@@ -43,6 +43,61 @@ API call is made:
 - **Request size limit**: Configurable max request body size.
 - **Origin validation**: Configurable allowlist (default: localhost only).
 
+## Google Credentials Setup
+
+The server needs OAuth2 credentials to call Google APIs. Choose one method:
+
+### Option A: Application Default Credentials (simplest for local dev)
+
+```bash
+gcloud auth application-default login \
+  --scopes=https://www.googleapis.com/auth/drive,\
+https://www.googleapis.com/auth/gmail.modify,\
+https://www.googleapis.com/auth/calendar
+```
+
+This stores credentials at `~/.config/gcloud/application_default_credentials.json`.
+The server finds them automatically.
+
+### Option B: Service Account (recommended for production)
+
+1. Go to [Google Cloud Console](https://console.cloud.google.com/) → **IAM & Admin** → **Service Accounts**
+2. Create a service account, download the JSON key file
+3. Enable the APIs you need (Drive API, Gmail API, Calendar API, etc.) under **APIs & Services** → **Enabled APIs**
+4. Share Drive folders or calendars with the service account's email address
+5. Set the credentials path:
+
+```bash
+export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account-key.json
+```
+
+### Option C: OAuth2 Client Credentials (for user-scoped access)
+
+1. Go to **APIs & Services** → **Credentials** → **Create Credentials** → **OAuth client ID**
+2. Choose **Desktop application**, download the JSON
+3. Use the [gws CLI](https://github.com/googleworkspace/cli) to complete the OAuth flow:
+
+```bash
+# Install gws
+cargo install google-workspace-cli
+
+# Authenticate (opens browser)
+gws auth login --credentials /path/to/client-credentials.json
+
+# Credentials are stored at ~/.config/gws/credentials.json
+# The MCP server finds them automatically
+```
+
+### Credential Priority
+
+The server checks these locations in order:
+
+1. `GOOGLE_WORKSPACE_CLI_TOKEN` env var (raw access token)
+2. `GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE` env var
+3. `~/.config/gws/credentials.json`
+4. `GOOGLE_APPLICATION_CREDENTIALS` env var
+5. `~/.config/gcloud/application_default_credentials.json`
+
 ## Quick Start
 
 ### Container (recommended)
