@@ -1,0 +1,35 @@
+[package]
+name = "mcp-google-workspace"
+version = "0.1.0"
+edition = "2024"
+description = "MCP server for Google Workspace APIs with per-project safety policies"
+license = "Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", features = ["macros"] }
+base64 = "0.22"
+dirs-next = "2"
+google-workspace = { git = "https://github.com/googleworkspace/cli", rev = "a3768d0" }
+reqwest = { version = "0.12", features = ["json", "rustls-tls-native-roots"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+toml = "0.8"
+once_cell = "1"
+opentelemetry = "0.29"
+prometheus = { version = "0.13", default-features = false }
+opentelemetry-otlp = { version = "0.29", features = ["http-json"], default-features = false }
+opentelemetry_sdk = { version = "0.29", features = ["rt-tokio"] }
+tracing = "0.1"
+tracing-opentelemetry = "0.30"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+yup-oauth2 = "12"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = "z"
+panic = "abort"
+strip = true

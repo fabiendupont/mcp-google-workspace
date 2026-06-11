@@ -1,0 +1,176 @@
+# mcp-google-workspace
+
+[![CI](https://github.com/fabiendupont/mcp-google-workspace/actions/workflows/ci.yml/badge.svg)](https://github.com/fabiendupont/mcp-google-workspace/actions/workflows/ci.yml)
+[![Release](https://github.com/fabiendupont/mcp-google-workspace/actions/workflows/release.yml/badge.svg)](https://github.com/fabiendupont/mcp-google-workspace/actions/workflows/release.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Container](https://img.shields.io/badge/ghcr.io-mcp--google--workspace-blue?logo=github)](https://github.com/fabiendupont/mcp-google-workspace/pkgs/container/mcp-google-workspace)
+[![MCP](https://img.shields.io/badge/MCP-2026--07--28_RC-green)](https://modelcontextprotocol.io/)
+
+MCP server for Google Workspace APIs with per-project safety policies.
+
+Gives AI agents controlled access to Drive, Gmail, Calendar, Sheets, Docs, and
+other Google services through the [Model Context Protocol](https://modelcontextprotocol.io/).
+A TOML policy file scopes what each project can access — folder-level Drive
+ACLs, per-calendar permissions, method denylists, and global read-only mode.
+
+## Protocol Support
+
+| MCP Version | Status |
+|-------------|--------|
+| 2026-07-28 RC | Full support (`server/discover`, `_meta`, `structuredContent`, `ttlMs`) |
+| 2025-11-25 | Supported (tool `title`, `annotations`) |
+| 2024-11-05 | Supported (`initialize` / `initialized` handshake) |
+
+The server auto-detects the client's protocol era and adapts accordingly.
+
+## Architecture
+
+See [docs/architecture.md](docs/architecture.md) for the full request flow diagram
+and multi-user deployment pattern.
+
+## Security Model
+
+The policy engine enforces access control at the MCP layer, before any Google
+API call is made:
+
+- **Service allow-list**: Only listed services are exposed. Everything else is denied.
+- **Folder-level Drive ACLs**: Per-folder `read-only` or `read-write` access, enforced
+  on queries, body `parents`, and `addParents`/`removeParents` params.
+- **Per-calendar permissions**: Per-calendar access levels. Unknown calendar IDs rejected.
+- **Method denylists**: Block specific methods (e.g., `messages.delete`).
+- **Read-only mode**: Global or per-service.
+- **Rate limiting**: Per-client-IP sliding window (HTTP transport).
+- **Request size limit**: Configurable max request body size.
+- **Origin validation**: Configurable allowlist (default: localhost only).
+
+## Quick Start
+
+### Container (recommended)
+
+```bash
+podman run -p 3000:3000 \
+  -v ./gws-policy.toml:/etc/mcp-google-workspace/policy.toml:ro \
+  -v ./credentials.json:/secrets/credentials.json:ro \
+  -e GOOGLE_APPLICATION_CREDENTIALS=/secrets/credentials.json \
+  ghcr.io/fabiendupont/mcp-google-workspace:latest
+```
+
+### From Source
+
+```bash
+cargo build --release
+./target/release/mcp-google-workspace --policy gws-policy.toml
+```
+
+### HTTP Transport
+
+```bash
+./target/release/mcp-google-workspace --policy gws-policy.toml --http 127.0.0.1:3000
+```
+
+## Policy File
+
+Create a `gws-policy.toml` to scope agent access. See
+[`policy.example.toml`](policy.example.toml) for a full example.
+
+```toml
+[server]
+read_only = false
+rate_limit_rpm = 120
+# allowed_origins = ["https://internal.corp.com"]
+
+[[services]]
+name = "drive"
+
+[[services.folders]]
+path = "Projects/current-project"
+access = "read-write"
+
+[[services]]
+name = "gmail"
+denied_methods = ["messages.delete", "messages.trash"]
+
+[[services]]
+name = "calendar"
+
+[[services.calendars]]
+id = "primary"
+access = "read-write"
+```
+
+## Claude Code Integration
+
+Add to `.claude/settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "google-workspace": {
+      "command": "/path/to/mcp-google-workspace",
+      "args": ["--policy", "/path/to/gws-policy.toml"]
+    }
+  }
+}
+```
+
+## Kubernetes Deployment
+
+Manifests are in [`deploy/kubernetes/`](deploy/kubernetes/). Deploy with:
+
+```bash
+# Create the credentials secret first
+kubectl create secret generic mcp-gws-credentials \
+  --from-file=credentials.json=./your-credentials.json \
+  -n mcp-google-workspace
+
+# Deploy
+kubectl apply -k deploy/kubernetes/
+```
+
+Each user gets their own deployment with their own credentials Secret and policy
+ConfigMap. See [docs/architecture.md](docs/architecture.md) for the multi-user
+deployment pattern.
+
+### Endpoints
+
+| Path | Purpose |
+|------|---------|
+| `POST /mcp` | MCP JSON-RPC endpoint |
+| `GET /mcp` | SSE notification stream |
+| `GET /healthz` | Health check |
+| `GET /readyz` | Readiness (discovery docs loaded) |
+| `GET /livez` | Liveness (process alive) |
+| `GET /metrics` | Prometheus metrics |
+
+## Observability
+
+- **Structured logging** via `tracing` (stderr, `RUST_LOG` for filtering)
+- **OpenTelemetry traces** via OTLP/HTTP (set `OTEL_EXPORTER_OTLP_ENDPOINT`)
+- **Prometheus metrics** at `/metrics` (request count, latency, errors, active tasks)
+
+## How It Works
+
+The server is **discovery-driven**: it fetches Google Discovery Documents at
+runtime to learn each API's resources, methods, and parameters. No hardcoded API
+list — new endpoints appear automatically.
+
+Each enabled Google service is exposed as a single MCP tool. The agent specifies
+`resource` and `method` as arguments:
+
+```json
+{
+  "name": "drive",
+  "arguments": {
+    "resource": "files",
+    "method": "list",
+    "params": { "q": "mimeType='application/pdf'", "fields": "files(id,name)" }
+  }
+}
+```
+
+A `gws_discover` meta-tool lets the agent introspect available resources,
+methods, and parameter schemas before making calls.
+
+## License
+
+Apache-2.0

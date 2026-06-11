@@ -1,0 +1,16 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: mcp-google-workspace
+  namespace: mcp-google-workspace
+  labels:
+    app.kubernetes.io/name: mcp-google-workspace
+    app.kubernetes.io/component: monitoring
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mcp-google-workspace
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s

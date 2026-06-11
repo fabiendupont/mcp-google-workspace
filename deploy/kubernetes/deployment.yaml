@@ -1,0 +1,79 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-google-workspace
+  namespace: mcp-google-workspace
+  labels:
+    app.kubernetes.io/name: mcp-google-workspace
+    app.kubernetes.io/component: server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mcp-google-workspace
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mcp-google-workspace
+        app.kubernetes.io/component: server
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "3000"
+        prometheus.io/path: "/metrics"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        fsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: mcp-gws
+          image: ghcr.io/fabiendupont/mcp-google-workspace:latest
+          ports:
+            - name: http
+              containerPort: 3000
+              protocol: TCP
+          env:
+            - name: GOOGLE_APPLICATION_CREDENTIALS
+              value: /secrets/credentials.json
+            - name: RUST_LOG
+              value: info
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: policy
+              mountPath: /etc/mcp-google-workspace
+              readOnly: true
+            - name: gcp-credentials
+              mountPath: /secrets
+              readOnly: true
+      volumes:
+        - name: policy
+          configMap:
+            name: mcp-gws-policy
+        - name: gcp-credentials
+          secret:
+            secretName: mcp-gws-credentials
