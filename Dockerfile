@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM docker.io/library/rust:1.88-bookworm AS builder
+FROM --platform=$BUILDPLATFORM docker.io/library/rust:1.96-bookworm AS builder
 
 ARG TARGETPLATFORM
 
