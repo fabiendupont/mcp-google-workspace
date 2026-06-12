@@ -24,45 +24,18 @@ fn adc_well_known_path() -> Option<PathBuf> {
     })
 }
 
-async fn parse_credential_file(
-    path: &std::path::Path,
-    content: &str,
-) -> anyhow::Result<Credential> {
+fn parse_credentials(content: &str, source: &str) -> anyhow::Result<Credential> {
     let json: serde_json::Value = serde_json::from_str(content)
-        .with_context(|| format!("Failed to parse credentials JSON at {}", path.display()))?;
+        .with_context(|| format!("Failed to parse credentials JSON from {source}"))?;
 
     if json.get("type").and_then(|v| v.as_str()) == Some("service_account") {
-        let key = yup_oauth2::parse_service_account_key(content).with_context(|| {
-            format!(
-                "Failed to parse service account key from {}",
-                path.display()
-            )
-        })?;
+        let key = yup_oauth2::parse_service_account_key(content)
+            .with_context(|| format!("Failed to parse service account key from {source}"))?;
         return Ok(Credential::ServiceAccount(key));
     }
 
     let secret: yup_oauth2::authorized_user::AuthorizedUserSecret = serde_json::from_value(json)
-        .with_context(|| {
-            format!(
-                "Failed to parse authorized user credentials from {}",
-                path.display()
-            )
-        })?;
-    Ok(Credential::AuthorizedUser(secret))
-}
-
-fn parse_credential_json(content: &str) -> anyhow::Result<Credential> {
-    let json: serde_json::Value =
-        serde_json::from_str(content).context("Failed to parse credentials JSON")?;
-
-    if json.get("type").and_then(|v| v.as_str()) == Some("service_account") {
-        let key = yup_oauth2::parse_service_account_key(content)
-            .context("Failed to parse service account key")?;
-        return Ok(Credential::ServiceAccount(key));
-    }
-
-    let secret: yup_oauth2::authorized_user::AuthorizedUserSecret =
-        serde_json::from_value(json).context("Failed to parse authorized user credentials")?;
+        .with_context(|| format!("Failed to parse authorized user credentials from {source}"))?;
     Ok(Credential::AuthorizedUser(secret))
 }
 
@@ -91,7 +64,7 @@ async fn load_credentials(credentials_file: Option<&str>) -> anyhow::Result<Cred
         if p.exists() {
             let content = tokio::fs::read_to_string(&p).await?;
             tracing::info!(path = path, "Using credentials from policy file");
-            return parse_credential_file(&p, &content).await;
+            return parse_credentials(&content, &p.display().to_string());
         }
         anyhow::bail!("credentials_file in policy points to {path}, but file does not exist");
     }
@@ -100,7 +73,7 @@ async fn load_credentials(credentials_file: Option<&str>) -> anyhow::Result<Cred
         let p = PathBuf::from(&path);
         if p.exists() {
             let content = tokio::fs::read_to_string(&p).await?;
-            return parse_credential_file(&p, &content).await;
+            return parse_credentials(&content, &p.display().to_string());
         }
         anyhow::bail!(
             "GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE points to {path}, but file does not exist"
@@ -110,7 +83,7 @@ async fn load_credentials(credentials_file: Option<&str>) -> anyhow::Result<Cred
     let default_path = config_dir().join("credentials.json");
     if default_path.exists() {
         let content = tokio::fs::read_to_string(&default_path).await?;
-        return parse_credential_file(&default_path, &content).await;
+        return parse_credentials(&content, &default_path.display().to_string());
     }
 
     if let Some(cred) = try_gws_export().await {
@@ -121,7 +94,7 @@ async fn load_credentials(credentials_file: Option<&str>) -> anyhow::Result<Cred
         let adc_path = PathBuf::from(&adc_env);
         if adc_path.exists() {
             let content = tokio::fs::read_to_string(&adc_path).await?;
-            return parse_credential_file(&adc_path, &content).await;
+            return parse_credentials(&content, &adc_path.display().to_string());
         }
         anyhow::bail!(
             "GOOGLE_APPLICATION_CREDENTIALS points to {adc_env}, but file does not exist"
@@ -132,7 +105,7 @@ async fn load_credentials(credentials_file: Option<&str>) -> anyhow::Result<Cred
         && well_known.exists()
     {
         let content = tokio::fs::read_to_string(&well_known).await?;
-        return parse_credential_file(&well_known, &content).await;
+        return parse_credentials(&content, &well_known.display().to_string());
     }
 
     anyhow::bail!(
@@ -159,7 +132,7 @@ async fn try_gws_export() -> Option<Credential> {
     let json_start = stdout.find('{')?;
     let json_str = &stdout[json_start..];
 
-    match parse_credential_json(json_str) {
+    match parse_credentials(json_str, "gws auth export") {
         Ok(cred) => {
             tracing::info!("Using credentials from gws auth export");
             Some(cred)
@@ -249,39 +222,20 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_parse_authorized_user() {
+    #[test]
+    fn test_parse_credentials_authorized_user() {
         let content = r#"{
             "client_id": "test-id",
             "client_secret": "test-secret",
             "refresh_token": "test-refresh",
             "type": "authorized_user"
         }"#;
-        let path = PathBuf::from("/tmp/test-creds.json");
-        let cred = parse_credential_file(&path, content).await.unwrap();
-        assert!(matches!(cred, Credential::AuthorizedUser(_)));
-    }
-
-    #[tokio::test]
-    async fn test_parse_invalid_json() {
-        let path = PathBuf::from("/tmp/test.json");
-        assert!(parse_credential_file(&path, "not json").await.is_err());
-    }
-
-    #[test]
-    fn test_parse_credential_json_authorized_user() {
-        let content = r#"{
-            "client_id": "test-id",
-            "client_secret": "test-secret",
-            "refresh_token": "test-refresh",
-            "type": "authorized_user"
-        }"#;
-        let cred = parse_credential_json(content).unwrap();
+        let cred = parse_credentials(content, "test").unwrap();
         assert!(matches!(cred, Credential::AuthorizedUser(_)));
     }
 
     #[test]
-    fn test_parse_credential_json_invalid() {
-        assert!(parse_credential_json("not json").is_err());
+    fn test_parse_credentials_invalid() {
+        assert!(parse_credentials("not json", "test").is_err());
     }
 }

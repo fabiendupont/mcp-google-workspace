@@ -89,12 +89,6 @@ pub async fn execute_tool(
         .and_then(|v| v.as_str())
         .unwrap_or("application/octet-stream");
 
-    if media_content_type.contains('\r') || media_content_type.contains('\n') {
-        return Err(GwsError::Validation(
-            "media_content_type must not contain CR or LF characters".to_string(),
-        ));
-    }
-
     if media_data.is_some() && !method.supports_media_upload {
         return Err(GwsError::Validation(format!(
             "Method '{method_name}' does not support media upload"
@@ -348,6 +342,11 @@ fn build_multipart_body(
     data: &[u8],
     content_type: &str,
 ) -> Result<(Vec<u8>, String), GwsError> {
+    if content_type.contains('\r') || content_type.contains('\n') {
+        return Err(GwsError::Validation(
+            "Content type must not contain CR or LF characters".to_string(),
+        ));
+    }
     let boundary = format!("mcp_gws_{:016x}", simple_hash(data));
 
     let metadata_json = match metadata {
@@ -597,6 +596,12 @@ pub(crate) async fn initiate_resumable_upload(
         .get("media_total_size")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
+
+    if content_type.contains('\r') || content_type.contains('\n') {
+        return Err(GwsError::Validation(
+            "Content type must not contain CR or LF characters".to_string(),
+        ));
+    }
 
     let scopes: Vec<&str> = select_scope(&method.scopes).into_iter().collect();
     let token = crate::auth::get_token(&scopes, policy.credentials_file.as_deref())
