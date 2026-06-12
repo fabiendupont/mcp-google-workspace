@@ -51,6 +51,8 @@ pub struct ServerPolicy {
     pub rate_limit_rpm: Option<u32>,
     #[serde(default)]
     pub allowed_origins: Vec<String>,
+    #[serde(default)]
+    pub credentials_file: Option<String>,
 }
 
 impl Default for ServerPolicy {
@@ -60,6 +62,7 @@ impl Default for ServerPolicy {
             max_request_bytes: default_max_request_bytes(),
             rate_limit_rpm: None,
             allowed_origins: Vec::new(),
+            credentials_file: None,
         }
     }
 }
@@ -87,6 +90,7 @@ pub struct Policy {
     pub max_request_bytes: usize,
     pub rate_limit_rpm: Option<u32>,
     pub allowed_origins: Vec<String>,
+    pub credentials_file: Option<String>,
     services: HashMap<String, ServicePolicy>,
 }
 
@@ -124,6 +128,7 @@ impl Policy {
             max_request_bytes: file.server.max_request_bytes,
             rate_limit_rpm: file.server.rate_limit_rpm,
             allowed_origins: file.server.allowed_origins,
+            credentials_file: file.server.credentials_file,
             services,
         }
     }
@@ -144,11 +149,13 @@ impl Policy {
         }
 
         let scopes = &["https://www.googleapis.com/auth/drive.metadata.readonly"];
-        let token = crate::auth::get_token(scopes).await.map_err(|e| {
-            GwsError::Auth(format!(
-                "Cannot resolve Drive folder paths without authentication: {e}"
-            ))
-        })?;
+        let token = crate::auth::get_token(scopes, self.credentials_file.as_deref())
+            .await
+            .map_err(|e| {
+                GwsError::Auth(format!(
+                    "Cannot resolve Drive folder paths without authentication: {e}"
+                ))
+            })?;
 
         let svc = self.services.get_mut("drive").unwrap();
         for folder in &mut svc.folders {

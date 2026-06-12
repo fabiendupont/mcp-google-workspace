@@ -84,8 +84,19 @@ cargo install google-workspace-cli
 # Authenticate (opens browser)
 gws auth login --credentials /path/to/client-credentials.json
 
-# Credentials are stored at ~/.config/gws/credentials.json
-# The MCP server finds them automatically
+# Credentials are stored in the OS keyring
+# The MCP server reads them automatically via `gws auth export`
+```
+
+You can also export credentials to a file and reference it in the policy:
+
+```bash
+gws auth export --unmasked > /path/to/credentials.json
+```
+
+```toml
+[server]
+credentials_file = "/path/to/credentials.json"
 ```
 
 ### Credential Priority
@@ -93,10 +104,12 @@ gws auth login --credentials /path/to/client-credentials.json
 The server checks these locations in order:
 
 1. `GOOGLE_WORKSPACE_CLI_TOKEN` env var (raw access token)
-2. `GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE` env var
-3. `~/.config/gws/credentials.json`
-4. `GOOGLE_APPLICATION_CREDENTIALS` env var
-5. `~/.config/gcloud/application_default_credentials.json`
+2. `credentials_file` from policy TOML `[server]` section
+3. `GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE` env var
+4. `~/.config/gws/credentials.json`
+5. `gws auth export --unmasked` (reads from OS keyring)
+6. `GOOGLE_APPLICATION_CREDENTIALS` env var
+7. `~/.config/gcloud/application_default_credentials.json`
 
 ## Quick Start
 

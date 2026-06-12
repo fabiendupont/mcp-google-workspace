@@ -24,6 +24,11 @@ read_only = false
 # When set, ONLY the listed origins are allowed (localhost is NOT implicit).
 # allowed_origins = ["https://internal.corp.com", "https://dashboard.example.com"]
 
+# Path to a credentials JSON file (authorized_user or service_account).
+# When set, this takes priority over env vars and gws auth export.
+# Generate with: gws auth export --unmasked > /path/to/credentials.json
+# credentials_file = "/path/to/credentials.json"
+
 # Per-service configuration. Only services listed here are exposed.
 # Everything not listed is denied.
 

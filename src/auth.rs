@@ -51,24 +51,51 @@ async fn parse_credential_file(
     Ok(Credential::AuthorizedUser(secret))
 }
 
+fn parse_credential_json(content: &str) -> anyhow::Result<Credential> {
+    let json: serde_json::Value =
+        serde_json::from_str(content).context("Failed to parse credentials JSON")?;
+
+    if json.get("type").and_then(|v| v.as_str()) == Some("service_account") {
+        let key = yup_oauth2::parse_service_account_key(content)
+            .context("Failed to parse service account key")?;
+        return Ok(Credential::ServiceAccount(key));
+    }
+
+    let secret: yup_oauth2::authorized_user::AuthorizedUserSecret =
+        serde_json::from_value(json).context("Failed to parse authorized user credentials")?;
+    Ok(Credential::AuthorizedUser(secret))
+}
+
 /// Credential priority:
 /// 0. GOOGLE_WORKSPACE_CLI_TOKEN env var (raw access token)
-/// 1. GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE env var
-/// 2. ~/.config/gws/credentials.json
-/// 3. GOOGLE_APPLICATION_CREDENTIALS env var (ADC)
-/// 4. ~/.config/gcloud/application_default_credentials.json
-pub async fn get_token(scopes: &[&str]) -> anyhow::Result<String> {
+/// 1. Policy credentials_file
+/// 2. GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE env var
+/// 3. ~/.config/gws/credentials.json
+/// 4. `gws auth export` (reads from OS keyring)
+/// 5. GOOGLE_APPLICATION_CREDENTIALS env var (ADC)
+/// 6. ~/.config/gcloud/application_default_credentials.json
+pub async fn get_token(scopes: &[&str], credentials_file: Option<&str>) -> anyhow::Result<String> {
     if let Ok(token) = std::env::var("GOOGLE_WORKSPACE_CLI_TOKEN")
         && !token.is_empty()
     {
         return Ok(token);
     }
 
-    let creds = load_credentials().await?;
+    let creds = load_credentials(credentials_file).await?;
     get_token_inner(scopes, creds).await
 }
 
-async fn load_credentials() -> anyhow::Result<Credential> {
+async fn load_credentials(credentials_file: Option<&str>) -> anyhow::Result<Credential> {
+    if let Some(path) = credentials_file {
+        let p = PathBuf::from(path);
+        if p.exists() {
+            let content = tokio::fs::read_to_string(&p).await?;
+            tracing::info!(path = path, "Using credentials from policy file");
+            return parse_credential_file(&p, &content).await;
+        }
+        anyhow::bail!("credentials_file in policy points to {path}, but file does not exist");
+    }
+
     if let Ok(path) = std::env::var("GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE") {
         let p = PathBuf::from(&path);
         if p.exists() {
@@ -84,6 +111,10 @@ async fn load_credentials() -> anyhow::Result<Credential> {
     if default_path.exists() {
         let content = tokio::fs::read_to_string(&default_path).await?;
         return parse_credential_file(&default_path, &content).await;
+    }
+
+    if let Some(cred) = try_gws_export().await {
+        return Ok(cred);
     }
 
     if let Ok(adc_env) = std::env::var("GOOGLE_APPLICATION_CREDENTIALS") {
@@ -105,9 +136,36 @@ async fn load_credentials() -> anyhow::Result<Credential> {
     }
 
     anyhow::bail!(
-        "No credentials found. Set GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE, \
-         GOOGLE_APPLICATION_CREDENTIALS, or run `gcloud auth application-default login`."
+        "No credentials found. Options:\n\
+         - Set credentials_file in policy TOML\n\
+         - Run `gws auth login` (credentials read via `gws auth export`)\n\
+         - Set GOOGLE_APPLICATION_CREDENTIALS env var\n\
+         - Run `gcloud auth application-default login`"
     )
+}
+
+async fn try_gws_export() -> Option<Credential> {
+    let output = tokio::process::Command::new("gws")
+        .args(["auth", "export", "--unmasked"])
+        .output()
+        .await
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let json_start = stdout.find('{')?;
+    let json_str = &stdout[json_start..];
+
+    match parse_credential_json(json_str) {
+        Ok(cred) => {
+            tracing::info!("Using credentials from gws auth export");
+            Some(cred)
+        }
+        Err(_) => None,
+    }
 }
 
 async fn get_token_inner(scopes: &[&str], creds: Credential) -> anyhow::Result<String> {
@@ -117,7 +175,10 @@ async fn get_token_inner(scopes: &[&str], creds: Credential) -> anyhow::Result<S
                 .build()
                 .await
                 .context("Failed to build authorized user authenticator")?;
-            let token = auth.token(scopes).await.context("Failed to get token")?;
+            let token = auth
+                .token(scopes)
+                .await
+                .map_err(|e| anyhow::anyhow!("Token refresh failed: {e}"))?;
             Ok(token
                 .token()
                 .ok_or_else(|| anyhow::anyhow!("Token response contained no access token"))?
@@ -128,7 +189,10 @@ async fn get_token_inner(scopes: &[&str], creds: Credential) -> anyhow::Result<S
                 .build()
                 .await
                 .context("Failed to build service account authenticator")?;
-            let token = auth.token(scopes).await.context("Failed to get token")?;
+            let token = auth
+                .token(scopes)
+                .await
+                .map_err(|e| anyhow::anyhow!("Token refresh failed: {e}"))?;
             Ok(token
                 .token()
                 .ok_or_else(|| anyhow::anyhow!("Token response contained no access token"))?
@@ -195,25 +259,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_parse_service_account() {
-        let content = r#"{
-            "type": "service_account",
-            "project_id": "test",
-            "private_key_id": "key1",
-            "private_key": "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA0Z3VS5JJcds3xfn/ygWyF8PbnGy0AHB7MhgHcTz6sE2I2yPB\naFDrBz9vFqU4yoySN5Lkzpf/AB+c0LS3cD0lNJHPOb0K2GKi5YX0P54hiDRF4qv\ng6vDp15sObnzqFE7D0VNjm2b4UlRNR8pzGt/AE5Q0nG/KBIGfx2G+K4UL94Q8VE\nuvFN3s0FxnL1Fg2kE3R3CZ3R5KxV0d3bMYiC0lohgSUbh3QEIjxXKDU/GjFiEiA\nkl7S/GuTGTVpH5K0uyk/Mmji2RBj2TXH7yFNf/D2c2fNGmG3j7B0e+3m/VIsKEb\n9v+1j/L0sBFPG21FCBzx0G/9GPPLWMJ0sRMfJwIDAQABAoIBAC5RgZ+hBx7xHNaM\npPgwGMnCd6HEfyGI+K2gOzfEPLelML5LxFEr0KPsgz7K1NxTq2qFRQDi5kJ9k6B\n1A4IBypassword123456789012345678901234567890==\n-----END RSA PRIVATE KEY-----\n",
-            "client_email": "test@test.iam.gserviceaccount.com",
-            "client_id": "123",
-            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-            "token_uri": "https://oauth2.googleapis.com/token"
-        }"#;
-        let path = PathBuf::from("/tmp/test-sa.json");
-        let cred = parse_credential_file(&path, content).await.unwrap();
-        assert!(matches!(cred, Credential::ServiceAccount(_)));
-    }
-
-    #[tokio::test]
     async fn test_parse_invalid_json() {
         let path = PathBuf::from("/tmp/test.json");
         assert!(parse_credential_file(&path, "not json").await.is_err());
+    }
+
+    #[test]
+    fn test_parse_credential_json_authorized_user() {
+        let content = r#"{
+            "client_id": "test-id",
+            "client_secret": "test-secret",
+            "refresh_token": "test-refresh",
+            "type": "authorized_user"
+        }"#;
+        let cred = parse_credential_json(content).unwrap();
+        assert!(matches!(cred, Credential::AuthorizedUser(_)));
+    }
+
+    #[test]
+    fn test_parse_credential_json_invalid() {
+        assert!(parse_credential_json("not json").is_err());
     }
 }
