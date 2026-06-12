@@ -201,7 +201,11 @@ async fn get_token_inner(scopes: &[&str], creds: Credential) -> anyhow::Result<S
     }
 }
 
-pub fn get_quota_project() -> Option<String> {
+pub fn get_quota_project(policy_project_id: Option<&str>) -> Option<String> {
+    if let Some(pid) = policy_project_id {
+        return Some(pid.to_string());
+    }
+
     if let Ok(project_id) = std::env::var("GOOGLE_WORKSPACE_PROJECT_ID")
         && !project_id.is_empty()
     {

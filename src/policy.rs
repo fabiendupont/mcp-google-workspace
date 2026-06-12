@@ -53,6 +53,8 @@ pub struct ServerPolicy {
     pub allowed_origins: Vec<String>,
     #[serde(default)]
     pub credentials_file: Option<String>,
+    #[serde(default)]
+    pub project_id: Option<String>,
 }
 
 impl Default for ServerPolicy {
@@ -63,6 +65,7 @@ impl Default for ServerPolicy {
             rate_limit_rpm: None,
             allowed_origins: Vec::new(),
             credentials_file: None,
+            project_id: None,
         }
     }
 }
@@ -91,6 +94,7 @@ pub struct Policy {
     pub rate_limit_rpm: Option<u32>,
     pub allowed_origins: Vec<String>,
     pub credentials_file: Option<String>,
+    pub project_id: Option<String>,
     services: HashMap<String, ServicePolicy>,
 }
 
@@ -129,6 +133,7 @@ impl Policy {
             rate_limit_rpm: file.server.rate_limit_rpm,
             allowed_origins: file.server.allowed_origins,
             credentials_file: file.server.credentials_file,
+            project_id: file.server.project_id,
             services,
         }
     }

@@ -29,6 +29,11 @@ read_only = false
 # Generate with: gws auth export --unmasked > /path/to/credentials.json
 # credentials_file = "/path/to/credentials.json"
 
+# Google Cloud project ID for quota/billing attribution.
+# Required when using OAuth2 user credentials.
+# Find yours at: https://console.cloud.google.com
+# project_id = "my-project-123456"
+
 # Per-service configuration. Only services listed here are exposed.
 # Everything not listed is denied.
 

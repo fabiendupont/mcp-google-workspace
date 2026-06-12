@@ -28,8 +28,9 @@ fn gws_err(msg: impl std::fmt::Display) -> GwsError {
 fn apply_common_headers(
     mut request: reqwest::RequestBuilder,
     meta: &RequestMeta,
+    policy: &Policy,
 ) -> reqwest::RequestBuilder {
-    if let Some(quota_project) = crate::auth::get_quota_project() {
+    if let Some(quota_project) = crate::auth::get_quota_project(policy.project_id.as_deref()) {
         request = request.header("x-goog-user-project", quota_project);
     }
     if let Some(ref tp) = meta.trace_parent {
@@ -175,7 +176,7 @@ pub async fn execute_tool(
         };
 
         request = request.bearer_auth(&token);
-        request = apply_common_headers(request, meta);
+        request = apply_common_headers(request, meta, policy);
 
         let mut qp = query_params.clone();
         if let Some(ref pt) = page_token {
@@ -609,7 +610,7 @@ pub(crate) async fn initiate_resumable_upload(
         request = request.header("X-Upload-Content-Length", total_size.to_string());
     }
 
-    request = apply_common_headers(request, meta);
+    request = apply_common_headers(request, meta, policy);
 
     if let Some(ref body_val) = body {
         request = request
