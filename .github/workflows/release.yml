@@ -25,7 +25,7 @@ jobs:
       - name: Extract version
         id: version
         run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64
@@ -47,7 +47,7 @@ jobs:
       - name: Extract version
         id: version
         run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/arm64
