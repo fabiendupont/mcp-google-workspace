@@ -187,12 +187,17 @@ impl Policy {
     }
 
     pub fn is_origin_allowed(&self, origin: &str) -> bool {
+        let host = url::Url::parse(origin)
+            .ok()
+            .and_then(|u| u.host_str().map(String::from));
+        let Some(host) = host else {
+            return false;
+        };
+
         if self.allowed_origins.is_empty() {
-            return origin.contains("localhost") || origin.contains("127.0.0.1");
+            return host == "localhost" || host == "127.0.0.1" || host == "::1";
         }
-        self.allowed_origins
-            .iter()
-            .any(|o| origin.contains(o.as_str()))
+        self.allowed_origins.iter().any(|o| host == o.as_str())
     }
 
     pub fn allowed_services(&self) -> Vec<&str> {
@@ -347,12 +352,11 @@ impl Policy {
             .unwrap_or_default();
 
         if parent_ids.is_empty() {
-            if rw_ids.is_empty() {
-                return Err(GwsError::Validation(
-                    "Write denied: no folders have read-write access in this policy".to_string(),
-                ));
-            }
-            return Ok(());
+            return Err(GwsError::Validation(format!(
+                "Write denied: 'parents' must be specified when folder restrictions are configured. \
+                 Allowed read-write folders: {}",
+                rw_ids.join(", ")
+            )));
         }
 
         for pid in &parent_ids {
@@ -426,7 +430,13 @@ impl Policy {
         }
 
         let Some(serde_json::Value::String(cal_id)) = params.get("calendarId") else {
-            return Ok(());
+            return Err(GwsError::Validation(format!(
+                "Calendar restrictions are configured but no calendarId specified. Allowed: {}",
+                cals.iter()
+                    .map(|c| c.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
         };
 
         let cal = cals.iter().find(|c| c.id == *cal_id);
@@ -609,6 +619,14 @@ name = "drive"
         assert!(p.enforce_drive_folder_write("gmail", &body).is_ok());
     }
 
+    #[test]
+    fn test_folder_write_denied_without_parents() {
+        let p = test_policy();
+        let body = Some(serde_json::json!({ "name": "test.txt" }));
+        let err = p.enforce_drive_folder_write("drive", &body).unwrap_err();
+        assert!(err.to_string().contains("parents"));
+    }
+
     // -- Drive folder param tests --
 
     #[test]
@@ -738,6 +756,20 @@ name = "drive"
     }
 
     #[test]
+    fn test_calendar_denied_without_calendar_id() {
+        let p = test_policy();
+        let method = RestMethod {
+            http_method: "GET".to_string(),
+            ..Default::default()
+        };
+        let params = serde_json::Map::new();
+        let err = p
+            .enforce_calendar("calendar", &method, &params)
+            .unwrap_err();
+        assert!(err.to_string().contains("calendarId"));
+    }
+
+    #[test]
     fn test_no_folder_restrictions_skips_enforcement() {
         let p = test_policy();
         assert!(!p.has_folder_restrictions("gmail"));
@@ -762,6 +794,22 @@ name = "drive"
     }
 
     #[test]
+    fn test_origin_rejects_substring_bypass() {
+        let p = test_policy();
+        assert!(!p.is_origin_allowed("https://evil-localhost.com"));
+        assert!(!p.is_origin_allowed("https://localhost.evil.com"));
+        assert!(!p.is_origin_allowed("https://127.0.0.1.evil.com"));
+        assert!(!p.is_origin_allowed("https://not-localhost.com"));
+    }
+
+    #[test]
+    fn test_origin_rejects_invalid() {
+        let p = test_policy();
+        assert!(!p.is_origin_allowed("not-a-url"));
+        assert!(!p.is_origin_allowed(""));
+    }
+
+    #[test]
     fn test_origin_custom_allowlist() {
         let toml_str = r#"
 [server]
@@ -775,6 +823,21 @@ name = "drive"
         assert!(p.is_origin_allowed("https://dashboard.example.com"));
         assert!(!p.is_origin_allowed("http://localhost:3000"));
         assert!(!p.is_origin_allowed("https://evil.com"));
+    }
+
+    #[test]
+    fn test_origin_custom_allowlist_rejects_substring() {
+        let toml_str = r#"
+[server]
+allowed_origins = ["corp.example.com"]
+[[services]]
+name = "drive"
+"#;
+        let file: PolicyFile = toml::from_str(toml_str).unwrap();
+        let p = Policy::from_policy_file(file);
+        assert!(p.is_origin_allowed("https://corp.example.com"));
+        assert!(!p.is_origin_allowed("https://evil-corp.example.com"));
+        assert!(!p.is_origin_allowed("https://corp.example.com.evil.com"));
     }
 
     // -- Security config tests --

@@ -89,6 +89,12 @@ pub async fn execute_tool(
         .and_then(|v| v.as_str())
         .unwrap_or("application/octet-stream");
 
+    if media_content_type.contains('\r') || media_content_type.contains('\n') {
+        return Err(GwsError::Validation(
+            "media_content_type must not contain CR or LF characters".to_string(),
+        ));
+    }
+
     if media_data.is_some() && !method.supports_media_upload {
         return Err(GwsError::Validation(format!(
             "Method '{method_name}' does not support media upload"

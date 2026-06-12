@@ -750,6 +750,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "url",
  "yup-oauth2",
 ]
 
