@@ -63,6 +63,7 @@ pub async fn execute_tool(
     meta: &RequestMeta,
     notify_tx: Option<&NotifySender>,
     dry_run: bool,
+    token_cache: &mut Option<crate::auth::TokenCache>,
 ) -> Result<Value, GwsError> {
     policy.check_method(service, resource_path, method_name, method)?;
 
@@ -154,9 +155,13 @@ pub async fn execute_tool(
         return Ok(dry);
     }
 
-    let token = crate::auth::get_token(&scopes, policy.credentials_file.as_deref())
-        .await
-        .map_err(|e| GwsError::Auth(format!("Authentication failed: {e}")))?;
+    let token = crate::auth::get_token(
+        &scopes,
+        policy.credentials_file.as_deref(),
+        Some(token_cache),
+    )
+    .await
+    .map_err(|e| GwsError::Auth(format!("Authentication failed: {e}")))?;
 
     let http_client = client::shared_client()?;
     let mut all_results: Vec<Value> = Vec::new();
@@ -563,6 +568,7 @@ pub(crate) async fn initiate_resumable_upload(
     service: &str,
     policy: &Policy,
     meta: &RequestMeta,
+    token_cache: &mut Option<crate::auth::TokenCache>,
 ) -> Result<Value, GwsError> {
     let params: Map<String, Value> = arguments
         .get("params")
@@ -604,9 +610,13 @@ pub(crate) async fn initiate_resumable_upload(
     }
 
     let scopes: Vec<&str> = select_scope(&method.scopes).into_iter().collect();
-    let token = crate::auth::get_token(&scopes, policy.credentials_file.as_deref())
-        .await
-        .map_err(|e| GwsError::Auth(format!("Authentication failed: {e}")))?;
+    let token = crate::auth::get_token(
+        &scopes,
+        policy.credentials_file.as_deref(),
+        Some(token_cache),
+    )
+    .await
+    .map_err(|e| GwsError::Auth(format!("Authentication failed: {e}")))?;
 
     let upload_url = build_upload_url(doc, method, &params)?;
 
@@ -1007,7 +1017,7 @@ mod tests {
         });
 
         let result = execute_tool(
-            &doc, &method, "files", "get", &args, "drive", &policy, &meta, None, true,
+            &doc, &method, "files", "get", &args, "drive", &policy, &meta, None, true, &mut None,
         )
         .await
         .unwrap();
@@ -1048,7 +1058,7 @@ name = "drive"
         });
 
         let err = execute_tool(
-            &doc, &method, "files", "create", &args, "drive", &policy, &meta, None, true,
+            &doc, &method, "files", "create", &args, "drive", &policy, &meta, None, true, &mut None,
         )
         .await;
 
@@ -1070,7 +1080,7 @@ name = "drive"
         });
 
         let err = execute_tool(
-            &doc, &method, "files", "get", &args, "drive", &policy, &meta, None, true,
+            &doc, &method, "files", "get", &args, "drive", &policy, &meta, None, true, &mut None,
         )
         .await;
 
@@ -1110,7 +1120,7 @@ name = "drive"
         });
 
         let result = execute_tool(
-            &doc, &method, "files", "create", &args, "drive", &policy, &meta, None, true,
+            &doc, &method, "files", "create", &args, "drive", &policy, &meta, None, true, &mut None,
         )
         .await
         .unwrap();
@@ -1147,7 +1157,7 @@ name = "drive"
         });
 
         let result = execute_tool(
-            &doc, &method, "files", "get", &args, "drive", &policy, &meta, None, true,
+            &doc, &method, "files", "get", &args, "drive", &policy, &meta, None, true, &mut None,
         )
         .await
         .unwrap();
@@ -1169,7 +1179,7 @@ name = "drive"
         });
 
         let result = execute_tool(
-            &doc, &method, "files", "get", &args, "drive", &policy, &meta, None, true,
+            &doc, &method, "files", "get", &args, "drive", &policy, &meta, None, true, &mut None,
         )
         .await
         .unwrap();
@@ -1190,7 +1200,7 @@ name = "drive"
         });
 
         let err = execute_tool(
-            &doc, &method, "files", "get", &args, "drive", &policy, &meta, None, true,
+            &doc, &method, "files", "get", &args, "drive", &policy, &meta, None, true, &mut None,
         )
         .await;
 
@@ -1224,7 +1234,7 @@ name = "drive"
         });
 
         let err = execute_tool(
-            &doc, &method, "files", "create", &args, "drive", &policy, &meta, None, true,
+            &doc, &method, "files", "create", &args, "drive", &policy, &meta, None, true, &mut None,
         )
         .await;
 

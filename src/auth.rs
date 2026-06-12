@@ -1,10 +1,24 @@
 use std::path::PathBuf;
+use std::time::Instant;
 
 use anyhow::Context;
+
 #[derive(Debug)]
 enum Credential {
     AuthorizedUser(yup_oauth2::authorized_user::AuthorizedUserSecret),
     ServiceAccount(yup_oauth2::ServiceAccountKey),
+}
+
+#[derive(Debug)]
+pub(crate) struct TokenCache {
+    token: String,
+    expires_at: Instant,
+}
+
+impl TokenCache {
+    fn is_valid(&self) -> bool {
+        Instant::now() < self.expires_at
+    }
 }
 
 fn config_dir() -> PathBuf {
@@ -47,15 +61,34 @@ fn parse_credentials(content: &str, source: &str) -> anyhow::Result<Credential> 
 /// 4. `gws auth export` (reads from OS keyring)
 /// 5. GOOGLE_APPLICATION_CREDENTIALS env var (ADC)
 /// 6. ~/.config/gcloud/application_default_credentials.json
-pub async fn get_token(scopes: &[&str], credentials_file: Option<&str>) -> anyhow::Result<String> {
+pub async fn get_token(
+    scopes: &[&str],
+    credentials_file: Option<&str>,
+    cache: Option<&mut Option<TokenCache>>,
+) -> anyhow::Result<String> {
     if let Ok(token) = std::env::var("GOOGLE_WORKSPACE_CLI_TOKEN")
         && !token.is_empty()
     {
         return Ok(token);
     }
 
+    if let Some(&mut Some(ref c)) = cache
+        && c.is_valid()
+    {
+        return Ok(c.token.clone());
+    }
+
     let creds = load_credentials(credentials_file).await?;
-    get_token_inner(scopes, creds).await
+    let token = get_token_inner(scopes, creds).await?;
+
+    if let Some(slot) = cache {
+        *slot = Some(TokenCache {
+            token: token.clone(),
+            expires_at: Instant::now() + std::time::Duration::from_secs(3500),
+        });
+    }
+
+    Ok(token)
 }
 
 async fn load_credentials(credentials_file: Option<&str>) -> anyhow::Result<Credential> {

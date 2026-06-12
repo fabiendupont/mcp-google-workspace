@@ -154,7 +154,7 @@ impl Policy {
         }
 
         let scopes = &["https://www.googleapis.com/auth/drive.metadata.readonly"];
-        let token = crate::auth::get_token(scopes, self.credentials_file.as_deref())
+        let token = crate::auth::get_token(scopes, self.credentials_file.as_deref(), None)
             .await
             .map_err(|e| {
                 GwsError::Auth(format!(

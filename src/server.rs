@@ -22,6 +22,7 @@ pub(crate) struct ServerState {
     pub era: ClientEra,
     pub active_ids: HashSet<String>,
     pub tasks: HashMap<String, tasks::Task>,
+    pub token_cache: Option<crate::auth::TokenCache>,
 }
 
 #[derive(Debug)]
@@ -39,6 +40,7 @@ impl ServerState {
             era: ClientEra::Unknown,
             active_ids: HashSet::new(),
             tasks: HashMap::new(),
+            token_cache: None,
         }
     }
 
@@ -352,6 +354,7 @@ async fn handle_tool_call_inner(
         .and_then(|v| v.as_str())
         .ok_or_else(|| GwsError::Validation("Missing 'method' argument".to_string()))?;
 
+    let mut tc = state.token_cache.take();
     let doc = state.get_doc(svc_alias).await?;
 
     let resource = tools::find_resource(&doc.resources, resource_path).ok_or_else(|| {
@@ -372,9 +375,11 @@ async fn handle_tool_call_inner(
         .unwrap_or(false)
     {
         let init_result = crate::execute::initiate_resumable_upload(
-            doc, method, arguments, svc_alias, policy, meta,
+            doc, method, arguments, svc_alias, policy, meta, &mut tc,
         )
-        .await?;
+        .await;
+        state.token_cache = tc;
+        let init_result = init_result?;
 
         let session_uri = init_result["sessionUri"]
             .as_str()
@@ -438,8 +443,11 @@ async fn handle_tool_call_inner(
         meta,
         Some(&notify_tx),
         false,
+        &mut tc,
     )
-    .await?;
+    .await;
+    state.token_cache = tc;
+    let result = result?;
 
     drop(notify_tx);
     let mut notifications = Vec::new();
