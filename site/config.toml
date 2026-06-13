@@ -1,4 +1,4 @@
-base_url = "https://fabiendupont.github.io/mcp-google-workspace"
+base_url = "https://fabiendupont.io/mcp-google-workspace"
 theme = "adidoks"
 title = "MCP Google Workspace"
 description = "MCP server for Google Workspace APIs with per-project safety policies"

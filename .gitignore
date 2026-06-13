@@ -1,3 +1,5 @@
 /target
 .claude/
 /site/public/
+/.playwright-mcp/
+*.png
