@@ -5,11 +5,11 @@
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Container](https://img.shields.io/badge/ghcr.io-mcp--google--workspace-blue?logo=github)](https://github.com/fabiendupont/mcp-google-workspace/pkgs/container/mcp-google-workspace)
 [![MCP](https://img.shields.io/badge/MCP-2026--07--28_RC-green)](https://modelcontextprotocol.io/)
-[![Docs](https://img.shields.io/badge/docs-fabiendupont.github.io-blue)](https://fabiendupont.github.io/mcp-google-workspace/)
+[![Docs](https://img.shields.io/badge/docs-fabiendupont.github.io-blue)](https://fabiendupont.io/)
 
 MCP server for Google Workspace APIs with per-project safety policies.
 
-**[Documentation](https://fabiendupont.github.io/mcp-google-workspace/)** | **[Quick Start](https://fabiendupont.github.io/mcp-google-workspace/docs/getting-started/quickstart/)** | **[API Reference](https://fabiendupont.github.io/mcp-google-workspace/docs/api-reference/tool-arguments/)**
+**[Documentation](https://fabiendupont.io/)** | **[Quick Start](https://fabiendupont.io/docs/getting-started/quickstart/)** | **[API Reference](https://fabiendupont.io/docs/api-reference/tool-arguments/)**
 
 Gives AI agents controlled access to Drive, Gmail, Calendar, Sheets, Docs, and
 other Google services through the [Model Context Protocol](https://modelcontextprotocol.io/).
