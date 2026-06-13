@@ -1,0 +1,59 @@
+base_url = "https://fabiendupont.github.io/mcp-google-workspace"
+theme = "adidoks"
+title = "MCP Google Workspace"
+description = "MCP server for Google Workspace APIs with per-project safety policies"
+default_language = "en"
+compile_sass = true
+generate_feeds = false
+minify_html = true
+build_search_index = true
+
+taxonomies = [
+  {name = "authors"},
+]
+
+[search]
+include_title = true
+include_description = true
+include_content = true
+
+[markdown]
+
+[extra]
+author = "Fabien Dupont"
+github = "https://github.com/fabiendupont"
+email = ""
+ganalytics = ""
+is_netlify = false
+language_code = "en-US"
+theme_color = "#4f46e5"
+title_separator = "—"
+title_addition = "MCP Server for Google Workspace"
+timeformat = "%Y-%m-%d"
+timezone = "UTC"
+
+edit_page = true
+docs_repo = "https://github.com/fabiendupont/mcp-google-workspace"
+repo_branch = "main"
+
+math = false
+
+[extra.open]
+enable = false
+
+[extra.schema]
+type = "Organization"
+logo = ""
+github = "https://github.com/fabiendupont/mcp-google-workspace"
+section = "docs"
+site_links_search_box = false
+
+[[extra.menu.social]]
+name = "GitHub"
+pre = '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feather feather-github"><path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22"></path></svg>'
+url = "https://github.com/fabiendupont/mcp-google-workspace"
+post = "v0.1.0"
+weight = 10
+
+[extra.footer]
+info = 'Powered by <a href="https://www.getzola.org/">Zola</a> and <a href="https://github.com/aaranxu/adidoks">AdiDoks</a>. Licensed under <a href="https://github.com/fabiendupont/mcp-google-workspace/blob/main/LICENSE">Apache-2.0</a>.'
