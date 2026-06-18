@@ -26,8 +26,14 @@ enum Transport {
 #[derive(Debug)]
 enum Command {
     Serve(ParsedArgs),
-    InitPolicy { services: Option<Vec<String>> },
-    CheckPolicy { path: PathBuf, verify: bool },
+    InitPolicy {
+        services: Option<Vec<String>>,
+        template: Option<String>,
+    },
+    CheckPolicy {
+        path: PathBuf,
+        verify: bool,
+    },
 }
 
 #[derive(Debug)]
@@ -57,6 +63,9 @@ fn print_usage() {
     );
     eprintln!("  --check-policy <path> Validate a policy file without starting the server");
     eprintln!(
+        "  --template <name>     With --init-policy: use a preset (analyst, assistant, admin-readonly)"
+    );
+    eprintln!(
         "  --verify              With --check-policy: test credentials and resolve folder paths"
     );
     eprintln!("  --help                Show this help message");
@@ -69,6 +78,7 @@ fn parse_args_from(args: &[String]) -> Result<Command, GwsError> {
     let mut init_policy = false;
     let mut check_policy_path: Option<PathBuf> = None;
     let mut verify = false;
+    let mut template: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -107,6 +117,16 @@ fn parse_args_from(args: &[String]) -> Result<Command, GwsError> {
             "--verify" => {
                 verify = true;
             }
+            "--template" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(GwsError::Validation(
+                        "--template requires a name (analyst, assistant, admin-readonly)"
+                            .to_string(),
+                    ));
+                }
+                template = Some(args[i].clone());
+            }
             "--check-policy" => {
                 i += 1;
                 if i >= args.len() {
@@ -129,7 +149,7 @@ fn parse_args_from(args: &[String]) -> Result<Command, GwsError> {
 
     if init_policy {
         let services = services_str.map(|s| s.split(',').map(|s| s.trim().to_string()).collect());
-        return Ok(Command::InitPolicy { services });
+        return Ok(Command::InitPolicy { services, template });
     }
 
     Ok(Command::Serve(ParsedArgs {
@@ -212,12 +232,125 @@ fn default_service_entry(name: &str) -> serde_json::Value {
     }
 }
 
+const TEMPLATES: &[(&str, &str)] = &[
+    (
+        "analyst",
+        "Read-only Drive, Sheets, Docs. Gmail send-only. No calendar.",
+    ),
+    (
+        "assistant",
+        "Drive read-write, Gmail with safety blocks, Calendar primary read-write.",
+    ),
+    (
+        "admin-readonly",
+        "All services in read-only mode. Safe for auditing.",
+    ),
+];
+
+fn list_templates() {
+    eprintln!();
+    eprintln!("Available policy templates:");
+    eprintln!();
+    for (name, desc) in TEMPLATES {
+        eprintln!("  {name}");
+        eprintln!("    {desc}");
+        eprintln!();
+    }
+    eprintln!("Usage: mcp-google-workspace --init-policy --template <name>");
+}
+
+fn template_policy(name: &str) -> Result<serde_json::Value, GwsError> {
+    if name == "list" {
+        list_templates();
+        std::process::exit(0);
+    }
+
+    let gmail_safety = serde_json::json!([
+        "messages.delete",
+        "messages.trash",
+        "messages.batchDelete",
+        "settings.updateAutoForwarding",
+        "settings.delegates.create",
+        "settings.forwardingAddresses.create"
+    ]);
+
+    match name {
+        "analyst" => Ok(serde_json::json!({
+            "server": { "read_only": false },
+            "services": [
+                { "name": "drive", "read_only": true },
+                { "name": "sheets", "read_only": true },
+                { "name": "docs", "read_only": true },
+                {
+                    "name": "gmail",
+                    "denied_methods": gmail_safety
+                }
+            ]
+        })),
+        "assistant" => Ok(serde_json::json!({
+            "server": { "read_only": false },
+            "services": [
+                { "name": "drive" },
+                {
+                    "name": "gmail",
+                    "denied_methods": gmail_safety
+                },
+                {
+                    "name": "calendar",
+                    "constraints": [
+                        { "param": "calendarId", "values": ["primary"], "access": "read-write" }
+                    ]
+                },
+                { "name": "sheets" },
+                { "name": "docs", "read_only": true }
+            ]
+        })),
+        "admin-readonly" => Ok(serde_json::json!({
+            "server": { "read_only": true },
+            "services": [
+                { "name": "drive" },
+                { "name": "gmail" },
+                { "name": "calendar" },
+                { "name": "sheets" },
+                { "name": "docs" },
+                { "name": "slides" },
+                { "name": "admin" },
+                { "name": "chat" }
+            ]
+        })),
+        _ => {
+            let names: Vec<&str> = TEMPLATES.iter().map(|(n, _)| *n).collect();
+            Err(GwsError::Validation(format!(
+                "Unknown template '{name}'. Available: {}. Use --template list for details",
+                names.join(", ")
+            )))
+        }
+    }
+}
+
 fn init_policy_interactive() -> Result<serde_json::Value, GwsError> {
-    use dialoguer::{Confirm, Input, MultiSelect};
+    use dialoguer::{Confirm, Input, MultiSelect, Select};
 
     eprintln!();
     eprintln!("  MCP Google Workspace — Policy Generator");
     eprintln!();
+
+    let mut template_labels: Vec<String> = TEMPLATES
+        .iter()
+        .map(|(name, desc)| format!("{name} — {desc}"))
+        .collect();
+    template_labels.push("Custom — configure services individually".to_string());
+
+    let choice = Select::new()
+        .with_prompt("Start from a template or configure manually?")
+        .items(&template_labels)
+        .default(template_labels.len() - 1)
+        .interact()
+        .map_err(|e| GwsError::Validation(format!("Prompt failed: {e}")))?;
+
+    if choice < TEMPLATES.len() {
+        return template_policy(TEMPLATES[choice].0);
+    }
 
     let labels: Vec<String> = KNOWN_SERVICES
         .iter()
@@ -629,17 +762,29 @@ async fn main() {
     };
 
     let parsed = match cmd {
-        Command::InitPolicy { services } => {
-            let interactive = services.is_none();
-            let json = match services {
-                Some(svc) => generate_policy(&svc),
-                None => match init_policy_interactive() {
+        Command::InitPolicy { services, template } => {
+            let interactive = services.is_none() && template.is_none();
+            let json = if let Some(ref tmpl) = template {
+                if let Some((_, desc)) = TEMPLATES.iter().find(|(n, _)| *n == tmpl.as_str()) {
+                    eprintln!("Using template '{tmpl}': {desc}");
+                }
+                match template_policy(tmpl) {
                     Ok(j) => j,
                     Err(e) => {
                         eprintln!("Error: {e}");
                         std::process::exit(1);
                     }
-                },
+                }
+            } else if let Some(svc) = services {
+                generate_policy(&svc)
+            } else {
+                match init_policy_interactive() {
+                    Ok(j) => j,
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        std::process::exit(1);
+                    }
+                }
             };
             let output = serde_json::to_string_pretty(&json).unwrap();
 
@@ -868,8 +1013,9 @@ mod tests {
     fn test_parse_init_policy_interactive() {
         let cmd = parse_args_from(&args(&["--init-policy"])).unwrap();
         match cmd {
-            Command::InitPolicy { services } => {
+            Command::InitPolicy { services, template } => {
                 assert!(services.is_none());
+                assert!(template.is_none());
             }
             other => panic!("Expected InitPolicy, got {other:?}"),
         }
@@ -879,14 +1025,60 @@ mod tests {
     fn test_parse_init_policy_with_services() {
         let cmd = parse_args_from(&args(&["--init-policy", "--services", "drive,sheets"])).unwrap();
         match cmd {
-            Command::InitPolicy { services } => {
+            Command::InitPolicy { services, template } => {
                 assert_eq!(
                     services,
                     Some(vec!["drive".to_string(), "sheets".to_string()])
                 );
+                assert!(template.is_none());
             }
             other => panic!("Expected InitPolicy, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_parse_init_policy_with_template() {
+        let cmd = parse_args_from(&args(&["--init-policy", "--template", "analyst"])).unwrap();
+        match cmd {
+            Command::InitPolicy { services, template } => {
+                assert!(services.is_none());
+                assert_eq!(template, Some("analyst".to_string()));
+            }
+            other => panic!("Expected InitPolicy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_template_analyst() {
+        let json = template_policy("analyst").unwrap();
+        let services = json["services"].as_array().unwrap();
+        assert!(
+            services
+                .iter()
+                .any(|s| s["name"] == "drive" && s["read_only"] == true)
+        );
+        assert!(services.iter().any(|s| s["name"] == "gmail"));
+    }
+
+    #[test]
+    fn test_template_assistant() {
+        let json = template_policy("assistant").unwrap();
+        let services = json["services"].as_array().unwrap();
+        assert!(services.iter().any(|s| s["name"] == "drive"));
+        assert!(services.iter().any(|s| s["name"] == "calendar"));
+    }
+
+    #[test]
+    fn test_template_admin_readonly() {
+        let json = template_policy("admin-readonly").unwrap();
+        assert_eq!(json["server"]["read_only"], true);
+        let services = json["services"].as_array().unwrap();
+        assert!(services.len() >= 8);
+    }
+
+    #[test]
+    fn test_template_unknown() {
+        assert!(template_policy("nonexistent").is_err());
     }
 
     #[test]
