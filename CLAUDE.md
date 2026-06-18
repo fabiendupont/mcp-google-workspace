@@ -12,7 +12,7 @@ protocol.rs   — Typed JSON-RPC layer: request parsing, error codes, response c
 meta.rs       — Request metadata extraction (_meta, W3C Trace Context)
 tools.rs      — Builds MCP tool list from Google Discovery Documents, handles gws_discover
 execute.rs    — HTTP execution: URL template rendering, params, pagination, policy enforcement
-policy.rs     — TOML policy engine: per-service, per-folder, per-calendar, method denylists
+policy.rs     — JSON policy engine: per-service, per-folder, per-calendar, method denylists
 auth.rs       — OAuth2 chain: env var → credentials file → service account → ADC/gcloud
 resolve.rs    — Drive folder path → ID resolution at startup
 ```
@@ -22,9 +22,9 @@ resolve.rs    — Drive folder path → ID resolution at startup
 - **Discovery-driven**: Fetches Google Discovery Documents at runtime to learn each
   API's resources/methods/parameters. No hardcoded API list — new endpoints appear
   automatically.
-- **Policy-as-code**: A TOML file scopes what an agent can access per-project.
+- **Policy-as-code**: A JSON file scopes what an agent can access per-project.
   Supports folder-level Drive ACLs, per-calendar access, method denylists, and
-  global read-only mode. See `policy.example.toml`.
+  global read-only mode. See `policy.example.json`.
 - **One tool per service**: Each Google service (drive, gmail, calendar) is exposed
   as a single MCP tool. The agent specifies `resource` and `method` as arguments.
   `gws_discover` is a meta-tool for schema introspection.
@@ -44,7 +44,7 @@ resolve.rs    — Drive folder path → ID resolution at startup
 
 ```bash
 cargo check          # Type-check
-cargo test           # 33 unit tests across protocol.rs, meta.rs, policy.rs
+cargo test           # 183 unit tests across all modules
 cargo build --release
 ```
 
@@ -52,7 +52,7 @@ cargo build --release
 
 ```bash
 # With policy file (recommended)
-./target/release/mcp-google-workspace --policy gws-policy.toml
+./target/release/mcp-google-workspace --policy gws-policy.json
 
 # With service list (no constraints)
 ./target/release/mcp-google-workspace --services drive,gmail,calendar
@@ -66,7 +66,7 @@ Add to `.claude/settings.json`:
   "mcpServers": {
     "google-workspace": {
       "command": "/path/to/mcp-google-workspace",
-      "args": ["--policy", "/path/to/gws-policy.toml"]
+      "args": ["--policy", "/path/to/gws-policy.json"]
     }
   }
 }
@@ -89,7 +89,7 @@ Add to `.claude/settings.json`:
 - Pre-initialization blocking for legacy clients
 - Request ID uniqueness tracking
 - Progress notifications during auto-pagination
-- Policy engine with TOML parsing and 21 passing unit tests
+- Policy engine with JSON parsing, interactive wizard, and security warnings
 - `ping` support
 - Sorted, deterministic tool ordering
 

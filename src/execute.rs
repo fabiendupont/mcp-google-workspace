@@ -1041,13 +1041,11 @@ mod tests {
         let mut method = test_method();
         method.http_method = "POST".to_string();
         let policy = {
-            let toml = r#"
-[server]
-read_only = true
-[[services]]
-name = "drive"
-"#;
-            let file: crate::policy::PolicyFile = toml::from_str(toml).unwrap();
+            let json_str = r#"{
+                "server": { "read_only": true },
+                "services": [{ "name": "drive" }]
+            }"#;
+            let file: crate::policy::PolicyFile = serde_json::from_str(json_str).unwrap();
             crate::policy::Policy::from_policy_file(file)
         };
         let meta = RequestMeta::default();

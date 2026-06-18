@@ -23,11 +23,11 @@ LABEL name="mcp-google-workspace" \
 
 COPY --from=builder /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=builder /build/mcp-google-workspace /usr/local/bin/mcp-google-workspace
-COPY policy.example.toml /etc/mcp-google-workspace/policy.example.toml
+COPY policy.example.json /etc/mcp-google-workspace/policy.example.json
 
 USER 65534
 
 EXPOSE 3000
 
 ENTRYPOINT ["mcp-google-workspace"]
-CMD ["--policy", "/etc/mcp-google-workspace/policy.toml", "--http", "0.0.0.0:3000"]
+CMD ["--policy", "/etc/mcp-google-workspace/policy.json", "--http", "0.0.0.0:3000"]

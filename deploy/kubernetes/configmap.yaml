@@ -7,26 +7,29 @@ metadata:
     app.kubernetes.io/name: mcp-google-workspace
     app.kubernetes.io/component: config
 data:
-  policy.toml: |
-    [server]
-    read_only = false
-    rate_limit_rpm = 120
-    max_request_bytes = 16777216
-
-    [[services]]
-    name = "drive"
-
-    [[services.folders]]
-    path = "Projects/current-project"
-    access = "read-write"
-
-    [[services]]
-    name = "gmail"
-    denied_methods = ["messages.delete", "messages.trash"]
-
-    [[services]]
-    name = "calendar"
-
-    [[services.calendars]]
-    id = "primary"
-    access = "read-write"
+  policy.json: |
+    {
+      "server": {
+        "read_only": false,
+        "rate_limit_rpm": 120,
+        "max_request_bytes": 16777216
+      },
+      "services": [
+        {
+          "name": "drive",
+          "folders": [
+            { "path": "Projects/current-project", "access": "read-write" }
+          ]
+        },
+        {
+          "name": "gmail",
+          "denied_methods": ["messages.delete", "messages.trash"]
+        },
+        {
+          "name": "calendar",
+          "calendars": [
+            { "id": "primary", "access": "read-write" }
+          ]
+        }
+      ]
+    }

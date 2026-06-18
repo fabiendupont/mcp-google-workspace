@@ -102,8 +102,8 @@ impl Policy {
     pub fn from_file(path: &Path) -> Result<Self, GwsError> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| GwsError::Validation(format!("Failed to read policy file: {e}")))?;
-        let file: PolicyFile = toml::from_str(&content)
-            .map_err(|e| GwsError::Validation(format!("Invalid policy TOML: {e}")))?;
+        let file: PolicyFile = serde_json::from_str(&content)
+            .map_err(|e| GwsError::Validation(format!("Invalid policy JSON: {e}")))?;
         Ok(Self::from_policy_file(file))
     }
 
@@ -278,16 +278,17 @@ impl Policy {
     ) -> Result<(), GwsError> {
         if !self.is_service_allowed(service) {
             return Err(GwsError::Validation(format!(
-                "Service '{service}' is not allowed by policy"
+                "Service '{service}' is not allowed by policy. \
+                 Fix: add {{\"name\": \"{service}\"}} to the \"services\" array in your policy file"
             )));
         }
 
         let is_write = method.http_method != "GET";
 
-        // Service-level read-only check (separate from folder-level)
         if self.is_read_only(service) && is_write {
             return Err(GwsError::Validation(format!(
-                "Service '{service}' is read-only; {method_name} ({}) is not allowed",
+                "Service '{service}' is read-only; {method_name} ({}) is not allowed. \
+                 Fix: set \"read_only\": false on the \"{service}\" service in your policy file",
                 method.http_method
             )));
         }
@@ -296,7 +297,8 @@ impl Policy {
         let full_name = format!("{resource}.{method_name}");
         if denied.contains(method_name) || denied.contains(full_name.as_str()) {
             return Err(GwsError::Validation(format!(
-                "Method '{full_name}' is denied by policy"
+                "Method '{full_name}' is denied by policy. \
+                 Fix: remove \"{method_name}\" from \"denied_methods\" in the \"{service}\" service"
             )));
         }
 
@@ -354,8 +356,9 @@ impl Policy {
         if parent_ids.is_empty() {
             return Err(GwsError::Validation(format!(
                 "Write denied: 'parents' must be specified when folder restrictions are configured. \
-                 Allowed read-write folders: {}",
-                rw_ids.join(", ")
+                 Allowed read-write folders: {rw}. \
+                 Fix: include \"parents\": [\"<folder-id>\"] in the request body",
+                rw = rw_ids.join(", ")
             )));
         }
 
@@ -364,14 +367,17 @@ impl Policy {
                 Some(Access::ReadWrite) => {}
                 Some(Access::ReadOnly) => {
                     return Err(GwsError::Validation(format!(
-                        "Write denied: folder '{pid}' is read-only"
+                        "Write denied: folder '{pid}' is read-only. \
+                         Fix: change its access to \"read-write\" in your policy file, \
+                         or write to one of: {rw}",
+                        rw = rw_ids.join(", ")
                     )));
                 }
                 None => {
                     return Err(GwsError::Validation(format!(
                         "Write denied: folder '{pid}' is not in the allowed list. \
-                         Allowed read-write folders: {}",
-                        rw_ids.join(", ")
+                         Fix: add {{\"id\": \"{pid}\", \"access\": \"read-write\"}} \
+                         to the \"folders\" array in your policy file",
                     )));
                 }
             }
@@ -399,15 +405,15 @@ impl Policy {
                         Some(Access::ReadWrite) => {}
                         Some(Access::ReadOnly) => {
                             return Err(GwsError::Validation(format!(
-                                "Write denied via {key}: folder '{id}' is read-only"
+                                "Write denied via {key}: folder '{id}' is read-only. \
+                                 Fix: change its access to \"read-write\" in your policy file"
                             )));
                         }
                         None => {
-                            let rw_ids = self.folder_ids_with_access(service, Access::ReadWrite);
                             return Err(GwsError::Validation(format!(
                                 "Write denied via {key}: folder '{id}' is not in the allowed list. \
-                                 Allowed read-write folders: {}",
-                                rw_ids.join(", ")
+                                 Fix: add {{\"id\": \"{id}\", \"access\": \"read-write\"}} \
+                                 to the \"folders\" array in your policy file"
                             )));
                         }
                     }
@@ -429,13 +435,14 @@ impl Policy {
             return Ok(());
         }
 
+        let allowed_list: Vec<&str> = cals.iter().map(|c| c.id.as_str()).collect();
+        let allowed = allowed_list.join(", ");
+
         let Some(serde_json::Value::String(cal_id)) = params.get("calendarId") else {
             return Err(GwsError::Validation(format!(
-                "Calendar restrictions are configured but no calendarId specified. Allowed: {}",
-                cals.iter()
-                    .map(|c| c.id.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                "Calendar restrictions are configured but no calendarId specified. \
+                 Allowed: {allowed}. \
+                 Fix: include \"calendarId\" in the request params"
             )));
         };
 
@@ -444,18 +451,17 @@ impl Policy {
             Some(c) => {
                 if c.access == Access::ReadOnly && method.http_method != "GET" {
                     return Err(GwsError::Validation(format!(
-                        "Calendar '{cal_id}' is read-only; {} is not allowed",
+                        "Calendar '{cal_id}' is read-only; {} is not allowed. \
+                         Fix: change its access to \"read-write\" in your policy file",
                         method.http_method
                     )));
                 }
                 Ok(())
             }
             None => Err(GwsError::Validation(format!(
-                "Calendar '{cal_id}' is not allowed by policy. Allowed: {}",
-                cals.iter()
-                    .map(|c| c.id.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                "Calendar '{cal_id}' is not allowed by policy. Allowed: {allowed}. \
+                 Fix: add {{\"id\": \"{cal_id}\", \"access\": \"read-only\"}} \
+                 to the \"calendars\" array in your policy file"
             ))),
         }
     }
@@ -466,41 +472,34 @@ mod tests {
     use super::*;
 
     fn test_policy() -> Policy {
-        let toml_str = r#"
-[server]
-read_only = false
-
-[[services]]
-name = "drive"
-
-[[services.folders]]
-id = "folder-readonly"
-access = "read-only"
-
-[[services.folders]]
-id = "folder-readwrite"
-access = "read-write"
-
-[[services]]
-name = "calendar"
-
-[[services.calendars]]
-id = "primary"
-access = "read-write"
-
-[[services.calendars]]
-id = "holidays"
-access = "read-only"
-
-[[services]]
-name = "gmail"
-denied_methods = ["messages.delete", "messages.trash"]
-
-[[services]]
-name = "sheets"
-read_only = true
-"#;
-        let file: PolicyFile = toml::from_str(toml_str).unwrap();
+        let json_str = r#"{
+            "server": { "read_only": false },
+            "services": [
+                {
+                    "name": "drive",
+                    "folders": [
+                        { "id": "folder-readonly", "access": "read-only" },
+                        { "id": "folder-readwrite", "access": "read-write" }
+                    ]
+                },
+                {
+                    "name": "calendar",
+                    "calendars": [
+                        { "id": "primary", "access": "read-write" },
+                        { "id": "holidays", "access": "read-only" }
+                    ]
+                },
+                {
+                    "name": "gmail",
+                    "denied_methods": ["messages.delete", "messages.trash"]
+                },
+                {
+                    "name": "sheets",
+                    "read_only": true
+                }
+            ]
+        }"#;
+        let file: PolicyFile = serde_json::from_str(json_str).unwrap();
         Policy::from_policy_file(file)
     }
 
@@ -523,14 +522,11 @@ read_only = true
 
     #[test]
     fn test_global_read_only() {
-        let toml_str = r#"
-[server]
-read_only = true
-
-[[services]]
-name = "drive"
-"#;
-        let file: PolicyFile = toml::from_str(toml_str).unwrap();
+        let json_str = r#"{
+            "server": { "read_only": true },
+            "services": [{ "name": "drive" }]
+        }"#;
+        let file: PolicyFile = serde_json::from_str(json_str).unwrap();
         let p = Policy::from_policy_file(file);
         assert!(p.is_read_only("drive"));
     }
@@ -811,13 +807,11 @@ name = "drive"
 
     #[test]
     fn test_origin_custom_allowlist() {
-        let toml_str = r#"
-[server]
-allowed_origins = ["internal.corp.com", "dashboard.example.com"]
-[[services]]
-name = "drive"
-"#;
-        let file: PolicyFile = toml::from_str(toml_str).unwrap();
+        let json_str = r#"{
+            "server": { "allowed_origins": ["internal.corp.com", "dashboard.example.com"] },
+            "services": [{ "name": "drive" }]
+        }"#;
+        let file: PolicyFile = serde_json::from_str(json_str).unwrap();
         let p = Policy::from_policy_file(file);
         assert!(p.is_origin_allowed("https://internal.corp.com"));
         assert!(p.is_origin_allowed("https://dashboard.example.com"));
@@ -827,13 +821,11 @@ name = "drive"
 
     #[test]
     fn test_origin_custom_allowlist_rejects_substring() {
-        let toml_str = r#"
-[server]
-allowed_origins = ["corp.example.com"]
-[[services]]
-name = "drive"
-"#;
-        let file: PolicyFile = toml::from_str(toml_str).unwrap();
+        let json_str = r#"{
+            "server": { "allowed_origins": ["corp.example.com"] },
+            "services": [{ "name": "drive" }]
+        }"#;
+        let file: PolicyFile = serde_json::from_str(json_str).unwrap();
         let p = Policy::from_policy_file(file);
         assert!(p.is_origin_allowed("https://corp.example.com"));
         assert!(!p.is_origin_allowed("https://evil-corp.example.com"));
@@ -850,26 +842,22 @@ name = "drive"
 
     #[test]
     fn test_custom_max_request_bytes() {
-        let toml_str = r#"
-[server]
-max_request_bytes = 1048576
-[[services]]
-name = "drive"
-"#;
-        let file: PolicyFile = toml::from_str(toml_str).unwrap();
+        let json_str = r#"{
+            "server": { "max_request_bytes": 1048576 },
+            "services": [{ "name": "drive" }]
+        }"#;
+        let file: PolicyFile = serde_json::from_str(json_str).unwrap();
         let p = Policy::from_policy_file(file);
         assert_eq!(p.max_request_bytes, 1_048_576);
     }
 
     #[test]
     fn test_rate_limit_config() {
-        let toml_str = r#"
-[server]
-rate_limit_rpm = 60
-[[services]]
-name = "drive"
-"#;
-        let file: PolicyFile = toml::from_str(toml_str).unwrap();
+        let json_str = r#"{
+            "server": { "rate_limit_rpm": 60 },
+            "services": [{ "name": "drive" }]
+        }"#;
+        let file: PolicyFile = serde_json::from_str(json_str).unwrap();
         let p = Policy::from_policy_file(file);
         assert_eq!(p.rate_limit_rpm, Some(60));
     }

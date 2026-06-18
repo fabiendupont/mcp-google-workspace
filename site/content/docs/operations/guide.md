@@ -17,8 +17,8 @@ top = false
 Logs go to stderr via the `tracing` crate. Control with `RUST_LOG`:
 
 ```bash
-RUST_LOG=info mcp-google-workspace --policy policy.toml
-RUST_LOG=mcp_google_workspace=debug mcp-google-workspace --policy policy.toml
+RUST_LOG=info mcp-google-workspace --policy policy.json
+RUST_LOG=mcp_google_workspace=debug mcp-google-workspace --policy policy.json
 ```
 
 ## OpenTelemetry traces
@@ -27,7 +27,7 @@ Set `OTEL_EXPORTER_OTLP_ENDPOINT` to enable trace export:
 
 ```bash
 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 \
-  mcp-google-workspace --policy policy.toml
+  mcp-google-workspace --policy policy.json
 ```
 
 Traces include spans for each `execute_tool` call with service, resource, and method fields. W3C Trace Context (`traceparent`, `tracestate`, `baggage`) is forwarded from MCP `_meta` to Google API requests.

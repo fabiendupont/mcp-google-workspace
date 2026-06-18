@@ -21,7 +21,7 @@ Add to `.claude/settings.json`:
   "mcpServers": {
     "google-workspace": {
       "command": "/path/to/mcp-google-workspace",
-      "args": ["--policy", "/path/to/policy.toml"]
+      "args": ["--policy", "/path/to/policy.json"]
     }
   }
 }
@@ -33,7 +33,7 @@ Claude Code starts the binary as a child process, communicates over stdin/stdout
 
 ```bash
 podman run -p 3000:3000 \
-  -v ./policy.toml:/etc/mcp-google-workspace/policy.toml:ro,Z \
+  -v ./policy.json:/etc/mcp-google-workspace/policy.json:ro,Z \
   -v ./credentials.json:/etc/mcp-google-workspace/credentials.json:ro,Z \
   ghcr.io/fabiendupont/mcp-google-workspace:0.1.0
 ```

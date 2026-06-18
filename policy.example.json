@@ -1,0 +1,60 @@
+{
+  "server": {
+    "read_only": false,
+    "rate_limit_rpm": 120,
+    "allowed_origins": ["internal.corp.com"],
+    "credentials_file": "/path/to/credentials.json",
+    "project_id": "my-project-123456"
+  },
+  "services": [
+    {
+      "name": "drive",
+      "folders": [
+        {
+          "id": "1ABC-shared-references",
+          "access": "read-only"
+        },
+        {
+          "path": "Projects/current-project/output",
+          "access": "read-write"
+        },
+        {
+          "path": "My Drive/Shared/Templates",
+          "access": "read-only"
+        }
+      ]
+    },
+    {
+      "name": "calendar",
+      "calendars": [
+        {
+          "id": "primary",
+          "access": "read-write"
+        },
+        {
+          "id": "company-holidays@group.calendar.google.com",
+          "access": "read-only"
+        }
+      ]
+    },
+    {
+      "name": "gmail",
+      "denied_methods": [
+        "messages.delete",
+        "messages.trash",
+        "messages.batchDelete",
+        "settings.updateAutoForwarding",
+        "settings.delegates.create",
+        "settings.forwardingAddresses.create"
+      ]
+    },
+    {
+      "name": "sheets",
+      "read_only": true
+    },
+    {
+      "name": "docs",
+      "read_only": true
+    }
+  ]
+}

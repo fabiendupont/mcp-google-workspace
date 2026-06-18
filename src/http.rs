@@ -307,15 +307,11 @@ mod tests {
     }
 
     fn policy_with_origins(origins: Vec<String>) -> Arc<Policy> {
-        let toml_str = format!(
-            "[server]\nallowed_origins = [{}]\n[[services]]\nname = \"drive\"",
-            origins
-                .iter()
-                .map(|o| format!("\"{}\"", o))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        let file: crate::policy::PolicyFile = toml::from_str(&toml_str).unwrap();
+        let json_str = serde_json::json!({
+            "server": { "allowed_origins": origins },
+            "services": [{ "name": "drive" }]
+        });
+        let file: crate::policy::PolicyFile = serde_json::from_value(json_str).unwrap();
         Arc::new(Policy::from_policy_file(file))
     }
 

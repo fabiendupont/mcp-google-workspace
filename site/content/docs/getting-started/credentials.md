@@ -27,10 +27,13 @@ You can also export credentials to a file:
 gws auth export --unmasked > credentials.json
 ```
 
-```toml
-[server]
-credentials_file = "credentials.json"
-project_id = "my-project-123456"
+```json
+{
+  "server": {
+    "credentials_file": "credentials.json",
+    "project_id": "my-project-123456"
+  }
+}
 ```
 
 ## Option B: Application Default Credentials
@@ -50,9 +53,12 @@ https://www.googleapis.com/auth/calendar
 4. Share Drive folders or calendars with the service account email
 5. Reference in policy:
 
-```toml
-[server]
-credentials_file = "/path/to/service-account-key.json"
+```json
+{
+  "server": {
+    "credentials_file": "/path/to/service-account-key.json"
+  }
+}
 ```
 
 ## Credential priority
@@ -60,7 +66,7 @@ credentials_file = "/path/to/service-account-key.json"
 | Priority | Source |
 |----------|--------|
 | 1 | `GOOGLE_WORKSPACE_CLI_TOKEN` env var |
-| 2 | `credentials_file` in policy TOML |
+| 2 | `credentials_file` in policy JSON |
 | 3 | `GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE` env var |
 | 4 | `~/.config/gws/credentials.json` |
 | 5 | `gws auth export --unmasked` (OS keyring) |
@@ -71,7 +77,10 @@ credentials_file = "/path/to/service-account-key.json"
 
 When using OAuth2 user credentials, set the project ID for quota attribution:
 
-```toml
-[server]
-project_id = "my-project-123456"
+```json
+{
+  "server": {
+    "project_id": "my-project-123456"
+  }
+}
 ```

@@ -13,7 +13,7 @@ MCP server for Google Workspace APIs with per-project safety policies.
 
 Gives AI agents controlled access to Drive, Gmail, Calendar, Sheets, Docs, and
 other Google services through the [Model Context Protocol](https://modelcontextprotocol.io/).
-A TOML policy file scopes what each project can access — folder-level Drive
+A JSON policy file scopes what each project can access — folder-level Drive
 ACLs, per-calendar permissions, method denylists, and global read-only mode.
 
 ## Protocol Support
@@ -97,9 +97,12 @@ You can also export credentials to a file and reference it in the policy:
 gws auth export --unmasked > /path/to/credentials.json
 ```
 
-```toml
-[server]
-credentials_file = "/path/to/credentials.json"
+```json
+{
+  "server": {
+    "credentials_file": "/path/to/credentials.json"
+  }
+}
 ```
 
 ### Credential Priority
@@ -107,7 +110,7 @@ credentials_file = "/path/to/credentials.json"
 The server checks these locations in order:
 
 1. `GOOGLE_WORKSPACE_CLI_TOKEN` env var (raw access token)
-2. `credentials_file` from policy TOML `[server]` section
+2. `credentials_file` from policy JSON `server` object
 3. `GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE` env var
 4. `~/.config/gws/credentials.json`
 5. `gws auth export --unmasked` (reads from OS keyring)
@@ -120,7 +123,7 @@ The server checks these locations in order:
 
 ```bash
 podman run -p 3000:3000 \
-  -v ./gws-policy.toml:/etc/mcp-google-workspace/policy.toml:ro \
+  -v ./gws-policy.json:/etc/mcp-google-workspace/policy.json:ro \
   -v ./credentials.json:/secrets/credentials.json:ro \
   -e GOOGLE_APPLICATION_CREDENTIALS=/secrets/credentials.json \
   ghcr.io/fabiendupont/mcp-google-workspace:latest
@@ -130,43 +133,45 @@ podman run -p 3000:3000 \
 
 ```bash
 cargo build --release
-./target/release/mcp-google-workspace --policy gws-policy.toml
+./target/release/mcp-google-workspace --policy gws-policy.json
 ```
 
 ### HTTP Transport
 
 ```bash
-./target/release/mcp-google-workspace --policy gws-policy.toml --http 127.0.0.1:3000
+./target/release/mcp-google-workspace --policy gws-policy.json --http 127.0.0.1:3000
 ```
 
 ## Policy File
 
-Create a `gws-policy.toml` to scope agent access. See
-[`policy.example.toml`](policy.example.toml) for a full example.
+Create a `gws-policy.json` to scope agent access. See
+[`policy.example.json`](policy.example.json) for a full example.
 
-```toml
-[server]
-read_only = false
-rate_limit_rpm = 120
-# allowed_origins = ["https://internal.corp.com"]
-
-[[services]]
-name = "drive"
-
-[[services.folders]]
-path = "Projects/current-project"
-access = "read-write"
-
-[[services]]
-name = "gmail"
-denied_methods = ["messages.delete", "messages.trash"]
-
-[[services]]
-name = "calendar"
-
-[[services.calendars]]
-id = "primary"
-access = "read-write"
+```json
+{
+  "server": {
+    "read_only": false,
+    "rate_limit_rpm": 120
+  },
+  "services": [
+    {
+      "name": "drive",
+      "folders": [
+        { "path": "Projects/current-project", "access": "read-write" }
+      ]
+    },
+    {
+      "name": "gmail",
+      "denied_methods": ["messages.delete", "messages.trash"]
+    },
+    {
+      "name": "calendar",
+      "calendars": [
+        { "id": "primary", "access": "read-write" }
+      ]
+    }
+  ]
+}
 ```
 
 ## Claude Code Integration
@@ -178,7 +183,7 @@ Add to `.claude/settings.json`:
   "mcpServers": {
     "google-workspace": {
       "command": "/path/to/mcp-google-workspace",
-      "args": ["--policy", "/path/to/gws-policy.toml"]
+      "args": ["--policy", "/path/to/gws-policy.json"]
     }
   }
 }

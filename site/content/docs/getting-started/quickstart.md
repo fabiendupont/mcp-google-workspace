@@ -21,25 +21,27 @@ top = false
 
 ## 1. Create a policy file
 
-Save this as `policy.toml`:
+Save this as `policy.json`:
 
-```toml
-[server]
-project_id = "your-project-id"
-
-[[services]]
-name = "drive"
-
-[[services]]
-name = "gmail"
-denied_methods = ["messages.delete", "messages.trash"]
-
-[[services]]
-name = "calendar"
-
-[[services.calendars]]
-id = "primary"
-access = "read-write"
+```json
+{
+  "server": {
+    "project_id": "your-project-id"
+  },
+  "services": [
+    { "name": "drive" },
+    {
+      "name": "gmail",
+      "denied_methods": ["messages.delete", "messages.trash"]
+    },
+    {
+      "name": "calendar",
+      "calendars": [
+        { "id": "primary", "access": "read-write" }
+      ]
+    }
+  ]
+}
 ```
 
 This enables Drive (full access), Gmail (read and send, no delete), and Calendar (primary calendar only, read-write).
@@ -49,20 +51,20 @@ This enables Drive (full access), Gmail (read and send, no delete), and Calendar
 **Stdio (for Claude Code):**
 
 ```bash
-mcp-google-workspace --policy policy.toml
+mcp-google-workspace --policy policy.json
 ```
 
 **HTTP (for remote access):**
 
 ```bash
-mcp-google-workspace --policy policy.toml --http 127.0.0.1:3000
+mcp-google-workspace --policy policy.json --http 127.0.0.1:3000
 ```
 
 **Container:**
 
 ```bash
 podman run -p 3000:3000 \
-  -v ./policy.toml:/etc/mcp-google-workspace/policy.toml:ro,Z \
+  -v ./policy.json:/etc/mcp-google-workspace/policy.json:ro,Z \
   -v ./credentials.json:/etc/mcp-google-workspace/credentials.json:ro,Z \
   ghcr.io/fabiendupont/mcp-google-workspace:0.1.0
 ```
@@ -118,7 +120,7 @@ Add to `.claude/settings.json`:
   "mcpServers": {
     "google-workspace": {
       "command": "/path/to/mcp-google-workspace",
-      "args": ["--policy", "/path/to/policy.toml"]
+      "args": ["--policy", "/path/to/policy.json"]
     }
   }
 }
