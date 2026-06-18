@@ -2,7 +2,7 @@
 title = "Quick start"
 description = "From zero to working in 5 minutes"
 date = 2026-06-12T00:00:00+00:00
-updated = 2026-06-12T00:00:00+00:00
+updated = 2026-06-18T00:00:00+00:00
 draft = false
 weight = 30
 sort_by = "weight"
@@ -17,11 +17,23 @@ top = false
 ## Prerequisites
 
 - Google credentials configured (see [Credentials](../credentials/))
-- A policy file (we create one below)
+- The binary installed (see [Installation](../installation/))
 
 ## 1. Create a policy file
 
-Save this as `policy.json`:
+The fastest way is to use a template:
+
+```bash
+mcp-google-workspace --init-policy --template assistant > policy.json
+```
+
+Or run the interactive wizard:
+
+```bash
+mcp-google-workspace --init-policy
+```
+
+Or create `policy.json` manually:
 
 ```json
 {
@@ -32,21 +44,29 @@ Save this as `policy.json`:
     { "name": "drive" },
     {
       "name": "gmail",
-      "denied_methods": ["messages.delete", "messages.trash"]
+      "denied_methods": ["messages.delete", "messages.trash",
+        "settings.updateAutoForwarding", "settings.delegates.create",
+        "settings.forwardingAddresses.create"]
     },
     {
       "name": "calendar",
-      "calendars": [
-        { "id": "primary", "access": "read-write" }
+      "constraints": [
+        { "param": "calendarId", "values": ["primary"], "access": "read-write" }
       ]
     }
   ]
 }
 ```
 
-This enables Drive (full access), Gmail (read and send, no delete), and Calendar (primary calendar only, read-write).
+## 2. Validate the policy
 
-## 2. Start the server
+```bash
+mcp-google-workspace --check-policy policy.json
+```
+
+This shows a summary of services, constraints, and security warnings for risky configurations.
+
+## 3. Start the server
 
 **Stdio (for Claude Code):**
 
@@ -66,12 +86,12 @@ mcp-google-workspace --policy policy.json --http 127.0.0.1:3000
 podman run -p 3000:3000 \
   -v ./policy.json:/etc/mcp-google-workspace/policy.json:ro,Z \
   -v ./credentials.json:/etc/mcp-google-workspace/credentials.json:ro,Z \
-  ghcr.io/fabiendupont/mcp-google-workspace:0.1.0
+  ghcr.io/fabiendupont/mcp-google-workspace:latest
 ```
 
 > On Fedora and RHEL with SELinux enabled, the `:Z` flag is required for bind mounts.
 
-## 3. Test with a request
+## 4. Test with a request
 
 If running in HTTP mode, send a test request:
 
@@ -111,7 +131,7 @@ curl -s -X POST http://127.0.0.1:3000/mcp \
   }' | python3 -m json.tool
 ```
 
-## 4. Connect Claude Code
+## 5. Connect Claude Code
 
 Add to `.claude/settings.json`:
 
@@ -130,6 +150,6 @@ Claude Code can now use your Google Workspace data through the MCP tools.
 
 ## Next steps
 
-- [Policy reference](../../configuration/policy-reference/) — all configuration options
+- [Policy reference](../../configuration/policy-reference/) — all configuration options, constraints, templates, and CLI flags
 - [Security model](../../security/policy-engine/) — how the policy engine enforces access control
 - [Deployment guide](../../deployment/container/) — container and Kubernetes deployment

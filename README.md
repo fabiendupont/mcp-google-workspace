@@ -13,8 +13,10 @@ MCP server for Google Workspace APIs with per-project safety policies.
 
 Gives AI agents controlled access to Drive, Gmail, Calendar, Sheets, Docs, and
 other Google services through the [Model Context Protocol](https://modelcontextprotocol.io/).
-A JSON policy file scopes what each project can access — folder-level Drive
-ACLs, per-calendar permissions, method denylists, and global read-only mode.
+A JSON policy file scopes what each project can access — parameter-level
+constraints, method denylists, and global read-only mode. An interactive wizard
+and policy templates make setup easy. Audit logs, SIGHUP reload, and
+human-readable write explanations make it production-ready.
 
 ## Protocol Support
 
@@ -37,13 +39,13 @@ The policy engine enforces access control at the MCP layer, before any Google
 API call is made:
 
 - **Service allow-list**: Only listed services are exposed. Everything else is denied.
-- **Folder-level Drive ACLs**: Per-folder `read-only` or `read-write` access, enforced
-  on queries, body `parents`, and `addParents`/`removeParents` params.
-- **Per-calendar permissions**: Per-calendar access levels. Unknown calendar IDs rejected.
+- **Parameter constraints**: Generic allowlists on any API parameter with per-value access levels.
 - **Method denylists**: Block specific methods (e.g., `messages.delete`).
 - **Read-only mode**: Global or per-service.
+- **Request explanation**: Write operations include a plain-English description of what they do.
+- **Audit log**: Structured JSONL trail of every API call, allowed and denied.
+- **Live reload**: SIGHUP reloads the policy file without restart (HTTP transport).
 - **Rate limiting**: Per-client-IP sliding window (HTTP transport).
-- **Request size limit**: Configurable max request body size.
 - **Origin validation**: Configurable allowlist (default: localhost only).
 
 ## Google Credentials Setup
@@ -144,34 +146,49 @@ cargo build --release
 
 ## Policy File
 
-Create a `gws-policy.json` to scope agent access. See
-[`policy.example.json`](policy.example.json) for a full example.
+Use a template for quick setup:
+
+```bash
+mcp-google-workspace --init-policy --template assistant > gws-policy.json
+```
+
+Or run the interactive wizard:
+
+```bash
+mcp-google-workspace --init-policy
+```
+
+See [`policy.example.json`](policy.example.json) for a full example with constraints.
 
 ```json
 {
-  "server": {
-    "read_only": false,
-    "rate_limit_rpm": 120
-  },
+  "server": { "read_only": false },
   "services": [
     {
       "name": "drive",
-      "folders": [
-        { "path": "Projects/current-project", "access": "read-write" }
+      "constraints": [
+        { "param": "parents", "values": ["folder-id"], "access": "read-write", "location": "body" }
       ]
     },
     {
       "name": "gmail",
-      "denied_methods": ["messages.delete", "messages.trash"]
+      "denied_methods": ["messages.delete", "messages.trash",
+        "settings.updateAutoForwarding", "settings.delegates.create"]
     },
     {
       "name": "calendar",
-      "calendars": [
-        { "id": "primary", "access": "read-write" }
+      "constraints": [
+        { "param": "calendarId", "values": ["primary"], "access": "read-write" }
       ]
     }
   ]
 }
+```
+
+Validate before deploying:
+
+```bash
+mcp-google-workspace --check-policy gws-policy.json
 ```
 
 ## Claude Code Integration

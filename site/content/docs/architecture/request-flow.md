@@ -67,7 +67,7 @@ graph TB
 2. **Protocol** — The message is parsed, validated, and assigned an error code category
 3. **Metadata** — `_meta` is extracted for protocol version, client info, and W3C Trace Context
 4. **Dispatch** — The method is routed to the appropriate handler (tools/call, tasks/get, etc.)
-5. **Policy** — The policy engine checks service allow-list, method denylist, folder ACLs, calendar ACLs, and read-only mode
+5. **Policy** — The policy engine checks service allow-list, method denylist, parameter constraints, and read-only mode
 6. **Execute** — The Google API URL is built, OAuth token is obtained (cached), and the request is sent
 7. **Response** — The Google API response is returned to the client as MCP tool result content
 
@@ -97,11 +97,11 @@ graph LR
 | `server.rs` | JSON-RPC loop, dual-era dispatch, task chunk handling |
 | `http.rs` | Axum HTTP server, SSE, rate limiter, probes, metrics |
 | `execute.rs` | Google API execution, URL building, upload, download |
-| `policy.rs` | TOML policy engine, folder/calendar/method enforcement |
+| `policy.rs` | JSON policy engine, generic constraint enforcement |
 | `tools.rs` | Tool list from Discovery Docs, `gws_discover` handler |
 | `tasks.rs` | Task lifecycle (working, completed, failed, cancelled) |
 | `protocol.rs` | JSON-RPC types, error codes, request/response |
 | `meta.rs` | `_meta` extraction, W3C Trace Context, era detection |
 | `metrics.rs` | Prometheus counters, histograms, gauges |
 | `auth.rs` | OAuth2 credential chain with token caching |
-| `resolve.rs` | Drive folder path to ID resolution |
+| `audit.rs` | Structured JSONL audit log writer |

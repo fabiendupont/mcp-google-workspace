@@ -51,6 +51,52 @@ histogram_quantile(0.99, rate(mcp_gws_mcp_request_duration_seconds_bucket[5m])) 
 rate(mcp_gws_mcp_errors_total[5m]) / rate(mcp_gws_mcp_requests_total[5m])       # Error rate
 ```
 
+## Audit log
+
+Track every API call with a structured JSONL audit trail:
+
+```bash
+mcp-google-workspace --policy policy.json --audit-log /var/log/mcp-gws/audit.jsonl
+```
+
+Each line is a JSON object:
+
+```json
+{"timestamp":"1718745600.000","action":"allowed","service":"drive","resource":"files","method":"list","http_method":"GET","status":200,"duration_ms":142}
+{"timestamp":"1718745601.000","action":"denied","service":"docs","resource":"documents","method":"create","reason":"Service 'docs' is read-only"}
+```
+
+Use `jq` to query the audit log:
+
+```bash
+# All denied requests
+jq 'select(.action == "denied")' audit.jsonl
+
+# Drive writes in the last hour
+jq 'select(.service == "drive" and .http_method != "GET")' audit.jsonl
+
+# Slowest requests
+jq -s 'sort_by(-.duration_ms) | .[0:10]' audit.jsonl
+```
+
+## Live policy reload
+
+When running in HTTP mode with `--policy`, the server reloads the policy file on `SIGHUP`:
+
+```bash
+# Edit the policy file
+vim policy.json
+
+# Reload without restart
+kill -HUP $(pidof mcp-google-workspace)
+```
+
+The server logs the result:
+- Success: `Policy reloaded` with the new service list
+- Failure: `Policy reload failed, keeping current policy` with the error
+
+Not available in stdio mode (the MCP client manages the process lifecycle).
+
 ## Multi-user deployment
 
 The server runs as a single-user process. For multi-user environments, deploy one instance per user. Each instance gets its own credentials Secret, policy ConfigMap, and Deployment.

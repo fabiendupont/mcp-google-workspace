@@ -6,15 +6,18 @@ Written in Rust, uses direct Google REST API calls (not a CLI wrapper).
 ## Architecture
 
 ```
-main.rs       — CLI arg parsing (--policy / --services), tokio entrypoint
-server.rs     — JSON-RPC stdio loop, dual-era MCP dispatch (2024-11-05 + 2026-07-28)
+main.rs       — CLI arg parsing, templates, interactive wizard, policy checker
+server.rs     — JSON-RPC stdio loop, dual-era MCP dispatch, request explanation
 protocol.rs   — Typed JSON-RPC layer: request parsing, error codes, response construction
 meta.rs       — Request metadata extraction (_meta, W3C Trace Context)
 tools.rs      — Builds MCP tool list from Google Discovery Documents, handles gws_discover
-execute.rs    — HTTP execution: URL template rendering, params, pagination, policy enforcement
-policy.rs     — JSON policy engine: per-service, per-folder, per-calendar, method denylists
+execute.rs    — HTTP execution: URL template rendering, params, pagination, auto-resumable uploads
+policy.rs     — JSON policy engine: generic constraints, method denylists, read-only mode
 auth.rs       — OAuth2 chain: env var → credentials file → service account → ADC/gcloud
-resolve.rs    — Drive folder path → ID resolution at startup
+audit.rs      — Structured JSONL audit log writer
+http.rs       — Axum HTTP server, SSE streaming, rate limiter, SIGHUP reload, session IDs
+tasks.rs      — Task lifecycle for resumable uploads and chunked downloads
+metrics.rs    — Prometheus counters, histograms, gauges
 ```
 
 ## Key Design Decisions
@@ -23,8 +26,8 @@ resolve.rs    — Drive folder path → ID resolution at startup
   API's resources/methods/parameters. No hardcoded API list — new endpoints appear
   automatically.
 - **Policy-as-code**: A JSON file scopes what an agent can access per-project.
-  Supports folder-level Drive ACLs, per-calendar access, method denylists, and
-  global read-only mode. See `policy.example.json`.
+  Generic parameter constraints, method denylists, and read-only mode.
+  See `policy.example.json`.
 - **One tool per service**: Each Google service (drive, gmail, calendar) is exposed
   as a single MCP tool. The agent specifies `resource` and `method` as arguments.
   `gws_discover` is a meta-tool for schema introspection.
@@ -35,16 +38,14 @@ resolve.rs    — Drive folder path → ID resolution at startup
 ## Dependencies
 
 - `google-workspace` crate: git dependency from `github.com/googleworkspace/cli` (pinned to rev `a3768d0`).
-  This is a library crate from the gws CLI project — it provides Discovery Document
-  parsing, service name resolution, shared HTTP client, and input validation.
-- OAuth2 credentials: Requires one of: `GWS_ACCESS_TOKEN` env var, `~/.config/gws/credentials.json`,
-  service account key, or Application Default Credentials (gcloud auth).
+- `dialoguer` crate: interactive terminal prompts for the policy wizard.
+- OAuth2 credentials: Requires one of the 7 sources in the credential chain.
 
 ## Build and Test
 
 ```bash
 cargo check          # Type-check
-cargo test           # 183 unit tests across all modules
+cargo test           # 185 unit tests across all modules
 cargo build --release
 ```
 
@@ -54,8 +55,14 @@ cargo build --release
 # With policy file (recommended)
 ./target/release/mcp-google-workspace --policy gws-policy.json
 
+# With template
+./target/release/mcp-google-workspace --init-policy --template assistant > policy.json
+
 # With service list (no constraints)
 ./target/release/mcp-google-workspace --services drive,gmail,calendar
+
+# HTTP transport with audit log
+./target/release/mcp-google-workspace --policy gws-policy.json --http 127.0.0.1:3000 --audit-log audit.jsonl
 ```
 
 ## Claude Code integration
@@ -72,36 +79,9 @@ Add to `.claude/settings.json`:
 }
 ```
 
-## What's Done
-
-- Full MCP JSON-RPC server over stdio with dual-era support (2024-11-05 legacy + 2026-07-28 modern)
-- Typed JSON-RPC protocol layer with correct error codes (-32700, -32600, -32601, -32602, -32603)
-- `server/discover` method for modern capability discovery (SEP-2575)
-- `_meta` extraction with W3C Trace Context forwarding (SEP-414)
-- Cursor-based pagination on `tools/list` with `ttlMs`/`cacheScope` cache hints (SEP-2549)
-- Tool `title`, `annotations` (readOnlyHint, destructiveHint, etc.)
-- `structuredContent` in tool call results alongside text `content`
-- Media upload (base64 → multipart/related) and download (binary → base64 MCP content)
-- Discovery document caching (fetched once, reused across requests)
-- Narrowest-scope OAuth selection (prefers `.readonly` suffixes)
-- Hard-fail on auth failure (no silent unauthenticated requests)
-- Drive folder enforcement for `addParents`/`removeParents` query params
-- Pre-initialization blocking for legacy clients
-- Request ID uniqueness tracking
-- Progress notifications during auto-pagination
-- Policy engine with JSON parsing, interactive wizard, and security warnings
-- `ping` support
-- Sorted, deterministic tool ordering
-
-## What's Missing
-
-No major features remain. Potential future work:
-- Resumable uploads for files > 10MB
-- Streamable HTTP transport (currently stdio-only)
-
 ## Code Conventions
 
 - No comments unless the why is non-obvious
 - Error handling via `google_workspace::error::GwsError`
 - Tracing goes to stderr, MCP JSON-RPC to stdout
-- Policy tests use `#[cfg(test)]` inline in policy.rs
+- Policy tests use `#[cfg(test)]` inline in each module

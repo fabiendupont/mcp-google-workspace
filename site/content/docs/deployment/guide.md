@@ -35,7 +35,7 @@ Claude Code starts the binary as a child process, communicates over stdin/stdout
 podman run -p 3000:3000 \
   -v ./policy.json:/etc/mcp-google-workspace/policy.json:ro,Z \
   -v ./credentials.json:/etc/mcp-google-workspace/credentials.json:ro,Z \
-  ghcr.io/fabiendupont/mcp-google-workspace:0.1.0
+  ghcr.io/fabiendupont/mcp-google-workspace:latest
 ```
 
 > On Fedora and RHEL with SELinux, the `:Z` flag is required for bind mounts.

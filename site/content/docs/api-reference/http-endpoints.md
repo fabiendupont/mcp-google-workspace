@@ -2,7 +2,7 @@
 title = "HTTP endpoints"
 description = "HTTP endpoint reference"
 date = 2026-06-12T00:00:00+00:00
-updated = 2026-06-12T00:00:00+00:00
+updated = 2026-06-18T00:00:00+00:00
 draft = false
 weight = 30
 template = "docs/page.html"
@@ -14,10 +14,31 @@ top = false
 
 ## MCP
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST /mcp` | MCP JSON-RPC endpoint | Send MCP requests |
-| `GET /mcp` | SSE notification stream | Requires `Accept: text/event-stream` |
+| Method | Path | Content-Type | Description |
+|--------|------|-------------|-------------|
+| `POST /mcp` | `/mcp` | `application/json` | MCP JSON-RPC endpoint (synchronous response) |
+| `POST /mcp` | `/mcp` | `text/event-stream` | MCP JSON-RPC with SSE streaming (when `Accept: text/event-stream`) |
+| `GET /mcp` | `/mcp` | `text/event-stream` | SSE notification stream (requires `Accept: text/event-stream`) |
+
+### Streamable HTTP
+
+When the client sends `Accept: text/event-stream` on a POST request, the server returns an SSE stream instead of a single JSON response. Notifications are sent inline as `event: notification` messages, followed by the final result as `event: message`:
+
+```
+event: notification
+data: {"jsonrpc":"2.0","method":"notifications/progress","params":{"progress":50,"total":100}}
+
+event: message
+data: {"jsonrpc":"2.0","id":1,"result":{"content":[...]}}
+```
+
+Clients that send `Accept: application/json` (or no Accept header) receive the standard synchronous JSON response.
+
+### Response headers
+
+| Header | Description |
+|--------|-------------|
+| `Mcp-Session-Id` | Session identifier, returned on every POST response |
 
 ## Probes
 
