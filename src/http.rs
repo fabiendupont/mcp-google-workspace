@@ -10,7 +10,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 
@@ -49,7 +49,9 @@ impl RateLimiter {
 
 #[derive(Clone)]
 struct AppState {
-    policy: Arc<Policy>,
+    policy: Arc<RwLock<Policy>>,
+    #[allow(dead_code)]
+    policy_path: Option<std::path::PathBuf>,
     state: Arc<Mutex<ServerState>>,
     notify_tx: broadcast::Sender<Value>,
     rate_limiter: Option<Arc<Mutex<RateLimiter>>>,
@@ -57,18 +59,20 @@ struct AppState {
 }
 
 pub async fn serve(
-    policy: Arc<Policy>,
+    policy: Arc<RwLock<Policy>>,
+    policy_path: Option<std::path::PathBuf>,
     state: Arc<Mutex<ServerState>>,
     addr: &str,
 ) -> Result<(), GwsError> {
     let (notify_tx, _) = broadcast::channel::<Value>(256);
 
-    let rate_limiter = policy.rate_limit_rpm.map(|rpm| {
+    let p = policy.read().await;
+    let rate_limiter = p.rate_limit_rpm.map(|rpm| {
         tracing::info!(rate_limit_rpm = rpm, "Rate limiting enabled");
         Arc::new(Mutex::new(RateLimiter::new(rpm)))
     });
-
-    let max_body = policy.max_request_bytes;
+    let max_body = p.max_request_bytes;
+    drop(p);
 
     let session_id = Arc::new(format!(
         "{:016x}",
@@ -79,12 +83,36 @@ pub async fn serve(
     ));
 
     let app_state = AppState {
-        policy,
+        policy: policy.clone(),
+        policy_path: policy_path.clone(),
         state,
         notify_tx,
         rate_limiter,
         session_id,
     };
+
+    if policy_path.is_some() {
+        let reload_policy = policy.clone();
+        let reload_path = policy_path.clone().unwrap();
+        tokio::spawn(async move {
+            let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+                .expect("failed to register SIGHUP handler");
+            loop {
+                sighup.recv().await;
+                tracing::info!("Received SIGHUP, reloading policy");
+                match Policy::from_file(&reload_path) {
+                    Ok(new_policy) => {
+                        let svcs = new_policy.allowed_services().join(", ");
+                        *reload_policy.write().await = new_policy;
+                        tracing::info!(services = %svcs, "Policy reloaded");
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "Policy reload failed, keeping current policy");
+                    }
+                }
+            }
+        });
+    }
 
     let app = Router::new()
         .route("/mcp", post(handle_post))
@@ -129,8 +157,11 @@ async fn handle_post(
     headers: HeaderMap,
     body: String,
 ) -> impl IntoResponse {
-    if let Err(resp) = validate_origin(&headers, &app.policy) {
-        return *resp;
+    {
+        let policy = app.policy.read().await;
+        if let Err(resp) = validate_origin(&headers, &policy) {
+            return *resp;
+        }
     }
 
     if let Some(ref rl) = app.rate_limiter {
@@ -184,11 +215,11 @@ async fn handle_post(
         return handle_post_streaming(app, req, meta).await;
     }
 
+    let policy = app.policy.read().await;
     let mut state = app.state.lock().await;
 
     let (response, notifications) =
-        crate::server::handle_request(&req.method, &req.params, &meta, &app.policy, &mut state)
-            .await;
+        crate::server::handle_request(&req.method, &req.params, &meta, &policy, &mut state).await;
 
     for notif in &notifications {
         let _ = app.notify_tx.send(notif.clone());
@@ -216,10 +247,11 @@ async fn handle_post_streaming(
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(64);
 
     tokio::spawn(async move {
+        let policy = app.policy.read().await;
         let mut state = app.state.lock().await;
 
         let (response, notifications) =
-            crate::server::handle_request(&req.method, &req.params, &meta, &app.policy, &mut state)
+            crate::server::handle_request(&req.method, &req.params, &meta, &policy, &mut state)
                 .await;
 
         for notif in &notifications {
@@ -248,8 +280,11 @@ async fn handle_post_streaming(
 
 #[axum::debug_handler]
 async fn handle_get(State(app): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if let Err(resp) = validate_origin(&headers, &app.policy) {
-        return *resp;
+    {
+        let policy = app.policy.read().await;
+        if let Err(resp) = validate_origin(&headers, &policy) {
+            return *resp;
+        }
     }
 
     let accept = headers

@@ -161,7 +161,8 @@ pub async fn run_stdio(
 }
 
 pub async fn run_http(
-    policy: Arc<Policy>,
+    policy: Policy,
+    policy_path: Option<std::path::PathBuf>,
     addr: &str,
     audit: Option<Arc<crate::audit::AuditLogger>>,
 ) -> Result<(), GwsError> {
@@ -169,8 +170,9 @@ pub async fn run_http(
     s.audit = audit;
     s.era = ClientEra::Modern;
     let state = Arc::new(Mutex::new(s));
+    let policy = Arc::new(tokio::sync::RwLock::new(policy));
 
-    crate::http::serve(policy, state, addr).await
+    crate::http::serve(policy, policy_path, state, addr).await
 }
 
 pub(crate) fn detect_era(era: &mut ClientEra, method: &str, meta: &RequestMeta) {

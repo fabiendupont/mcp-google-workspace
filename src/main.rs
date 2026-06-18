@@ -860,6 +860,7 @@ async fn main() {
     init_telemetry();
 
     let audit_log_path = parsed.audit_log.clone();
+    let policy_file_path = parsed.policy_path.clone();
 
     let (policy, transport) = match resolve_config(parsed) {
         Ok(p) => p,
@@ -881,7 +882,7 @@ async fn main() {
 
     let result = match transport {
         Transport::Stdio => server::run_stdio(policy, audit).await,
-        Transport::Http(addr) => server::run_http(Arc::new(policy), &addr, audit).await,
+        Transport::Http(addr) => server::run_http(policy, policy_file_path, &addr, audit).await,
     };
 
     if let Err(e) = result {
