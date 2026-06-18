@@ -590,15 +590,101 @@ async fn handle_tool_call_inner(
         })
     } else {
         let text = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
+        let mut structured = result.clone();
+        if method.http_method != "GET" {
+            let explanation =
+                explain_request(svc_alias, resource_path, method_name, method, arguments);
+            structured["_explanation"] = json!(explanation);
+        }
         json!({
             "content": [{ "type": "text", "text": text }],
-            "structuredContent": result,
+            "structuredContent": structured,
             "isError": false
         })
     };
 
     state.token_cache = tc;
     Ok((mcp_result, notifications))
+}
+
+fn explain_request(
+    service: &str,
+    resource: &str,
+    method_name: &str,
+    method: &google_workspace::discovery::RestMethod,
+    arguments: &Value,
+) -> String {
+    let verb = match method.http_method.as_str() {
+        "POST" => "Create",
+        "PUT" => "Replace",
+        "PATCH" => "Update",
+        "DELETE" => "Delete",
+        _ => "Modify",
+    };
+
+    let params = arguments
+        .get("params")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let body = arguments.get("body");
+
+    let mut details = Vec::new();
+
+    // Extract key identifiers from params
+    for key in [
+        "fileId",
+        "messageId",
+        "eventId",
+        "spreadsheetId",
+        "documentId",
+        "presentationId",
+    ] {
+        if let Some(Value::String(val)) = params.get(key) {
+            details.push(format!("{key}={val}"));
+        }
+    }
+
+    // Extract names and subjects from body
+    if let Some(b) = body {
+        if let Some(Value::String(name)) = b.get("name") {
+            details.push(format!("name=\"{name}\""));
+        }
+        if let Some(Value::String(subj)) = b.get("subject") {
+            details.push(format!("subject=\"{subj}\""));
+        }
+        if let Some(Value::String(summary)) = b.get("summary") {
+            details.push(format!("summary=\"{summary}\""));
+        }
+        if let Some(Value::Array(parents)) = b.get("parents") {
+            let ids: Vec<&str> = parents.iter().filter_map(|v| v.as_str()).collect();
+            if !ids.is_empty() {
+                details.push(format!("in folder {}", ids.join(", ")));
+            }
+        }
+        if let Some(Value::Array(to)) = b.get("to") {
+            let addrs: Vec<&str> = to.iter().filter_map(|v| v.as_str()).collect();
+            if !addrs.is_empty() {
+                details.push(format!("to {}", addrs.join(", ")));
+            }
+        }
+    }
+
+    // Calendar-specific
+    if let Some(Value::String(cal)) = params.get("calendarId") {
+        details.push(format!("on calendar \"{cal}\""));
+    }
+
+    let detail_str = if details.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", details.join(", "))
+    };
+
+    format!(
+        "{verb} {service}/{resource}.{method_name} ({}){detail_str}",
+        method.http_method
+    )
 }
 
 const DOWNLOAD_CHUNK_B64_SIZE: usize = 10 * 1024 * 1024 * 4 / 3 + 4;
@@ -1227,5 +1313,71 @@ mod tests {
         let resp = chunk_response("dl1", "AA", 98, 100, 100, 75, "text/plain", true);
         assert_eq!(resp["structuredContent"]["status"], "complete");
         assert!(resp["structuredContent"]["is_last"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn test_explain_create_file() {
+        let method = google_workspace::discovery::RestMethod {
+            http_method: "POST".to_string(),
+            ..Default::default()
+        };
+        let args = json!({
+            "resource": "files",
+            "method": "create",
+            "body": { "name": "report.pdf", "parents": ["folder-123"] }
+        });
+        let explanation = explain_request("drive", "files", "create", &method, &args);
+        assert!(explanation.contains("Create"));
+        assert!(explanation.contains("drive/files.create"));
+        assert!(explanation.contains("report.pdf"));
+        assert!(explanation.contains("folder-123"));
+    }
+
+    #[test]
+    fn test_explain_delete() {
+        let method = google_workspace::discovery::RestMethod {
+            http_method: "DELETE".to_string(),
+            ..Default::default()
+        };
+        let args = json!({
+            "resource": "files",
+            "method": "delete",
+            "params": { "fileId": "abc123" }
+        });
+        let explanation = explain_request("drive", "files", "delete", &method, &args);
+        assert!(explanation.contains("Delete"));
+        assert!(explanation.contains("fileId=abc123"));
+    }
+
+    #[test]
+    fn test_explain_calendar_event() {
+        let method = google_workspace::discovery::RestMethod {
+            http_method: "POST".to_string(),
+            ..Default::default()
+        };
+        let args = json!({
+            "resource": "events",
+            "method": "insert",
+            "params": { "calendarId": "primary" },
+            "body": { "summary": "Team standup" }
+        });
+        let explanation = explain_request("calendar", "events", "insert", &method, &args);
+        assert!(explanation.contains("Create"));
+        assert!(explanation.contains("Team standup"));
+        assert!(explanation.contains("primary"));
+    }
+
+    #[test]
+    fn test_explain_get_no_explanation() {
+        let method = google_workspace::discovery::RestMethod {
+            http_method: "GET".to_string(),
+            ..Default::default()
+        };
+        let args = json!({
+            "resource": "files",
+            "method": "list"
+        });
+        let explanation = explain_request("drive", "files", "list", &method, &args);
+        assert!(explanation.contains("Modify"));
     }
 }
