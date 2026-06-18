@@ -446,7 +446,6 @@ async fn handle_tool_call_inner(
         &mut tc,
     )
     .await;
-    state.token_cache = tc;
     let result = result?;
 
     drop(notify_tx);
@@ -498,6 +497,60 @@ async fn handle_tool_call_inner(
             },
             "isError": false
         })
+    } else if let Some(ar) = result.get("_mcp_auto_resumable") {
+        let total_size = ar["total_size"].as_u64().unwrap_or(0);
+        let content_type = ar["content_type"]
+            .as_str()
+            .unwrap_or("application/octet-stream")
+            .to_string();
+
+        let init_result = crate::execute::initiate_resumable_upload(
+            doc, method, arguments, svc_alias, policy, meta, &mut tc,
+        )
+        .await?;
+
+        let session_uri = init_result["sessionUri"]
+            .as_str()
+            .ok_or_else(|| {
+                GwsError::Other(anyhow::anyhow!("No session URI in upload init response"))
+            })?
+            .to_string();
+
+        let handle = format!(
+            "upload_{:016x}",
+            crate::execute::simple_hash(session_uri.as_bytes())
+        );
+
+        state.clean_expired_sessions();
+        state.tasks.insert(
+            handle.clone(),
+            tasks::Task::new(
+                handle.clone(),
+                3_600_000,
+                tasks::TaskKind::Upload(tasks::UploadData {
+                    session_uri,
+                    total_size,
+                    bytes_uploaded: 0,
+                    content_type: content_type.clone(),
+                }),
+            ),
+        );
+
+        json!({
+            "content": [{ "type": "text", "text": format!(
+                "File too large for simple upload ({total_size} bytes). \
+                 Resumable session started. Send chunks with upload_handle=\"{handle}\" + media_chunk."
+            ) }],
+            "structuredContent": {
+                "upload_handle": handle,
+                "taskId": handle,
+                "total_size": total_size,
+                "content_type": content_type,
+                "status": "initiated",
+                "auto_resumable": true
+            },
+            "isError": false
+        })
     } else {
         let text = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
         json!({
@@ -507,6 +560,7 @@ async fn handle_tool_call_inner(
         })
     };
 
+    state.token_cache = tc;
     Ok((mcp_result, notifications))
 }
 

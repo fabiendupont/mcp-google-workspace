@@ -128,16 +128,14 @@ pub async fn execute_tool(
         if is_upload && let Some(b64_data) = media_data {
             let raw_bytes = b64_decode(b64_data)?;
             if raw_bytes.len() > MAX_UPLOAD_BYTES {
-                return Err(GwsError::Validation(format!(
-                    "Media upload too large: {} bytes (max {})",
-                    raw_bytes.len(),
-                    MAX_UPLOAD_BYTES
-                )));
+                dry["auto_resumable"] = json!(true);
+                dry["upload_total_size"] = json!(raw_bytes.len());
+            } else {
+                let (multipart_body, content_type) =
+                    build_multipart_body(&body, &raw_bytes, media_content_type)?;
+                dry["upload_content_type"] = json!(content_type);
+                dry["upload_body_size"] = json!(multipart_body.len());
             }
-            let (multipart_body, content_type) =
-                build_multipart_body(&body, &raw_bytes, media_content_type)?;
-            dry["upload_content_type"] = json!(content_type);
-            dry["upload_body_size"] = json!(multipart_body.len());
         }
         if let Some(ref b) = body {
             dry["body"] = b.clone();
@@ -188,11 +186,12 @@ pub async fn execute_tool(
             if let Some(b64_data) = media_data {
                 let raw_bytes = b64_decode(b64_data)?;
                 if raw_bytes.len() > MAX_UPLOAD_BYTES {
-                    return Err(GwsError::Validation(format!(
-                        "Media upload too large: {} bytes (max {})",
-                        raw_bytes.len(),
-                        MAX_UPLOAD_BYTES
-                    )));
+                    return Ok(json!({
+                        "_mcp_auto_resumable": {
+                            "total_size": raw_bytes.len(),
+                            "content_type": media_content_type
+                        }
+                    }));
                 }
                 let (multipart_body, content_type) =
                     build_multipart_body(&body, &raw_bytes, media_content_type)?;
@@ -1219,12 +1218,13 @@ mod tests {
             "media_content_type": "application/octet-stream"
         });
 
-        let err = execute_tool(
+        let result = execute_tool(
             &doc, &method, "files", "create", &args, "drive", &policy, &meta, None, true, &mut None,
         )
-        .await;
+        .await
+        .unwrap();
 
-        assert!(err.is_err());
-        assert!(err.unwrap_err().to_string().contains("too large"));
+        assert_eq!(result["auto_resumable"], true);
+        assert!(result["upload_total_size"].as_u64().unwrap() > MAX_UPLOAD_BYTES as u64);
     }
 }
