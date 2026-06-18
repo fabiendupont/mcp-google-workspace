@@ -53,6 +53,7 @@ struct AppState {
     state: Arc<Mutex<ServerState>>,
     notify_tx: broadcast::Sender<Value>,
     rate_limiter: Option<Arc<Mutex<RateLimiter>>>,
+    session_id: Arc<String>,
 }
 
 pub async fn serve(
@@ -69,11 +70,20 @@ pub async fn serve(
 
     let max_body = policy.max_request_bytes;
 
+    let session_id = Arc::new(format!(
+        "{:016x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+
     let app_state = AppState {
         policy,
         state,
         notify_tx,
         rate_limiter,
+        session_id,
     };
 
     let app = Router::new()
@@ -165,6 +175,15 @@ async fn handle_post(
         return (StatusCode::BAD_REQUEST, Json(resp.to_json())).into_response();
     }
 
+    let accepts_sse = headers
+        .get("accept")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|a| a.contains("text/event-stream"));
+
+    if accepts_sse {
+        return handle_post_streaming(app, req, meta).await;
+    }
+
     let mut state = app.state.lock().await;
 
     let (response, notifications) =
@@ -181,7 +200,50 @@ async fn handle_post(
     };
 
     let json = resp.to_json();
-    (StatusCode::OK, Json(json)).into_response()
+    let mut response = (StatusCode::OK, Json(json)).into_response();
+    if let Ok(val) = axum::http::HeaderValue::from_str(&app.session_id) {
+        response.headers_mut().insert("mcp-session-id", val);
+    }
+    response
+}
+
+async fn handle_post_streaming(
+    app: AppState,
+    req: protocol::JsonRpcRequest,
+    meta: RequestMeta,
+) -> axum::response::Response {
+    let id = req.id.clone().unwrap();
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(64);
+
+    tokio::spawn(async move {
+        let mut state = app.state.lock().await;
+
+        let (response, notifications) =
+            crate::server::handle_request(&req.method, &req.params, &meta, &app.policy, &mut state)
+                .await;
+
+        for notif in &notifications {
+            let _ = app.notify_tx.send(notif.clone());
+            let data = serde_json::to_string(notif).unwrap_or_default();
+            let _ = tx
+                .send(Ok(Event::default().event("notification").data(data)))
+                .await;
+        }
+
+        let resp = match response {
+            Ok(result) => protocol::success(&id, result),
+            Err(err_resp) => err_resp,
+        };
+        let data = serde_json::to_string(&resp.to_json()).unwrap_or_default();
+        let _ = tx
+            .send(Ok(Event::default().event("message").data(data)))
+            .await;
+    });
+
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 #[axum::debug_handler]
@@ -420,5 +482,31 @@ mod tests {
         assert!(rl.check("client1"));
         assert!(!rl.check("client1"));
         assert!(rl.check("client2"));
+    }
+
+    #[test]
+    fn test_accepts_sse_detection() {
+        let mut headers = HeaderMap::new();
+        headers.insert("accept", HeaderValue::from_static("text/event-stream"));
+        let accepts = headers
+            .get("accept")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|a| a.contains("text/event-stream"));
+        assert!(accepts);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("accept", HeaderValue::from_static("application/json"));
+        let accepts = headers
+            .get("accept")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|a| a.contains("text/event-stream"));
+        assert!(!accepts);
+
+        let headers = HeaderMap::new();
+        let accepts = headers
+            .get("accept")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|a| a.contains("text/event-stream"));
+        assert!(!accepts);
     }
 }
