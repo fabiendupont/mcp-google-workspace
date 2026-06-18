@@ -23,6 +23,7 @@ pub(crate) struct ServerState {
     pub active_ids: HashSet<String>,
     pub tasks: HashMap<String, tasks::Task>,
     pub token_cache: Option<crate::auth::TokenCache>,
+    pub audit: Option<Arc<crate::audit::AuditLogger>>,
 }
 
 #[derive(Debug)]
@@ -41,6 +42,7 @@ impl ServerState {
             active_ids: HashSet::new(),
             tasks: HashMap::new(),
             token_cache: None,
+            audit: None,
         }
     }
 
@@ -65,7 +67,10 @@ impl ServerState {
     }
 }
 
-pub async fn run_stdio(policy: Policy) -> Result<(), GwsError> {
+pub async fn run_stdio(
+    policy: Policy,
+    audit: Option<Arc<crate::audit::AuditLogger>>,
+) -> Result<(), GwsError> {
     let svc_list = policy.allowed_services();
     if svc_list.is_empty() {
         tracing::warn!("No services configured. Zero tools will be exposed.");
@@ -73,9 +78,11 @@ pub async fn run_stdio(policy: Policy) -> Result<(), GwsError> {
         tracing::info!(services = %svc_list.join(", "), "Starting MCP server");
     }
 
+    let mut state = ServerState::new();
+    state.audit = audit;
+
     let mut stdin = BufReader::new(tokio::io::stdin()).lines();
     let mut stdout = tokio::io::stdout();
-    let mut state = ServerState::new();
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| GwsError::Other(anyhow::anyhow!("Failed to register SIGTERM handler: {e}")))?;
 
@@ -153,10 +160,15 @@ pub async fn run_stdio(policy: Policy) -> Result<(), GwsError> {
     Ok(())
 }
 
-pub async fn run_http(policy: Arc<Policy>, addr: &str) -> Result<(), GwsError> {
-    let state = Arc::new(Mutex::new(ServerState::new()));
-    // Force modern era for HTTP clients
-    state.lock().await.era = ClientEra::Modern;
+pub async fn run_http(
+    policy: Arc<Policy>,
+    addr: &str,
+    audit: Option<Arc<crate::audit::AuditLogger>>,
+) -> Result<(), GwsError> {
+    let mut s = ServerState::new();
+    s.audit = audit;
+    s.era = ClientEra::Modern;
+    let state = Arc::new(Mutex::new(s));
 
     crate::http::serve(policy, state, addr).await
 }
@@ -355,6 +367,7 @@ async fn handle_tool_call_inner(
         .ok_or_else(|| GwsError::Validation("Missing 'method' argument".to_string()))?;
 
     let mut tc = state.token_cache.take();
+    let audit = state.audit.clone();
     let doc = state.get_doc(svc_alias).await?;
 
     let resource = tools::find_resource(&doc.resources, resource_path).ok_or_else(|| {
@@ -432,6 +445,7 @@ async fn handle_tool_call_inner(
 
     let (notify_tx, mut notify_rx) = tokio::sync::mpsc::unbounded_channel();
 
+    let exec_start = Instant::now();
     let result = crate::execute::execute_tool(
         doc,
         method,
@@ -446,6 +460,27 @@ async fn handle_tool_call_inner(
         &mut tc,
     )
     .await;
+    let duration_ms = exec_start.elapsed().as_millis() as u64;
+
+    match &result {
+        Ok(_) => {
+            if let Some(ref a) = audit {
+                a.log_allowed(
+                    svc_alias,
+                    resource_path,
+                    method_name,
+                    &method.http_method,
+                    200,
+                    duration_ms,
+                );
+            }
+        }
+        Err(e) => {
+            if let Some(ref a) = audit {
+                a.log_denied(svc_alias, resource_path, method_name, &e.to_string());
+            }
+        }
+    }
     let result = result?;
 
     drop(notify_tx);

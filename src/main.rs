@@ -1,3 +1,4 @@
+mod audit;
 mod auth;
 mod execute;
 mod http;
@@ -41,6 +42,7 @@ struct ParsedArgs {
     policy_path: Option<PathBuf>,
     services_str: Option<String>,
     http_addr: Option<String>,
+    audit_log: Option<PathBuf>,
 }
 
 fn print_usage() {
@@ -68,6 +70,7 @@ fn print_usage() {
     eprintln!(
         "  --verify              With --check-policy: test credentials and resolve folder paths"
     );
+    eprintln!("  --audit-log <path>    Write structured audit log (JSONL) of all API calls");
     eprintln!("  --help                Show this help message");
 }
 
@@ -79,6 +82,7 @@ fn parse_args_from(args: &[String]) -> Result<Command, GwsError> {
     let mut check_policy_path: Option<PathBuf> = None;
     let mut verify = false;
     let mut template: Option<String> = None;
+    let mut audit_log: Option<PathBuf> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -127,6 +131,15 @@ fn parse_args_from(args: &[String]) -> Result<Command, GwsError> {
                 }
                 template = Some(args[i].clone());
             }
+            "--audit-log" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(GwsError::Validation(
+                        "--audit-log requires a file path".to_string(),
+                    ));
+                }
+                audit_log = Some(PathBuf::from(&args[i]));
+            }
             "--check-policy" => {
                 i += 1;
                 if i >= args.len() {
@@ -156,6 +169,7 @@ fn parse_args_from(args: &[String]) -> Result<Command, GwsError> {
         policy_path,
         services_str,
         http_addr,
+        audit_log,
     }))
 }
 
@@ -845,6 +859,8 @@ async fn main() {
 
     init_telemetry();
 
+    let audit_log_path = parsed.audit_log.clone();
+
     let (policy, transport) = match resolve_config(parsed) {
         Ok(p) => p,
         Err(e) => {
@@ -854,9 +870,18 @@ async fn main() {
         }
     };
 
+    let audit = audit_log_path.map(|path| {
+        let logger = audit::AuditLogger::new(path.clone()).unwrap_or_else(|e| {
+            eprintln!("Error opening audit log {}: {e}", path.display());
+            std::process::exit(1);
+        });
+        eprintln!("[mcp-gws] Audit log: {}", logger.path().display());
+        Arc::new(logger)
+    });
+
     let result = match transport {
-        Transport::Stdio => server::run_stdio(policy).await,
-        Transport::Http(addr) => server::run_http(Arc::new(policy), &addr).await,
+        Transport::Stdio => server::run_stdio(policy, audit).await,
+        Transport::Http(addr) => server::run_http(Arc::new(policy), &addr, audit).await,
     };
 
     if let Err(e) = result {
@@ -960,6 +985,7 @@ mod tests {
             policy_path: None,
             services_str: Some("drive,gmail".to_string()),
             http_addr: None,
+            audit_log: None,
         };
         let (policy, _) = resolve_config(parsed).unwrap();
         assert!(policy.is_service_allowed("drive"));
@@ -973,6 +999,7 @@ mod tests {
             policy_path: None,
             services_str: None,
             http_addr: None,
+            audit_log: None,
         };
         assert!(resolve_config(parsed).is_err());
     }
@@ -983,6 +1010,7 @@ mod tests {
             policy_path: None,
             services_str: Some("drive".to_string()),
             http_addr: Some("0.0.0.0:8080".to_string()),
+            audit_log: None,
         };
         let (_, transport) = resolve_config(parsed).unwrap();
         assert!(matches!(transport, Transport::Http(addr) if addr == "0.0.0.0:8080"));
@@ -994,6 +1022,7 @@ mod tests {
             policy_path: None,
             services_str: Some("drive".to_string()),
             http_addr: None,
+            audit_log: None,
         };
         let (_, transport) = resolve_config(parsed).unwrap();
         assert!(matches!(transport, Transport::Stdio));
@@ -1005,6 +1034,7 @@ mod tests {
             policy_path: Some(PathBuf::from("/nonexistent/path/policy.json")),
             services_str: None,
             http_addr: None,
+            audit_log: None,
         };
         assert!(resolve_config(parsed).is_err());
     }
