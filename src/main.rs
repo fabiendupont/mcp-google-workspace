@@ -5,7 +5,6 @@ mod meta;
 mod metrics;
 mod policy;
 mod protocol;
-mod resolve;
 mod server;
 mod tasks;
 mod tools;
@@ -187,8 +186,8 @@ fn default_service_entry(name: &str) -> serde_json::Value {
     match name {
         "drive" => serde_json::json!({
             "name": "drive",
-            "folders": [
-                { "path": "My Drive/Projects", "access": "read-write" }
+            "constraints": [
+                { "param": "parents", "values": ["<your-folder-id>"], "access": "read-write", "location": "body" }
             ]
         }),
         "gmail" => serde_json::json!({
@@ -202,8 +201,8 @@ fn default_service_entry(name: &str) -> serde_json::Value {
         }),
         "calendar" => serde_json::json!({
             "name": "calendar",
-            "calendars": [
-                { "id": "primary", "access": "read-write" }
+            "constraints": [
+                { "param": "calendarId", "values": ["primary"], "access": "read-write" }
             ]
         }),
         _ => serde_json::json!({
@@ -300,7 +299,7 @@ fn configure_drive() -> Result<serde_json::Value, GwsError> {
         return Ok(serde_json::json!({ "name": "drive" }));
     }
 
-    let mut folders: Vec<serde_json::Value> = Vec::new();
+    let mut constraints: Vec<serde_json::Value> = Vec::new();
     loop {
         let path: String = Input::new()
             .with_prompt("  Folder path (e.g. Projects/output, or empty to finish)")
@@ -319,13 +318,15 @@ fn configure_drive() -> Result<serde_json::Value, GwsError> {
             .map_err(|e| GwsError::Validation(format!("Prompt failed: {e}")))?;
 
         let access = if rw { "read-write" } else { "read-only" };
-        folders.push(serde_json::json!({ "path": path, "access": access }));
+        constraints.push(serde_json::json!({
+            "param": "parents", "values": [path], "access": access, "location": "body"
+        }));
     }
 
-    if folders.is_empty() {
+    if constraints.is_empty() {
         Ok(serde_json::json!({ "name": "drive" }))
     } else {
-        Ok(serde_json::json!({ "name": "drive", "folders": folders }))
+        Ok(serde_json::json!({ "name": "drive", "constraints": constraints }))
     }
 }
 
@@ -378,7 +379,7 @@ fn configure_calendar() -> Result<serde_json::Value, GwsError> {
         return Ok(serde_json::json!({ "name": "calendar" }));
     }
 
-    let mut calendars: Vec<serde_json::Value> = Vec::new();
+    let mut constraints: Vec<serde_json::Value> = Vec::new();
 
     let use_primary = Confirm::new()
         .with_prompt("  Include your primary calendar?")
@@ -394,7 +395,9 @@ fn configure_calendar() -> Result<serde_json::Value, GwsError> {
             .map_err(|e| GwsError::Validation(format!("Prompt failed: {e}")))?;
 
         let access = if rw { "read-write" } else { "read-only" };
-        calendars.push(serde_json::json!({ "id": "primary", "access": access }));
+        constraints.push(serde_json::json!({
+            "param": "calendarId", "values": ["primary"], "access": access
+        }));
     }
 
     loop {
@@ -415,13 +418,15 @@ fn configure_calendar() -> Result<serde_json::Value, GwsError> {
             .map_err(|e| GwsError::Validation(format!("Prompt failed: {e}")))?;
 
         let access = if rw { "read-write" } else { "read-only" };
-        calendars.push(serde_json::json!({ "id": id, "access": access }));
+        constraints.push(serde_json::json!({
+            "param": "calendarId", "values": [id], "access": access
+        }));
     }
 
-    if calendars.is_empty() {
+    if constraints.is_empty() {
         Ok(serde_json::json!({ "name": "calendar" }))
     } else {
-        Ok(serde_json::json!({ "name": "calendar", "calendars": calendars }))
+        Ok(serde_json::json!({ "name": "calendar", "constraints": constraints }))
     }
 }
 
@@ -456,13 +461,9 @@ fn check_policy(path: &Path) -> Result<(), GwsError> {
         if !denied.is_empty() {
             flags.push(format!("{} denied method(s)", denied.len()));
         }
-        if p.has_folder_restrictions(svc) {
-            let count = p.all_folder_ids(svc).len();
-            flags.push(format!("{count} folder ACL(s)"));
-        }
-        let cals = p.calendars(svc);
-        if !cals.is_empty() {
-            flags.push(format!("{} calendar ACL(s)", cals.len()));
+        let constraints = p.constraints(svc);
+        if !constraints.is_empty() {
+            flags.push(format!("{} constraint(s)", constraints.len()));
         }
         if flags.is_empty() {
             eprintln!("  {svc}: no constraints");
@@ -518,9 +519,9 @@ fn check_policy_warnings(p: &policy::Policy) -> Vec<String> {
                 }
             }
             "drive" => {
-                if !p.has_folder_restrictions(svc) && !p.is_read_only(svc) {
+                if p.constraints(svc).is_empty() && !p.is_read_only(svc) {
                     warnings.push(
-                        "drive: no folder restrictions and not read-only — \
+                        "drive: no constraints and not read-only — \
                          agent has full access to all Drive files"
                             .to_string(),
                     );
@@ -555,30 +556,10 @@ async fn verify_policy(p: &mut policy::Policy) -> Result<(), GwsError> {
         }
     }
 
-    match p.resolve_folder_paths().await {
-        Ok(()) => {
-            let services = p.allowed_services();
-            for svc in &services {
-                if p.has_folder_restrictions(svc) {
-                    let ids = p.all_folder_ids(svc);
-                    eprintln!("  {svc} folders: {} resolved", ids.len());
-                }
-            }
-        }
-        Err(e) => {
-            return Err(GwsError::Validation(format!(
-                "Drive folder resolution failed: {e}"
-            )));
-        }
-    }
-
     for svc in p.allowed_services() {
-        let cals = p.calendars(svc);
-        if !cals.is_empty() {
-            eprintln!(
-                "  {svc} calendars: {} configured (IDs not verified — no list API call)",
-                cals.len()
-            );
+        let constraints = p.constraints(svc);
+        if !constraints.is_empty() {
+            eprintln!("  {svc}: {} constraint(s) configured", constraints.len());
         }
     }
 
@@ -719,7 +700,7 @@ async fn main() {
 
     init_telemetry();
 
-    let (mut policy, transport) = match resolve_config(parsed) {
+    let (policy, transport) = match resolve_config(parsed) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -727,11 +708,6 @@ async fn main() {
             std::process::exit(1);
         }
     };
-
-    if let Err(e) = policy.resolve_folder_paths().await {
-        eprintln!("Error resolving Drive folder paths: {e}");
-        std::process::exit(1);
-    }
 
     let result = match transport {
         Transport::Stdio => server::run_stdio(policy).await,
@@ -951,7 +927,7 @@ mod tests {
         let services = json["services"].as_array().unwrap();
         assert_eq!(services.len(), 1);
         assert_eq!(services[0]["name"], "drive");
-        assert!(services[0]["folders"].is_array());
+        assert!(services[0]["constraints"].is_array());
     }
 
     #[test]

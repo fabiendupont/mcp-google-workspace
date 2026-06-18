@@ -96,17 +96,7 @@ pub async fn execute_tool(
         )));
     }
 
-    if service == "drive" {
-        policy.enforce_drive_folder_list(service, &mut params);
-        if method.http_method != "GET" {
-            policy.enforce_drive_folder_write(service, &body)?;
-            policy.enforce_drive_folder_params(service, &params)?;
-        }
-    }
-
-    if service == "calendar" {
-        policy.enforce_calendar(service, method, &params)?;
-    }
+    policy.enforce_constraints(service, method, &mut params, &body)?;
 
     let scopes: Vec<&str> = select_scope(&method.scopes).into_iter().collect();
 
@@ -570,11 +560,6 @@ pub(crate) async fn initiate_resumable_upload(
     meta: &RequestMeta,
     token_cache: &mut Option<crate::auth::TokenCache>,
 ) -> Result<Value, GwsError> {
-    let params: Map<String, Value> = arguments
-        .get("params")
-        .and_then(|v| v.as_object())
-        .cloned()
-        .unwrap_or_default();
     let body: Option<Value> = arguments
         .get("body")
         .filter(|v| !v.as_object().is_some_and(|m| m.is_empty()))
@@ -590,9 +575,12 @@ pub(crate) async fn initiate_resumable_upload(
         .unwrap_or("");
     policy.check_method(service, resource_path, method_name, method)?;
 
-    if service == "drive" && method.http_method != "GET" {
-        policy.enforce_drive_folder_write(service, &body)?;
-    }
+    let mut params: serde_json::Map<String, serde_json::Value> = arguments
+        .get("params")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    policy.enforce_constraints(service, method, &mut params, &body)?;
 
     let content_type = arguments
         .get("media_content_type")

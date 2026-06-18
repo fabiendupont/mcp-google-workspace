@@ -13,24 +13,17 @@ pub enum Access {
     ReadWrite,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct FolderPolicy {
-    #[serde(default)]
-    pub id: String,
-    #[serde(default)]
-    pub path: Option<String>,
-    pub access: Access,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct CalendarPolicy {
-    pub id: String,
-    #[serde(default = "default_read_write")]
-    pub access: Access,
-}
-
 fn default_read_write() -> Access {
     Access::ReadWrite
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Constraint {
+    pub param: String,
+    pub values: Vec<String>,
+    #[serde(default = "default_read_write")]
+    pub access: Access,
+    pub location: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -82,9 +75,7 @@ pub struct ServicePolicy {
     #[serde(default)]
     pub denied_methods: Vec<String>,
     #[serde(default)]
-    pub folders: Vec<FolderPolicy>,
-    #[serde(default)]
-    pub calendars: Vec<CalendarPolicy>,
+    pub constraints: Vec<Constraint>,
 }
 
 #[derive(Debug)]
@@ -138,54 +129,6 @@ impl Policy {
         }
     }
 
-    /// Resolve any `path`-based folder entries to IDs via the Drive API.
-    /// Must be called before the server starts accepting requests.
-    pub async fn resolve_folder_paths(&mut self) -> Result<(), GwsError> {
-        let Some(svc) = self.services.get("drive") else {
-            return Ok(());
-        };
-
-        let needs_resolution = svc
-            .folders
-            .iter()
-            .any(|f| f.path.is_some() && f.id.is_empty());
-        if !needs_resolution {
-            return Ok(());
-        }
-
-        let scopes = &["https://www.googleapis.com/auth/drive.metadata.readonly"];
-        let token = crate::auth::get_token(scopes, self.credentials_file.as_deref(), None)
-            .await
-            .map_err(|e| {
-                GwsError::Auth(format!(
-                    "Cannot resolve Drive folder paths without authentication: {e}"
-                ))
-            })?;
-
-        let svc = self.services.get_mut("drive").unwrap();
-        for folder in &mut svc.folders {
-            if let Some(ref path) = folder.path
-                && folder.id.is_empty()
-            {
-                let id = crate::resolve::resolve_drive_path(path, &token).await?;
-                tracing::info!(path = %path, folder_id = %id, "Resolved Drive folder path");
-                folder.id = id;
-            }
-        }
-
-        // Validate no empty IDs remain
-        for folder in &svc.folders {
-            if folder.id.is_empty() {
-                return Err(GwsError::Validation(format!(
-                    "Folder entry has neither 'id' nor 'path': {:?}",
-                    folder
-                )));
-            }
-        }
-
-        Ok(())
-    }
-
     pub fn is_origin_allowed(&self, origin: &str) -> bool {
         let host = url::Url::parse(origin)
             .ok()
@@ -227,45 +170,10 @@ impl Policy {
             .unwrap_or_default()
     }
 
-    pub fn has_folder_restrictions(&self, service: &str) -> bool {
+    pub fn constraints(&self, service: &str) -> &[Constraint] {
         self.services
             .get(service)
-            .is_some_and(|s| !s.folders.is_empty())
-    }
-
-    pub fn folder_ids_with_access(&self, service: &str, access: Access) -> Vec<&str> {
-        self.services
-            .get(service)
-            .map(|s| {
-                s.folders
-                    .iter()
-                    .filter(|f| f.access == access)
-                    .map(|f| f.id.as_str())
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    pub fn all_folder_ids(&self, service: &str) -> Vec<&str> {
-        self.services
-            .get(service)
-            .map(|s| s.folders.iter().map(|f| f.id.as_str()).collect())
-            .unwrap_or_default()
-    }
-
-    pub fn folder_access(&self, service: &str, folder_id: &str) -> Option<Access> {
-        self.services
-            .get(service)?
-            .folders
-            .iter()
-            .find(|f| f.id == folder_id)
-            .map(|f| f.access)
-    }
-
-    pub fn calendars(&self, service: &str) -> &[CalendarPolicy] {
-        self.services
-            .get(service)
-            .map(|s| s.calendars.as_slice())
+            .map(|s| s.constraints.as_slice())
             .unwrap_or(&[])
     }
 
@@ -305,117 +213,148 @@ impl Policy {
         Ok(())
     }
 
-    /// For list operations: constrain `q` to all allowed folder IDs.
-    pub fn enforce_drive_folder_list(
+    pub fn enforce_constraints(
         &self,
         service: &str,
+        method: &RestMethod,
         params: &mut serde_json::Map<String, serde_json::Value>,
-    ) {
-        if !self.has_folder_restrictions(service) {
-            return;
-        }
-
-        let all_ids = self.all_folder_ids(service);
-        if all_ids.is_empty() {
-            return;
-        }
-
-        let folder_query: Vec<String> = all_ids
-            .iter()
-            .map(|id| format!("'{id}' in parents"))
-            .collect();
-        let constraint = folder_query.join(" or ");
-
-        if let Some(serde_json::Value::String(existing)) = params.get("q") {
-            let combined = format!("({existing}) and ({constraint})");
-            params.insert("q".to_string(), serde_json::Value::String(combined));
-        } else {
-            params.insert("q".to_string(), serde_json::Value::String(constraint));
-        }
-    }
-
-    /// For write operations: verify that target folders have read-write access.
-    pub fn enforce_drive_folder_write(
-        &self,
-        service: &str,
         body: &Option<serde_json::Value>,
     ) -> Result<(), GwsError> {
-        if !self.has_folder_restrictions(service) {
+        let constraints = self.constraints(service);
+        if constraints.is_empty() {
             return Ok(());
         }
 
-        let rw_ids = self.folder_ids_with_access(service, Access::ReadWrite);
+        let is_write = method.http_method != "GET";
 
-        let parent_ids: Vec<&str> = body
-            .as_ref()
-            .and_then(|b| b.get("parents"))
-            .and_then(|p| p.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
-            .unwrap_or_default();
-
-        if parent_ids.is_empty() {
-            return Err(GwsError::Validation(format!(
-                "Write denied: 'parents' must be specified when folder restrictions are configured. \
-                 Allowed read-write folders: {rw}. \
-                 Fix: include \"parents\": [\"<folder-id>\"] in the request body",
-                rw = rw_ids.join(", ")
-            )));
+        let mut by_param: HashMap<&str, Vec<&Constraint>> = HashMap::new();
+        for c in constraints {
+            by_param.entry(c.param.as_str()).or_default().push(c);
         }
 
-        for pid in &parent_ids {
-            match self.folder_access(service, pid) {
-                Some(Access::ReadWrite) => {}
-                Some(Access::ReadOnly) => {
-                    return Err(GwsError::Validation(format!(
-                        "Write denied: folder '{pid}' is read-only. \
-                         Fix: change its access to \"read-write\" in your policy file, \
-                         or write to one of: {rw}",
-                        rw = rw_ids.join(", ")
-                    )));
+        for (param, group) in &by_param {
+            let all_values: Vec<&str> = group
+                .iter()
+                .flat_map(|c| c.values.iter().map(|v| v.as_str()))
+                .collect();
+            let rw_values: Vec<&str> = group
+                .iter()
+                .filter(|c| c.access == Access::ReadWrite)
+                .flat_map(|c| c.values.iter().map(|v| v.as_str()))
+                .collect();
+
+            let location = group[0].location.as_deref();
+            let is_body = location == Some("body");
+
+            if is_body {
+                self.enforce_body_constraint(
+                    param,
+                    &all_values,
+                    &rw_values,
+                    is_write,
+                    params,
+                    body,
+                )?;
+                if is_write {
+                    self.enforce_parent_params(param, &all_values, &rw_values, params)?;
                 }
-                None => {
-                    return Err(GwsError::Validation(format!(
-                        "Write denied: folder '{pid}' is not in the allowed list. \
-                         Fix: add {{\"id\": \"{pid}\", \"access\": \"read-write\"}} \
-                         to the \"folders\" array in your policy file",
-                    )));
-                }
+            } else {
+                self.enforce_param_constraint(param, &all_values, &rw_values, is_write, params)?;
             }
         }
 
         Ok(())
     }
 
-    pub fn enforce_drive_folder_params(
+    fn enforce_body_constraint(
         &self,
-        service: &str,
-        params: &serde_json::Map<String, serde_json::Value>,
+        param: &str,
+        all_values: &[&str],
+        rw_values: &[&str],
+        is_write: bool,
+        params: &mut serde_json::Map<String, serde_json::Value>,
+        body: &Option<serde_json::Value>,
     ) -> Result<(), GwsError> {
-        if !self.has_folder_restrictions(service) {
+        if !is_write {
+            let filter_parts: Vec<String> = all_values
+                .iter()
+                .map(|id| format!("'{id}' in {param}"))
+                .collect();
+            let constraint = filter_parts.join(" or ");
+
+            if let Some(serde_json::Value::String(existing)) = params.get("q") {
+                let combined = format!("({existing}) and ({constraint})");
+                params.insert("q".to_string(), serde_json::Value::String(combined));
+            } else {
+                params.insert("q".to_string(), serde_json::Value::String(constraint));
+            }
             return Ok(());
         }
 
-        for key in ["addParents", "removeParents"] {
-            if let Some(serde_json::Value::String(ids)) = params.get(key) {
+        let body_values: Vec<&str> = body
+            .as_ref()
+            .and_then(|b| b.get(param))
+            .map(|v| match v {
+                serde_json::Value::Array(arr) => arr.iter().filter_map(|v| v.as_str()).collect(),
+                serde_json::Value::String(s) => vec![s.as_str()],
+                _ => vec![],
+            })
+            .unwrap_or_default();
+
+        if body_values.is_empty() {
+            return Err(GwsError::Validation(format!(
+                "Write denied: '{param}' must be specified when constraints are configured. \
+                 Allowed read-write values: {rw}. \
+                 Fix: include \"{param}\" in the request body",
+                rw = rw_values.join(", ")
+            )));
+        }
+
+        for val in &body_values {
+            if !all_values.contains(val) {
+                return Err(GwsError::Validation(format!(
+                    "Write denied: {param} value '{val}' is not in the allowed list. \
+                     Fix: add it to a constraint on \"{param}\" in your policy file"
+                )));
+            }
+            if !rw_values.contains(val) {
+                return Err(GwsError::Validation(format!(
+                    "Write denied: {param} value '{val}' is read-only. \
+                     Fix: change its access to \"read-write\" in your policy file"
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn enforce_parent_params(
+        &self,
+        param: &str,
+        all_values: &[&str],
+        rw_values: &[&str],
+        params: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(), GwsError> {
+        let add_key = format!("add{}", capitalize(param));
+        let remove_key = format!("remove{}", capitalize(param));
+
+        for key in [&add_key, &remove_key] {
+            if let Some(serde_json::Value::String(ids)) = params.get(key.as_str()) {
                 for id in ids.split(',').map(|s| s.trim()) {
                     if id.is_empty() {
                         continue;
                     }
-                    match self.folder_access(service, id) {
-                        Some(Access::ReadWrite) => {}
-                        Some(Access::ReadOnly) => {
-                            return Err(GwsError::Validation(format!(
-                                "Write denied via {key}: folder '{id}' is read-only. \
-                                 Fix: change its access to \"read-write\" in your policy file"
-                            )));
-                        }
-                        None => {
-                            return Err(GwsError::Validation(format!(
-                                "Write denied via {key}: folder '{id}' is not in the allowed list. \
-                                 Fix: add {{\"id\": \"{id}\", \"access\": \"read-write\"}} \
-                                 to the \"folders\" array in your policy file"
-                            )));
-                        }
+                    if !all_values.contains(&id) {
+                        return Err(GwsError::Validation(format!(
+                            "Write denied via {key}: '{id}' is not in the allowed list. \
+                             Fix: add it to a constraint on \"{param}\" in your policy file"
+                        )));
+                    }
+                    if !rw_values.contains(&id) {
+                        return Err(GwsError::Validation(format!(
+                            "Write denied via {key}: '{id}' is read-only. \
+                             Fix: change its access to \"read-write\" in your policy file"
+                        )));
                     }
                 }
             }
@@ -424,46 +363,48 @@ impl Policy {
         Ok(())
     }
 
-    pub fn enforce_calendar(
+    fn enforce_param_constraint(
         &self,
-        service: &str,
-        method: &RestMethod,
+        param: &str,
+        all_values: &[&str],
+        rw_values: &[&str],
+        is_write: bool,
         params: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<(), GwsError> {
-        let cals = self.calendars(service);
-        if cals.is_empty() {
-            return Ok(());
-        }
-
-        let allowed_list: Vec<&str> = cals.iter().map(|c| c.id.as_str()).collect();
-        let allowed = allowed_list.join(", ");
-
-        let Some(serde_json::Value::String(cal_id)) = params.get("calendarId") else {
+        let Some(serde_json::Value::String(value)) = params.get(param) else {
             return Err(GwsError::Validation(format!(
-                "Calendar restrictions are configured but no calendarId specified. \
-                 Allowed: {allowed}. \
-                 Fix: include \"calendarId\" in the request params"
+                "Constraints are configured for '{param}' but it was not specified. \
+                 Allowed: {all}. \
+                 Fix: include \"{param}\" in the request params",
+                all = all_values.join(", ")
             )));
         };
 
-        let cal = cals.iter().find(|c| c.id == *cal_id);
-        match cal {
-            Some(c) => {
-                if c.access == Access::ReadOnly && method.http_method != "GET" {
-                    return Err(GwsError::Validation(format!(
-                        "Calendar '{cal_id}' is read-only; {} is not allowed. \
-                         Fix: change its access to \"read-write\" in your policy file",
-                        method.http_method
-                    )));
-                }
-                Ok(())
-            }
-            None => Err(GwsError::Validation(format!(
-                "Calendar '{cal_id}' is not allowed by policy. Allowed: {allowed}. \
-                 Fix: add {{\"id\": \"{cal_id}\", \"access\": \"read-only\"}} \
-                 to the \"calendars\" array in your policy file"
-            ))),
+        if !all_values.contains(&value.as_str()) {
+            return Err(GwsError::Validation(format!(
+                "Value '{value}' for '{param}' is not allowed by policy. Allowed: {all}. \
+                 Fix: add {{\"param\": \"{param}\", \"values\": [\"{value}\"]}} \
+                 to the \"constraints\" array in your policy file",
+                all = all_values.join(", ")
+            )));
         }
+
+        if is_write && !rw_values.contains(&value.as_str()) {
+            return Err(GwsError::Validation(format!(
+                "'{param}' value '{value}' is read-only; write operations are not allowed. \
+                 Fix: change its access to \"read-write\" in your policy file"
+            )));
+        }
+
+        Ok(())
+    }
+}
+
+fn capitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
     }
 }
 
@@ -477,16 +418,16 @@ mod tests {
             "services": [
                 {
                     "name": "drive",
-                    "folders": [
-                        { "id": "folder-readonly", "access": "read-only" },
-                        { "id": "folder-readwrite", "access": "read-write" }
+                    "constraints": [
+                        { "param": "parents", "values": ["folder-readonly"], "access": "read-only", "location": "body" },
+                        { "param": "parents", "values": ["folder-readwrite"], "access": "read-write", "location": "body" }
                     ]
                 },
                 {
                     "name": "calendar",
-                    "calendars": [
-                        { "id": "primary", "access": "read-write" },
-                        { "id": "holidays", "access": "read-only" }
+                    "constraints": [
+                        { "param": "calendarId", "values": ["primary"], "access": "read-write" },
+                        { "param": "calendarId", "values": ["holidays"], "access": "read-only" }
                     ]
                 },
                 {
@@ -502,6 +443,22 @@ mod tests {
         let file: PolicyFile = serde_json::from_str(json_str).unwrap();
         Policy::from_policy_file(file)
     }
+
+    fn get_method() -> RestMethod {
+        RestMethod {
+            http_method: "GET".to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn post_method() -> RestMethod {
+        RestMethod {
+            http_method: "POST".to_string(),
+            ..Default::default()
+        }
+    }
+
+    // -- Service & method tests --
 
     #[test]
     fn test_service_allowed() {
@@ -540,237 +497,303 @@ mod tests {
         assert!(!denied.contains("messages.list"));
     }
 
-    // -- Drive folder tests --
+    // -- Body constraint tests (Drive folders pattern) --
 
     #[test]
-    fn test_folder_ids_by_access() {
+    fn test_body_constraint_list_injects_query() {
         let p = test_policy();
-        let ro = p.folder_ids_with_access("drive", Access::ReadOnly);
-        assert_eq!(ro, vec!["folder-readonly"]);
-        let rw = p.folder_ids_with_access("drive", Access::ReadWrite);
-        assert_eq!(rw, vec!["folder-readwrite"]);
-    }
-
-    #[test]
-    fn test_folder_list_constrains_query() {
-        let p = test_policy();
+        let method = get_method();
         let mut params = serde_json::Map::new();
-        p.enforce_drive_folder_list("drive", &mut params);
+        p.enforce_constraints("drive", &method, &mut params, &None)
+            .unwrap();
         let q = params.get("q").unwrap().as_str().unwrap();
         assert!(q.contains("'folder-readonly' in parents"));
         assert!(q.contains("'folder-readwrite' in parents"));
     }
 
     #[test]
-    fn test_folder_list_merges_existing_query() {
+    fn test_body_constraint_list_merges_existing_query() {
         let p = test_policy();
+        let method = get_method();
         let mut params = serde_json::Map::new();
         params.insert(
             "q".to_string(),
             serde_json::Value::String("mimeType='application/pdf'".to_string()),
         );
-        p.enforce_drive_folder_list("drive", &mut params);
+        p.enforce_constraints("drive", &method, &mut params, &None)
+            .unwrap();
         let q = params.get("q").unwrap().as_str().unwrap();
         assert!(q.contains("mimeType='application/pdf'"));
         assert!(q.contains("'folder-readonly' in parents"));
     }
 
     #[test]
-    fn test_folder_write_allowed_to_rw() {
+    fn test_body_constraint_write_allowed_to_rw() {
         let p = test_policy();
+        let method = post_method();
+        let mut params = serde_json::Map::new();
         let body = Some(serde_json::json!({
             "parents": ["folder-readwrite"],
             "name": "test.txt"
         }));
-        assert!(p.enforce_drive_folder_write("drive", &body).is_ok());
+        assert!(
+            p.enforce_constraints("drive", &method, &mut params, &body)
+                .is_ok()
+        );
     }
 
     #[test]
-    fn test_folder_write_denied_to_readonly() {
+    fn test_body_constraint_write_denied_to_readonly() {
         let p = test_policy();
+        let method = post_method();
+        let mut params = serde_json::Map::new();
         let body = Some(serde_json::json!({
             "parents": ["folder-readonly"],
             "name": "test.txt"
         }));
-        let err = p.enforce_drive_folder_write("drive", &body).unwrap_err();
+        let err = p
+            .enforce_constraints("drive", &method, &mut params, &body)
+            .unwrap_err();
         assert!(err.to_string().contains("read-only"));
     }
 
     #[test]
-    fn test_folder_write_denied_to_unknown() {
+    fn test_body_constraint_write_denied_to_unknown() {
         let p = test_policy();
+        let method = post_method();
+        let mut params = serde_json::Map::new();
         let body = Some(serde_json::json!({
             "parents": ["unknown-folder"],
             "name": "test.txt"
         }));
-        let err = p.enforce_drive_folder_write("drive", &body).unwrap_err();
+        let err = p
+            .enforce_constraints("drive", &method, &mut params, &body)
+            .unwrap_err();
         assert!(err.to_string().contains("not in the allowed list"));
     }
 
     #[test]
-    fn test_folder_write_no_restrictions_passes() {
+    fn test_body_constraint_write_denied_without_parents() {
         let p = test_policy();
+        let method = post_method();
+        let mut params = serde_json::Map::new();
         let body = Some(serde_json::json!({ "name": "test.txt" }));
-        // gmail has no folder restrictions
-        assert!(p.enforce_drive_folder_write("gmail", &body).is_ok());
-    }
-
-    #[test]
-    fn test_folder_write_denied_without_parents() {
-        let p = test_policy();
-        let body = Some(serde_json::json!({ "name": "test.txt" }));
-        let err = p.enforce_drive_folder_write("drive", &body).unwrap_err();
+        let err = p
+            .enforce_constraints("drive", &method, &mut params, &body)
+            .unwrap_err();
         assert!(err.to_string().contains("parents"));
     }
 
-    // -- Drive folder param tests --
+    #[test]
+    fn test_body_constraint_no_restrictions_passes() {
+        let p = test_policy();
+        let method = post_method();
+        let mut params = serde_json::Map::new();
+        let body = Some(serde_json::json!({ "name": "test.txt" }));
+        assert!(
+            p.enforce_constraints("gmail", &method, &mut params, &body)
+                .is_ok()
+        );
+    }
+
+    // -- addParents/removeParents tests --
 
     #[test]
-    fn test_folder_params_add_to_rw_allowed() {
+    fn test_parent_params_add_to_rw_allowed() {
         let p = test_policy();
+        let method = post_method();
         let mut params = serde_json::Map::new();
         params.insert(
             "addParents".to_string(),
             serde_json::Value::String("folder-readwrite".to_string()),
         );
-        assert!(p.enforce_drive_folder_params("drive", &params).is_ok());
+        let body = Some(serde_json::json!({ "parents": ["folder-readwrite"] }));
+        assert!(
+            p.enforce_constraints("drive", &method, &mut params, &body)
+                .is_ok()
+        );
     }
 
     #[test]
-    fn test_folder_params_add_to_readonly_denied() {
+    fn test_parent_params_add_to_readonly_denied() {
         let p = test_policy();
+        let method = post_method();
         let mut params = serde_json::Map::new();
         params.insert(
             "addParents".to_string(),
             serde_json::Value::String("folder-readonly".to_string()),
         );
-        let err = p.enforce_drive_folder_params("drive", &params).unwrap_err();
+        let body = Some(serde_json::json!({ "parents": ["folder-readwrite"] }));
+        let err = p
+            .enforce_constraints("drive", &method, &mut params, &body)
+            .unwrap_err();
         assert!(err.to_string().contains("read-only"));
     }
 
     #[test]
-    fn test_folder_params_remove_from_unknown_denied() {
+    fn test_parent_params_remove_unknown_denied() {
         let p = test_policy();
+        let method = post_method();
         let mut params = serde_json::Map::new();
         params.insert(
             "removeParents".to_string(),
             serde_json::Value::String("unknown-folder".to_string()),
         );
-        let err = p.enforce_drive_folder_params("drive", &params).unwrap_err();
+        let body = Some(serde_json::json!({ "parents": ["folder-readwrite"] }));
+        let err = p
+            .enforce_constraints("drive", &method, &mut params, &body)
+            .unwrap_err();
         assert!(err.to_string().contains("not in the allowed list"));
     }
 
     #[test]
-    fn test_folder_params_multiple_ids() {
+    fn test_parent_params_multiple_ids() {
         let p = test_policy();
+        let method = post_method();
         let mut params = serde_json::Map::new();
         params.insert(
             "addParents".to_string(),
             serde_json::Value::String("folder-readwrite, folder-readonly".to_string()),
         );
-        let err = p.enforce_drive_folder_params("drive", &params).unwrap_err();
+        let body = Some(serde_json::json!({ "parents": ["folder-readwrite"] }));
+        let err = p
+            .enforce_constraints("drive", &method, &mut params, &body)
+            .unwrap_err();
         assert!(err.to_string().contains("read-only"));
     }
 
-    #[test]
-    fn test_folder_params_no_restrictions_passes() {
-        let p = test_policy();
-        let mut params = serde_json::Map::new();
-        params.insert(
-            "addParents".to_string(),
-            serde_json::Value::String("anything".to_string()),
-        );
-        assert!(p.enforce_drive_folder_params("gmail", &params).is_ok());
-    }
-
-    // -- Calendar tests --
+    // -- Param constraint tests (Calendar pattern) --
 
     #[test]
-    fn test_calendar_read_allowed() {
+    fn test_param_constraint_read_allowed() {
         let p = test_policy();
-        let method = RestMethod {
-            http_method: "GET".to_string(),
-            ..Default::default()
-        };
+        let method = get_method();
         let mut params = serde_json::Map::new();
         params.insert(
             "calendarId".to_string(),
             serde_json::Value::String("holidays".to_string()),
         );
-        assert!(p.enforce_calendar("calendar", &method, &params).is_ok());
+        assert!(
+            p.enforce_constraints("calendar", &method, &mut params, &None)
+                .is_ok()
+        );
     }
 
     #[test]
-    fn test_calendar_write_denied_on_readonly() {
+    fn test_param_constraint_write_denied_on_readonly() {
         let p = test_policy();
-        let method = RestMethod {
-            http_method: "POST".to_string(),
-            ..Default::default()
-        };
+        let method = post_method();
         let mut params = serde_json::Map::new();
         params.insert(
             "calendarId".to_string(),
             serde_json::Value::String("holidays".to_string()),
         );
         let err = p
-            .enforce_calendar("calendar", &method, &params)
+            .enforce_constraints("calendar", &method, &mut params, &None)
             .unwrap_err();
         assert!(err.to_string().contains("read-only"));
     }
 
     #[test]
-    fn test_calendar_write_allowed_on_rw() {
+    fn test_param_constraint_write_allowed_on_rw() {
         let p = test_policy();
-        let method = RestMethod {
-            http_method: "POST".to_string(),
-            ..Default::default()
-        };
+        let method = post_method();
         let mut params = serde_json::Map::new();
         params.insert(
             "calendarId".to_string(),
             serde_json::Value::String("primary".to_string()),
         );
-        assert!(p.enforce_calendar("calendar", &method, &params).is_ok());
+        assert!(
+            p.enforce_constraints("calendar", &method, &mut params, &None)
+                .is_ok()
+        );
     }
 
     #[test]
-    fn test_calendar_unknown_denied() {
+    fn test_param_constraint_unknown_denied() {
         let p = test_policy();
-        let method = RestMethod {
-            http_method: "GET".to_string(),
-            ..Default::default()
-        };
+        let method = get_method();
         let mut params = serde_json::Map::new();
         params.insert(
             "calendarId".to_string(),
             serde_json::Value::String("secret@group.calendar.google.com".to_string()),
         );
         let err = p
-            .enforce_calendar("calendar", &method, &params)
+            .enforce_constraints("calendar", &method, &mut params, &None)
             .unwrap_err();
         assert!(err.to_string().contains("not allowed by policy"));
     }
 
     #[test]
-    fn test_calendar_denied_without_calendar_id() {
+    fn test_param_constraint_missing_denied() {
         let p = test_policy();
-        let method = RestMethod {
-            http_method: "GET".to_string(),
-            ..Default::default()
-        };
-        let params = serde_json::Map::new();
+        let method = get_method();
+        let mut params = serde_json::Map::new();
         let err = p
-            .enforce_calendar("calendar", &method, &params)
+            .enforce_constraints("calendar", &method, &mut params, &None)
             .unwrap_err();
         assert!(err.to_string().contains("calendarId"));
     }
 
+    // -- Generic constraint tests (new patterns) --
+
     #[test]
-    fn test_no_folder_restrictions_skips_enforcement() {
-        let p = test_policy();
-        assert!(!p.has_folder_restrictions("gmail"));
+    fn test_constraint_on_spreadsheet_id() {
+        let json_str = r#"{
+            "services": [{
+                "name": "sheets",
+                "constraints": [
+                    { "param": "spreadsheetId", "values": ["abc123"], "access": "read-write" }
+                ]
+            }]
+        }"#;
+        let file: PolicyFile = serde_json::from_str(json_str).unwrap();
+        let p = Policy::from_policy_file(file);
+
+        let mut method = get_method();
+        method
+            .parameters
+            .insert("spreadsheetId".to_string(), Default::default());
+
         let mut params = serde_json::Map::new();
-        p.enforce_drive_folder_list("gmail", &mut params);
+        params.insert(
+            "spreadsheetId".to_string(),
+            serde_json::Value::String("abc123".to_string()),
+        );
+        assert!(
+            p.enforce_constraints("sheets", &method, &mut params, &None)
+                .is_ok()
+        );
+
+        params.insert(
+            "spreadsheetId".to_string(),
+            serde_json::Value::String("other".to_string()),
+        );
+        assert!(
+            p.enforce_constraints("sheets", &method, &mut params, &None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_no_constraints_passes() {
+        let p = test_policy();
+        let method = post_method();
+        let mut params = serde_json::Map::new();
+        let body = Some(serde_json::json!({ "name": "test.txt" }));
+        assert!(
+            p.enforce_constraints("gmail", &method, &mut params, &body)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_no_constraints_skips_query_injection() {
+        let p = test_policy();
+        let method = get_method();
+        let mut params = serde_json::Map::new();
+        p.enforce_constraints("gmail", &method, &mut params, &None)
+            .unwrap();
         assert!(params.get("q").is_none());
     }
 

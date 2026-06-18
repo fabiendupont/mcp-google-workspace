@@ -9,32 +9,16 @@
   "services": [
     {
       "name": "drive",
-      "folders": [
-        {
-          "id": "1ABC-shared-references",
-          "access": "read-only"
-        },
-        {
-          "path": "Projects/current-project/output",
-          "access": "read-write"
-        },
-        {
-          "path": "My Drive/Shared/Templates",
-          "access": "read-only"
-        }
+      "constraints": [
+        { "param": "parents", "values": ["1ABC-shared-references"], "access": "read-only", "location": "body" },
+        { "param": "parents", "values": ["folder-id-for-output"], "access": "read-write", "location": "body" }
       ]
     },
     {
       "name": "calendar",
-      "calendars": [
-        {
-          "id": "primary",
-          "access": "read-write"
-        },
-        {
-          "id": "company-holidays@group.calendar.google.com",
-          "access": "read-only"
-        }
+      "constraints": [
+        { "param": "calendarId", "values": ["primary"], "access": "read-write" },
+        { "param": "calendarId", "values": ["company-holidays@group.calendar.google.com"], "access": "read-only" }
       ]
     },
     {
@@ -50,7 +34,10 @@
     },
     {
       "name": "sheets",
-      "read_only": true
+      "read_only": true,
+      "constraints": [
+        { "param": "spreadsheetId", "values": ["1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms"], "access": "read-only" }
+      ]
     },
     {
       "name": "docs",
