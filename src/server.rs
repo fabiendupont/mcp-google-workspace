@@ -959,6 +959,21 @@ fn strip_key(value: &Value, key: &str) -> Value {
     }
 }
 
+fn check_api_result(result: &Value) -> Result<(), GwsError> {
+    if let Some(err) = result.get("error").and_then(|v| v.as_str()) {
+        return Err(GwsError::Validation(err.to_string()));
+    }
+    if result.get("validation_error").is_some() {
+        let msg = result["errors"]
+            .as_array()
+            .and_then(|a| a.first())
+            .and_then(|e| e["hint"].as_str())
+            .unwrap_or("Validation failed");
+        return Err(GwsError::Validation(msg.to_string()));
+    }
+    Ok(())
+}
+
 fn parse_position(arguments: &Value) -> Position {
     if let Some(idx) = arguments.get("index").and_then(|v| v.as_i64()) {
         return Position::Index(idx as i32);
@@ -1226,7 +1241,7 @@ async fn execute_docs_helper(
         .get("batchUpdate")
         .ok_or_else(|| GwsError::Validation("batchUpdate method not found".into()))?;
 
-    crate::execute::execute_tool(
+    let result = crate::execute::execute_tool(
         &doc,
         method,
         "documents",
@@ -1239,7 +1254,9 @@ async fn execute_docs_helper(
         dry_run,
         &mut state.token_cache,
     )
-    .await
+    .await?;
+    check_api_result(&result)?;
+    Ok(result)
 }
 
 fn heading_level(style: &str) -> Option<u32> {
@@ -1351,6 +1368,7 @@ async fn execute_docs_import_markdown(
             &mut state.token_cache,
         )
         .await?;
+        check_api_result(&result)?;
         let new_id = result["id"]
             .as_str()
             .ok_or_else(|| {
@@ -1519,7 +1537,7 @@ async fn execute_docs_import_markdown(
             "params": { "documentId": doc_id },
             "body": { "requests": style_reqs }
         });
-        crate::execute::execute_tool(
+        let style_result = crate::execute::execute_tool(
             &docs_doc,
             batch_method,
             "documents",
@@ -1533,6 +1551,7 @@ async fn execute_docs_import_markdown(
             &mut state.token_cache,
         )
         .await?;
+        check_api_result(&style_result)?;
     }
 
     let mut content_requests: Vec<Value> = Vec::new();
@@ -1560,6 +1579,7 @@ async fn execute_docs_import_markdown(
         &mut state.token_cache,
     )
     .await?;
+    check_api_result(&result)?;
 
     // Step E: include doc ID in result (especially useful when a new doc was created)
     if created_new_doc {
