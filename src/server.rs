@@ -1333,49 +1333,142 @@ async fn execute_docs_import_markdown(
     let section = arguments.get("section").and_then(|v| v.as_str());
     let template_id = arguments.get("template_id").and_then(|v| v.as_str());
 
-    // Step A: resolve or create the document
+    // Step A: resolve, find existing, or create the document
     let (doc_id, created_new_doc) = if let Some(id) = doc_id_arg {
         (id.to_string(), false)
     } else if title.is_some() || folder_id.is_some() {
         let doc_title = title.unwrap_or("Untitled");
-        let mut body = json!({
-            "name": doc_title,
-            "mimeType": "application/vnd.google-apps.document"
-        });
-        if let Some(fid) = folder_id {
-            body["parents"] = json!([fid]);
-        }
-        let create_args = json!({"body": body});
-
         let drive_doc = state.get_doc("drive").await?;
         let drive_resource = tools::find_resource(&drive_doc.resources, "files")
             .ok_or_else(|| GwsError::Validation("files resource not found in drive API".into()))?;
-        let create_method = drive_resource
-            .methods
-            .get("create")
-            .ok_or_else(|| GwsError::Validation("create method not found in drive files".into()))?;
-        let result = crate::execute::execute_tool(
-            &drive_doc,
-            create_method,
-            "files",
-            "create",
-            &create_args,
-            "drive",
-            policy,
-            meta,
-            None,
-            dry_run,
-            &mut state.token_cache,
-        )
-        .await?;
-        check_api_result(&result)?;
-        let new_id = result["id"]
-            .as_str()
-            .ok_or_else(|| {
-                GwsError::Other(anyhow::anyhow!("No 'id' in drive.files.create response"))
-            })?
-            .to_string();
-        (new_id, true)
+
+        // Check if a doc with this title already exists in the folder
+        let existing_id = if let Some(fid) = folder_id {
+            let q = format!(
+                "name='{}' and '{}' in parents and mimeType='application/vnd.google-apps.document' and trashed=false",
+                doc_title.replace('\'', "\\'"),
+                fid
+            );
+            let list_method = drive_resource
+                .methods
+                .get("list")
+                .ok_or_else(|| GwsError::Validation("list method not found".into()))?;
+            let list_args = json!({"params": {"q": q, "fields": "files(id)", "pageSize": 1}});
+            let list_result = crate::execute::execute_tool(
+                &drive_doc,
+                list_method,
+                "files",
+                "list",
+                &list_args,
+                "drive",
+                policy,
+                meta,
+                None,
+                false,
+                &mut state.token_cache,
+            )
+            .await?;
+            list_result["files"]
+                .as_array()
+                .and_then(|f| f.first())
+                .and_then(|f| f["id"].as_str())
+                .map(|s| s.to_string())
+        } else {
+            None
+        };
+
+        if let Some(existing) = existing_id {
+            // Reuse existing doc — clear its content
+            let docs_doc = state.get_doc("docs").await?;
+            let resource = tools::find_resource(&docs_doc.resources, "documents")
+                .ok_or_else(|| GwsError::Validation("documents resource not found".into()))?;
+            let get_method = resource
+                .methods
+                .get("get")
+                .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
+            let get_args = json!({"params": {"documentId": &existing}});
+            let doc_content = crate::execute::execute_tool(
+                &docs_doc,
+                get_method,
+                "documents",
+                "get",
+                &get_args,
+                "docs",
+                policy,
+                meta,
+                None,
+                false,
+                &mut state.token_cache,
+            )
+            .await?;
+            let end_idx = doc_content["body"]["content"]
+                .as_array()
+                .and_then(|arr| arr.last())
+                .and_then(|el| el["endIndex"].as_i64())
+                .unwrap_or(2) as i32;
+            if end_idx > 2 {
+                let batch_method = resource
+                    .methods
+                    .get("batchUpdate")
+                    .ok_or_else(|| GwsError::Validation("batchUpdate not found".into()))?;
+                let clear_args = json!({
+                    "params": {"documentId": &existing},
+                    "body": {"requests": [{"deleteContentRange": {"range": {"startIndex": 1, "endIndex": end_idx - 1}}}]}
+                });
+                let clear_result = crate::execute::execute_tool(
+                    &docs_doc,
+                    batch_method,
+                    "documents",
+                    "batchUpdate",
+                    &clear_args,
+                    "docs",
+                    policy,
+                    meta,
+                    None,
+                    false,
+                    &mut state.token_cache,
+                )
+                .await?;
+                check_api_result(&clear_result)?;
+            }
+            tracing::info!(doc_id = %existing, title = doc_title, "Reusing existing document");
+            (existing, false)
+        } else {
+            let mut body = json!({
+                "name": doc_title,
+                "mimeType": "application/vnd.google-apps.document"
+            });
+            if let Some(fid) = folder_id {
+                body["parents"] = json!([fid]);
+            }
+            let create_args = json!({"body": body});
+            let create_method = drive_resource
+                .methods
+                .get("create")
+                .ok_or_else(|| GwsError::Validation("create method not found".into()))?;
+            let result = crate::execute::execute_tool(
+                &drive_doc,
+                create_method,
+                "files",
+                "create",
+                &create_args,
+                "drive",
+                policy,
+                meta,
+                None,
+                dry_run,
+                &mut state.token_cache,
+            )
+            .await?;
+            check_api_result(&result)?;
+            let new_id = result["id"]
+                .as_str()
+                .ok_or_else(|| {
+                    GwsError::Other(anyhow::anyhow!("No 'id' in drive.files.create response"))
+                })?
+                .to_string();
+            (new_id, true)
+        }
     } else {
         return Err(GwsError::Validation(
             "Either 'document_id' or 'title' is required".into(),

@@ -320,7 +320,7 @@ fn heading_level_to_style(level: HeadingLevel) -> &'static str {
 }
 
 #[derive(Debug, Clone)]
-struct StyleRange {
+struct InlineStyle {
     start: i32,
     end: i32,
     bold: bool,
@@ -331,85 +331,111 @@ struct StyleRange {
 }
 
 #[derive(Debug, Clone)]
-struct ParagraphRange {
-    start: i32,
-    end: i32,
-    heading_style: Option<String>,
-    is_blockquote: bool,
-}
-
-#[derive(Debug, Clone)]
-struct BulletRange {
-    start: i32,
-    end: i32,
-    ordered: bool,
-}
-
-#[derive(Debug, Clone)]
-struct ImageInsert {
-    index: i32,
-    url: String,
+enum Block {
+    Paragraph {
+        text: String,
+        styles: Vec<InlineStyle>,
+        heading: Option<String>,
+        is_blockquote: bool,
+    },
+    ListItem {
+        text: String,
+        styles: Vec<InlineStyle>,
+        ordered: bool,
+    },
+    Table {
+        rows: Vec<Vec<String>>,
+        header: bool,
+    },
+    Image {
+        url: String,
+    },
+    HorizontalRule,
+    FencedCode {
+        text: String,
+    },
 }
 
 pub fn markdown_to_batch_requests(markdown: &str, start_index: i32) -> Vec<Value> {
+    let blocks = parse_markdown_to_blocks(markdown);
+    generate_requests_from_blocks(&blocks, start_index)
+}
+
+fn parse_markdown_to_blocks(markdown: &str) -> Vec<Block> {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TABLES);
     let parser = Parser::new_ext(markdown, options);
 
-    let mut text_buf = String::new();
-    let mut style_ranges: Vec<StyleRange> = Vec::new();
-    let mut paragraph_ranges: Vec<ParagraphRange> = Vec::new();
-    let mut bullet_ranges: Vec<BulletRange> = Vec::new();
-    let mut images: Vec<ImageInsert> = Vec::new();
+    let mut blocks: Vec<Block> = Vec::new();
+
+    let mut para_text = String::new();
+    let mut para_styles: Vec<InlineStyle> = Vec::new();
+    let mut para_char_count: i32 = 0;
 
     let mut bold_depth = 0u32;
     let mut italic_depth = 0u32;
     let mut strikethrough_depth = 0u32;
     let mut code_block = false;
+    let mut code_block_text = String::new();
     let mut in_blockquote = false;
     let mut list_stack: Vec<bool> = Vec::new();
     let mut link_url_stack: Vec<String> = Vec::new();
-    let mut image_url: Option<String> = None;
     let mut in_image = false;
+    let mut image_url: Option<String> = None;
+    let mut in_table = false;
+    let mut table_rows: Vec<Vec<String>> = Vec::new();
+    let mut table_row: Vec<String> = Vec::new();
+    let mut table_cell_buf = String::new();
 
-    let mut block_start: Option<i32> = None;
-    let mut item_start: Option<i32> = None;
-
+    let mut current_heading: Option<String> = None;
+    let mut in_list_item = false;
     for event in parser {
         match event {
-            Event::Start(Tag::Heading { .. }) => {
-                block_start = Some(text_buf.len() as i32);
+            Event::Start(Tag::Heading { level, .. }) => {
+                current_heading = Some(heading_level_to_style(level).to_string());
+                para_text.clear();
+                para_styles.clear();
+                para_char_count = 0;
             }
-            Event::End(TagEnd::Heading(level)) => {
-                if !text_buf.ends_with('\n') {
-                    text_buf.push('\n');
+            Event::End(TagEnd::Heading(_)) => {
+                if !para_text.ends_with('\n') {
+                    para_text.push('\n');
                 }
-                if let Some(bs) = block_start {
-                    paragraph_ranges.push(ParagraphRange {
-                        start: bs,
-                        end: text_buf.len() as i32,
-                        heading_style: Some(heading_level_to_style(level).to_string()),
-                        is_blockquote: false,
-                    });
-                }
-                block_start = None;
+                blocks.push(Block::Paragraph {
+                    text: para_text.clone(),
+                    styles: para_styles.clone(),
+                    heading: current_heading.take(),
+                    is_blockquote: false,
+                });
+                para_text.clear();
+                para_styles.clear();
+                para_char_count = 0;
             }
             Event::Start(Tag::Paragraph) => {
-                block_start = Some(text_buf.len() as i32);
+                para_text.clear();
+                para_styles.clear();
+                para_char_count = 0;
             }
             Event::End(TagEnd::Paragraph) => {
-                if !text_buf.ends_with('\n') {
-                    text_buf.push('\n');
+                if in_list_item {
+                    continue;
                 }
-                if let Some(bs) = block_start {
-                    paragraph_ranges.push(ParagraphRange {
-                        start: bs,
-                        end: text_buf.len() as i32,
-                        heading_style: Some("NORMAL_TEXT".to_string()),
-                        is_blockquote: in_blockquote,
-                    });
+                if !para_text.ends_with('\n') {
+                    para_text.push('\n');
                 }
-                block_start = None;
+                if in_image {
+                    continue;
+                }
+                blocks.push(Block::Paragraph {
+                    text: para_text.clone(),
+                    styles: para_styles.clone(),
+                    heading: Some("NORMAL_TEXT".to_string()),
+                    is_blockquote: in_blockquote,
+                });
+                para_text.clear();
+                para_styles.clear();
+                para_char_count = 0;
             }
             Event::Start(Tag::BlockQuote(_)) => {
                 in_blockquote = true;
@@ -424,28 +450,25 @@ pub fn markdown_to_batch_requests(markdown: &str, start_index: i32) -> Vec<Value
                 list_stack.pop();
             }
             Event::Start(Tag::Item) => {
-                item_start = Some(text_buf.len() as i32);
+                in_list_item = true;
+                para_text.clear();
+                para_styles.clear();
+                para_char_count = 0;
             }
             Event::End(TagEnd::Item) => {
-                if !text_buf.ends_with('\n') {
-                    text_buf.push('\n');
+                in_list_item = false;
+                if !para_text.ends_with('\n') {
+                    para_text.push('\n');
                 }
-                if let Some(is) = item_start {
-                    let end = text_buf.len() as i32;
-                    let ordered = list_stack.last().copied().unwrap_or(false);
-                    bullet_ranges.push(BulletRange {
-                        start: is,
-                        end,
-                        ordered,
-                    });
-                    paragraph_ranges.push(ParagraphRange {
-                        start: is,
-                        end,
-                        heading_style: Some("NORMAL_TEXT".to_string()),
-                        is_blockquote: false,
-                    });
-                }
-                item_start = None;
+                let ordered = list_stack.last().copied().unwrap_or(false);
+                blocks.push(Block::ListItem {
+                    text: para_text.clone(),
+                    styles: para_styles.clone(),
+                    ordered,
+                });
+                para_text.clear();
+                para_styles.clear();
+                para_char_count = 0;
             }
             Event::Start(Tag::Strong) => {
                 bold_depth += 1;
@@ -477,59 +500,68 @@ pub fn markdown_to_batch_requests(markdown: &str, start_index: i32) -> Vec<Value
             }
             Event::End(TagEnd::Image) => {
                 if let Some(url) = image_url.take() {
-                    images.push(ImageInsert {
-                        index: text_buf.len() as i32,
-                        url,
-                    });
+                    blocks.push(Block::Image { url });
                 }
                 in_image = false;
             }
             Event::Start(Tag::CodeBlock(_)) => {
                 code_block = true;
-                block_start = Some(text_buf.len() as i32);
+                code_block_text.clear();
             }
             Event::End(TagEnd::CodeBlock) => {
                 code_block = false;
-                if !text_buf.ends_with('\n') {
-                    text_buf.push('\n');
+                if !code_block_text.ends_with('\n') {
+                    code_block_text.push('\n');
                 }
-                block_start = None;
+                blocks.push(Block::FencedCode {
+                    text: code_block_text.clone(),
+                });
+                code_block_text.clear();
             }
             Event::Text(t) => {
                 if in_image {
                     continue;
                 }
+                if in_table {
+                    table_cell_buf.push_str(t.as_ref());
+                    continue;
+                }
+                if code_block {
+                    code_block_text.push_str(t.as_ref());
+                    continue;
+                }
                 let s = t.as_ref();
-                let range_start = text_buf.len() as i32;
-                text_buf.push_str(s);
-                let range_end = text_buf.len() as i32;
+                let range_start = para_char_count;
+                para_text.push_str(s);
+                para_char_count += s.chars().count() as i32;
+                let range_end = para_char_count;
 
                 let has_style = bold_depth > 0
                     || italic_depth > 0
                     || strikethrough_depth > 0
-                    || code_block
                     || !link_url_stack.is_empty();
 
                 if has_style && range_start < range_end {
-                    style_ranges.push(StyleRange {
+                    para_styles.push(InlineStyle {
                         start: range_start,
                         end: range_end,
                         bold: bold_depth > 0,
                         italic: italic_depth > 0,
                         strikethrough: strikethrough_depth > 0,
-                        code: code_block,
+                        code: false,
                         link_url: link_url_stack.last().cloned(),
                     });
                 }
             }
             Event::Code(t) => {
                 let s = t.as_ref();
-                let range_start = text_buf.len() as i32;
-                text_buf.push_str(s);
-                let range_end = text_buf.len() as i32;
+                let range_start = para_char_count;
+                para_text.push_str(s);
+                para_char_count += s.chars().count() as i32;
+                let range_end = para_char_count;
 
                 if range_start < range_end {
-                    style_ranges.push(StyleRange {
+                    para_styles.push(InlineStyle {
                         start: range_start,
                         end: range_end,
                         bold: bold_depth > 0,
@@ -541,63 +573,374 @@ pub fn markdown_to_batch_requests(markdown: &str, start_index: i32) -> Vec<Value
                 }
             }
             Event::SoftBreak => {
-                text_buf.push(' ');
+                para_text.push(' ');
+                para_char_count += 1;
             }
             Event::HardBreak => {
-                text_buf.push('\n');
+                para_text.push('\n');
+                para_char_count += 1;
             }
             Event::Rule => {
-                text_buf.push_str("\u{2014}\u{2014}\u{2014}\n");
+                blocks.push(Block::HorizontalRule);
+            }
+            Event::Start(Tag::Table(_)) => {
+                in_table = true;
+                table_rows.clear();
+            }
+            Event::End(TagEnd::Table) => {
+                if !table_rows.is_empty() {
+                    blocks.push(Block::Table {
+                        rows: table_rows.clone(),
+                        header: true,
+                    });
+                }
+                in_table = false;
+                table_rows.clear();
+            }
+            Event::Start(Tag::TableHead) => {
+                table_row.clear();
+            }
+            Event::End(TagEnd::TableHead) => {
+                table_rows.push(table_row.clone());
+                table_row.clear();
+            }
+            Event::Start(Tag::TableRow) => {
+                table_row.clear();
+            }
+            Event::End(TagEnd::TableRow) => {
+                table_rows.push(table_row.clone());
+                table_row.clear();
+            }
+            Event::Start(Tag::TableCell) => {
+                table_cell_buf.clear();
+            }
+            Event::End(TagEnd::TableCell) => {
+                table_row.push(table_cell_buf.trim().to_string());
+                table_cell_buf.clear();
             }
             _ => {}
         }
     }
 
-    let mut requests: Vec<Value> = Vec::new();
+    blocks
+}
 
-    if !text_buf.is_empty() {
-        requests.push(json!({
-            "insertText": {
-                "text": text_buf,
-                "location": { "index": start_index }
+fn emit_text_style_request(style: &InlineStyle, base_index: i32) -> Option<Value> {
+    let mut ts = serde_json::Map::new();
+    let mut fields = Vec::new();
+
+    if style.bold {
+        ts.insert("bold".to_string(), json!(true));
+        fields.push("bold");
+    }
+    if style.italic {
+        ts.insert("italic".to_string(), json!(true));
+        fields.push("italic");
+    }
+    if style.strikethrough {
+        ts.insert("strikethrough".to_string(), json!(true));
+        fields.push("strikethrough");
+    }
+    if style.code {
+        ts.insert(
+            "weightedFontFamily".to_string(),
+            json!({ "fontFamily": "Courier New" }),
+        );
+        fields.push("weightedFontFamily");
+    }
+    if let Some(ref url) = style.link_url {
+        ts.insert("link".to_string(), json!({ "url": url }));
+        fields.push("link");
+    }
+
+    if fields.is_empty() {
+        return None;
+    }
+
+    Some(json!({
+        "updateTextStyle": {
+            "textStyle": Value::Object(ts),
+            "fields": fields.join(","),
+            "range": {
+                "startIndex": base_index + style.start,
+                "endIndex": base_index + style.end
             }
-        }));
-    }
+        }
+    }))
+}
 
-    // Paragraph styles MUST come before text styles — setting namedStyleType
-    // resets text formatting to the style's defaults, so explicit bold/italic/etc.
-    // must be applied after.
-    for pr in &paragraph_ranges {
-        if let Some(ref style) = pr.heading_style {
-            requests.push(json!({
-                "updateParagraphStyle": {
-                    "paragraphStyle": { "namedStyleType": style },
-                    "fields": "namedStyleType",
-                    "range": {
-                        "startIndex": start_index + pr.start,
-                        "endIndex": start_index + pr.end
+fn generate_requests_from_blocks(blocks: &[Block], start_index: i32) -> Vec<Value> {
+    let mut requests: Vec<Value> = Vec::new();
+    let mut current_index = start_index;
+
+    let mut pending_bullet_start: Option<i32> = None;
+    let mut pending_bullet_end: Option<i32> = None;
+    let mut pending_bullet_ordered: Option<bool> = None;
+
+    for (i, block) in blocks.iter().enumerate() {
+        let next_is_same_list = match block {
+            Block::ListItem { ordered, .. } => {
+                if let Some(Block::ListItem {
+                    ordered: next_ord, ..
+                }) = blocks.get(i + 1)
+                {
+                    *ordered == *next_ord
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+
+        match block {
+            Block::Paragraph {
+                text,
+                styles,
+                heading,
+                is_blockquote,
+            } => {
+                flush_bullets(
+                    &mut requests,
+                    &mut pending_bullet_start,
+                    &mut pending_bullet_end,
+                    &mut pending_bullet_ordered,
+                );
+
+                let text_chars = text.chars().count() as i32;
+                requests.push(json!({
+                    "insertText": {
+                        "text": text,
+                        "location": { "index": current_index }
+                    }
+                }));
+
+                if let Some(h) = heading {
+                    requests.push(json!({
+                        "updateParagraphStyle": {
+                            "paragraphStyle": { "namedStyleType": h },
+                            "fields": "namedStyleType",
+                            "range": {
+                                "startIndex": current_index,
+                                "endIndex": current_index + text_chars
+                            }
+                        }
+                    }));
+                }
+
+                if *is_blockquote {
+                    requests.push(json!({
+                        "updateParagraphStyle": {
+                            "paragraphStyle": {
+                                "indentStart": { "magnitude": 36, "unit": "PT" }
+                            },
+                            "fields": "indentStart",
+                            "range": {
+                                "startIndex": current_index,
+                                "endIndex": current_index + text_chars
+                            }
+                        }
+                    }));
+                }
+
+                for sr in styles {
+                    if let Some(req) = emit_text_style_request(sr, current_index) {
+                        requests.push(req);
                     }
                 }
-            }));
-        }
-        if pr.is_blockquote {
-            requests.push(json!({
-                "updateParagraphStyle": {
-                    "paragraphStyle": {
-                        "indentStart": { "magnitude": 36, "unit": "PT" }
-                    },
-                    "fields": "indentStart",
-                    "range": {
-                        "startIndex": start_index + pr.start,
-                        "endIndex": start_index + pr.end
+
+                current_index += text_chars;
+            }
+            Block::ListItem {
+                text,
+                styles,
+                ordered,
+            } => {
+                let text_chars = text.chars().count() as i32;
+                requests.push(json!({
+                    "insertText": {
+                        "text": text,
+                        "location": { "index": current_index }
+                    }
+                }));
+
+                requests.push(json!({
+                    "updateParagraphStyle": {
+                        "paragraphStyle": { "namedStyleType": "NORMAL_TEXT" },
+                        "fields": "namedStyleType",
+                        "range": {
+                            "startIndex": current_index,
+                            "endIndex": current_index + text_chars
+                        }
+                    }
+                }));
+
+                for sr in styles {
+                    if let Some(req) = emit_text_style_request(sr, current_index) {
+                        requests.push(req);
                     }
                 }
-            }));
+
+                if pending_bullet_start.is_none() {
+                    pending_bullet_start = Some(current_index);
+                    pending_bullet_ordered = Some(*ordered);
+                }
+                pending_bullet_end = Some(current_index + text_chars);
+
+                current_index += text_chars;
+
+                if !next_is_same_list {
+                    flush_bullets(
+                        &mut requests,
+                        &mut pending_bullet_start,
+                        &mut pending_bullet_end,
+                        &mut pending_bullet_ordered,
+                    );
+                }
+            }
+            Block::Table { rows, header } => {
+                flush_bullets(
+                    &mut requests,
+                    &mut pending_bullet_start,
+                    &mut pending_bullet_end,
+                    &mut pending_bullet_ordered,
+                );
+
+                let num_rows = rows.len() as i32;
+                let num_cols = rows.first().map(|r| r.len()).unwrap_or(0) as i32;
+                if num_cols == 0 || num_rows == 0 {
+                    continue;
+                }
+
+                requests.push(json!({
+                    "insertTable": {
+                        "rows": num_rows,
+                        "columns": num_cols,
+                        "location": { "index": current_index }
+                    }
+                }));
+
+                for r in (0..num_rows).rev() {
+                    let row = &rows[r as usize];
+                    for c in (0..num_cols).rev() {
+                        let cell_text = row.get(c as usize).map(|s| s.as_str()).unwrap_or("");
+                        if cell_text.is_empty() {
+                            continue;
+                        }
+                        let cell_idx = current_index + 3 + r * (2 * num_cols + 1) + c * 2;
+                        requests.push(json!({
+                            "insertText": {
+                                "text": cell_text,
+                                "location": { "index": cell_idx }
+                            }
+                        }));
+                    }
+                }
+
+                if *header && num_rows > 0 {
+                    let header_start = current_index + 3;
+                    let header_end = current_index + 3 + 2 * num_cols;
+                    requests.push(json!({
+                        "updateTextStyle": {
+                            "textStyle": { "bold": true },
+                            "fields": "bold",
+                            "range": {
+                                "startIndex": header_start,
+                                "endIndex": header_end
+                            }
+                        }
+                    }));
+                }
+
+                // table structural footprint: 2 + num_rows * (2*num_cols + 1)
+                current_index += 2 + num_rows * (2 * num_cols + 1);
+            }
+            Block::Image { url } => {
+                flush_bullets(
+                    &mut requests,
+                    &mut pending_bullet_start,
+                    &mut pending_bullet_end,
+                    &mut pending_bullet_ordered,
+                );
+
+                requests.push(json!({
+                    "insertInlineImage": {
+                        "uri": url,
+                        "location": { "index": current_index }
+                    }
+                }));
+                current_index += 1;
+            }
+            Block::HorizontalRule => {
+                flush_bullets(
+                    &mut requests,
+                    &mut pending_bullet_start,
+                    &mut pending_bullet_end,
+                    &mut pending_bullet_ordered,
+                );
+
+                let rule_text = "\u{2014}\u{2014}\u{2014}\n";
+                requests.push(json!({
+                    "insertText": {
+                        "text": rule_text,
+                        "location": { "index": current_index }
+                    }
+                }));
+                current_index += 4;
+            }
+            Block::FencedCode { text } => {
+                flush_bullets(
+                    &mut requests,
+                    &mut pending_bullet_start,
+                    &mut pending_bullet_end,
+                    &mut pending_bullet_ordered,
+                );
+
+                let text_chars = text.chars().count() as i32;
+                requests.push(json!({
+                    "insertText": {
+                        "text": text,
+                        "location": { "index": current_index }
+                    }
+                }));
+
+                if text_chars > 0 {
+                    requests.push(json!({
+                        "updateTextStyle": {
+                            "textStyle": {
+                                "weightedFontFamily": { "fontFamily": "Courier New" }
+                            },
+                            "fields": "weightedFontFamily",
+                            "range": {
+                                "startIndex": current_index,
+                                "endIndex": current_index + text_chars
+                            }
+                        }
+                    }));
+                }
+
+                current_index += text_chars;
+            }
         }
     }
 
-    for br in &bullet_ranges {
-        let preset = if br.ordered {
+    flush_bullets(
+        &mut requests,
+        &mut pending_bullet_start,
+        &mut pending_bullet_end,
+        &mut pending_bullet_ordered,
+    );
+
+    requests
+}
+
+fn flush_bullets(
+    requests: &mut Vec<Value>,
+    start: &mut Option<i32>,
+    end: &mut Option<i32>,
+    ordered: &mut Option<bool>,
+) {
+    if let (Some(s), Some(e), Some(o)) = (*start, *end, *ordered) {
+        let preset = if o {
             "NUMBERED_DECIMAL_NESTED"
         } else {
             "BULLET_DISC_CIRCLE_SQUARE"
@@ -605,66 +948,16 @@ pub fn markdown_to_batch_requests(markdown: &str, start_index: i32) -> Vec<Value
         requests.push(json!({
             "createParagraphBullets": {
                 "range": {
-                    "startIndex": start_index + br.start,
-                    "endIndex": start_index + br.end
+                    "startIndex": s,
+                    "endIndex": e
                 },
                 "bulletPreset": preset
             }
         }));
     }
-
-    for sr in &style_ranges {
-        let mut ts = serde_json::Map::new();
-        let mut fields = Vec::new();
-
-        if sr.bold {
-            ts.insert("bold".to_string(), json!(true));
-            fields.push("bold");
-        }
-        if sr.italic {
-            ts.insert("italic".to_string(), json!(true));
-            fields.push("italic");
-        }
-        if sr.strikethrough {
-            ts.insert("strikethrough".to_string(), json!(true));
-            fields.push("strikethrough");
-        }
-        if sr.code {
-            ts.insert(
-                "weightedFontFamily".to_string(),
-                json!({ "fontFamily": "Courier New" }),
-            );
-            fields.push("weightedFontFamily");
-        }
-        if let Some(ref url) = sr.link_url {
-            ts.insert("link".to_string(), json!({ "url": url }));
-            fields.push("link");
-        }
-
-        if !fields.is_empty() {
-            requests.push(json!({
-                "updateTextStyle": {
-                    "textStyle": Value::Object(ts),
-                    "fields": fields.join(","),
-                    "range": {
-                        "startIndex": start_index + sr.start,
-                        "endIndex": start_index + sr.end
-                    }
-                }
-            }));
-        }
-    }
-
-    for img in images.iter().rev() {
-        requests.push(json!({
-            "insertInlineImage": {
-                "uri": img.url,
-                "location": { "index": start_index + img.index }
-            }
-        }));
-    }
-
-    requests
+    *start = None;
+    *end = None;
+    *ordered = None;
 }
 
 pub fn markdown_tool_schema() -> Value {
@@ -1172,13 +1465,9 @@ mod tests {
             .iter()
             .filter(|r| r.get("createParagraphBullets").is_some())
             .collect();
-        assert_eq!(bullets.len(), 2);
+        assert_eq!(bullets.len(), 1);
         assert_eq!(
             bullets[0]["createParagraphBullets"]["bulletPreset"],
-            "BULLET_DISC_CIRCLE_SQUARE"
-        );
-        assert_eq!(
-            bullets[1]["createParagraphBullets"]["bulletPreset"],
             "BULLET_DISC_CIRCLE_SQUARE"
         );
     }
@@ -1359,5 +1648,32 @@ mod tests {
     fn test_markdown_empty() {
         let requests = markdown_to_batch_requests("", 1);
         assert!(requests.is_empty());
+    }
+
+    #[test]
+    fn test_markdown_table() {
+        let md = "| Name | Value |\n|------|-------|\n| Alpha | 100 |\n| Beta | 200 |\n";
+        let requests = markdown_to_batch_requests(md, 1);
+        let tables: Vec<&Value> = requests
+            .iter()
+            .filter(|r| r.get("insertTable").is_some())
+            .collect();
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0]["insertTable"]["rows"], 3);
+        assert_eq!(tables[0]["insertTable"]["columns"], 2);
+    }
+
+    #[test]
+    fn test_markdown_table_with_text() {
+        let md = "# Title\n\nSome text.\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\nMore text.\n";
+        let requests = markdown_to_batch_requests(md, 1);
+        let has_insert = requests.iter().any(|r| r.get("insertText").is_some());
+        let has_table = requests.iter().any(|r| r.get("insertTable").is_some());
+        let has_heading = requests
+            .iter()
+            .any(|r| r.get("updateParagraphStyle").is_some());
+        assert!(has_insert);
+        assert!(has_table);
+        assert!(has_heading);
     }
 }
