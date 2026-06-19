@@ -1,4 +1,5 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
 
 use base64::Engine;
 use serde_json::{Map, Value, json};
@@ -10,6 +11,31 @@ use google_workspace::validate;
 
 use crate::meta::RequestMeta;
 use crate::policy::Policy;
+
+static FIELD_DEFAULTS: LazyLock<HashMap<(&str, &str, &str), &str>> = LazyLock::new(|| {
+    let mut m = HashMap::new();
+    m.insert(
+        ("drive", "files", "list"),
+        "files(id,name,mimeType,modifiedTime,size,parents),nextPageToken",
+    );
+    m.insert(
+        ("drive", "files", "get"),
+        "id,name,mimeType,modifiedTime,size,parents,webViewLink",
+    );
+    m.insert(
+        ("gmail", "messages", "list"),
+        "messages(id,threadId),nextPageToken,resultSizeEstimate",
+    );
+    m.insert(("gmail", "messages", "get"), "id,threadId,labelIds,snippet,payload(headers(name,value),mimeType,body),sizeEstimate,internalDate");
+    m.insert(
+        ("gmail", "threads", "list"),
+        "threads(id,snippet),nextPageToken",
+    );
+    m.insert(("calendar", "events", "list"), "items(id,summary,start,end,status,organizer,attendees(email,responseStatus)),nextPageToken");
+    m.insert(("calendar", "events", "get"), "id,summary,description,start,end,status,location,organizer,attendees,conferenceData,htmlLink");
+    m.insert(("sheets", "spreadsheets", "get"), "spreadsheetId,properties(title),sheets(properties(sheetId,title,index),data(rowData(values(formattedValue))))");
+    m
+});
 
 fn b64_encode(data: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(data)
@@ -45,10 +71,135 @@ fn apply_common_headers(
     request
 }
 
+struct ParsedArgs {
+    params: Map<String, Value>,
+    body: Option<Value>,
+}
+
+fn parse_args(
+    arguments: &Value,
+    service: &str,
+    resource_path: &str,
+    method_name: &str,
+    method: &RestMethod,
+    policy: &Policy,
+) -> Result<ParsedArgs, GwsError> {
+    policy.check_method(service, resource_path, method_name, method)?;
+
+    let mut params: Map<String, Value> = arguments
+        .get("params")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+
+    let body: Option<Value> = arguments
+        .get("body")
+        .filter(|v| !v.as_object().is_some_and(|m| m.is_empty()))
+        .cloned();
+
+    policy.enforce_constraints(service, method, &mut params, &body)?;
+
+    Ok(ParsedArgs { params, body })
+}
+
+fn validate_params(method: &RestMethod, params: &Value) -> Result<(), Value> {
+    let param_map = params.as_object();
+    let mut errors: Vec<Value> = Vec::new();
+    let mut warnings: Vec<Value> = Vec::new();
+
+    for (name, schema) in &method.parameters {
+        let value = param_map.and_then(|m| m.get(name));
+
+        if schema.required && value.is_none() {
+            errors.push(json!({
+                "param": name,
+                "issue": "missing_required",
+                "hint": format!("Required parameter '{}' is missing", name),
+                "type": schema.param_type.as_deref().unwrap_or("string"),
+                "location": schema.location.as_deref().unwrap_or("query"),
+                "description": schema.description.as_deref().unwrap_or("")
+            }));
+            continue;
+        }
+
+        let Some(val) = value else { continue };
+
+        if let Some(ref param_type) = schema.param_type {
+            let type_ok = match param_type.as_str() {
+                "string" => val.is_string(),
+                "integer" => val.is_i64() || val.is_u64(),
+                "boolean" => val.is_boolean(),
+                "number" => val.is_number(),
+                _ => true,
+            };
+            if !type_ok {
+                errors.push(json!({
+                    "param": name,
+                    "issue": "wrong_type",
+                    "expected": param_type,
+                    "provided_type": value_type_name(val),
+                    "hint": format!("Parameter '{}' must be of type {}", name, param_type)
+                }));
+                continue;
+            }
+        }
+
+        if let Some(ref allowed) = schema.enum_values
+            && let Some(s) = val.as_str()
+            && !allowed.contains(&s.to_string())
+        {
+            errors.push(json!({
+                "param": name,
+                "issue": "invalid_enum_value",
+                "provided": s,
+                "allowed": allowed,
+                "hint": "Use one of the allowed values"
+            }));
+        }
+    }
+
+    if let Some(map) = param_map {
+        for key in map.keys() {
+            if !method.parameters.contains_key(key) {
+                warnings.push(json!({
+                    "param": key,
+                    "issue": "unknown_parameter",
+                    "hint": format!("Parameter '{}' is not defined in the API schema", key)
+                }));
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        let mut result = json!({
+            "validation_error": true,
+            "errors": errors,
+        });
+        if !warnings.is_empty() {
+            result["warnings"] = json!(warnings);
+        }
+        Err(result)
+    }
+}
+
+fn value_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
 pub type NotifySender = tokio::sync::mpsc::UnboundedSender<Value>;
 
 const MAX_UPLOAD_BYTES: usize = 10 * 1024 * 1024;
 const DOWNLOAD_CHUNK_SIZE: usize = 10 * 1024 * 1024;
+const MAX_DOWNLOAD_SIZE: usize = 100 * 1024 * 1024;
 
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip(doc, method, arguments, policy, meta, notify_tx), fields(service, resource = resource_path, method_name))]
@@ -65,19 +216,24 @@ pub async fn execute_tool(
     dry_run: bool,
     token_cache: &mut Option<crate::auth::TokenCache>,
 ) -> Result<Value, GwsError> {
-    policy.check_method(service, resource_path, method_name, method)?;
+    let ParsedArgs { mut params, body } = parse_args(
+        arguments,
+        service,
+        resource_path,
+        method_name,
+        method,
+        policy,
+    )?;
 
-    let mut params: Map<String, Value> = arguments
-        .get("params")
-        .and_then(|v| v.as_object())
-        .cloned()
-        .unwrap_or_default();
+    if let Err(validation_error) = validate_params(method, &Value::Object(params.clone())) {
+        return Ok(validation_error);
+    }
 
-    // Drop empty body objects — LLMs commonly send "body": {} on GET methods.
-    let body: Option<Value> = arguments
-        .get("body")
-        .filter(|v| !v.as_object().is_some_and(|m| m.is_empty()))
-        .cloned();
+    if !params.contains_key("fields")
+        && let Some(default) = FIELD_DEFAULTS.get(&(service, resource_path, method_name))
+    {
+        params.insert("fields".to_string(), Value::String(default.to_string()));
+    }
 
     let page_all = arguments
         .get("page_all")
@@ -96,8 +252,6 @@ pub async fn execute_tool(
         )));
     }
 
-    policy.enforce_constraints(service, method, &mut params, &body)?;
-
     let scopes: Vec<&str> = select_scope(&method.scopes).into_iter().collect();
 
     let is_upload = media_data.is_some() && method.supports_media_upload;
@@ -107,13 +261,13 @@ pub async fn execute_tool(
             .and_then(|v| v.as_str())
             .is_some_and(|v| v == "media");
 
+    let query_params = build_query_params(method, &params);
     let url = if is_upload {
         build_upload_url(doc, method, &params)?
     } else {
         let (u, _) = build_url(doc, method, &params)?;
         u
     };
-    let (_, query_params) = build_url(doc, method, &params)?;
 
     if dry_run {
         let mut dry = json!({
@@ -223,11 +377,27 @@ pub async fn execute_tool(
             .to_string();
 
         if is_download && !is_json_content_type(&response_content_type) && status.is_success() {
+            if let Some(cl) = response
+                .headers()
+                .get("content-length")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<usize>().ok())
+                && cl > MAX_DOWNLOAD_SIZE
+            {
+                return Err(gws_err(format!(
+                    "Download too large ({cl} bytes, limit {MAX_DOWNLOAD_SIZE})"
+                )));
+            }
             let bytes = response
                 .bytes()
                 .await
                 .map_err(|e| gws_err(format!("Failed to read binary response: {e}")))?;
             let total = bytes.len();
+            if total > MAX_DOWNLOAD_SIZE {
+                return Err(gws_err(format!(
+                    "Download too large ({total} bytes, limit {MAX_DOWNLOAD_SIZE})"
+                )));
+            }
             if total <= DOWNLOAD_CHUNK_SIZE {
                 let b64 = b64_encode(&bytes);
                 return Ok(json!({
@@ -250,7 +420,12 @@ pub async fn execute_tool(
             .map_err(|e| gws_err(format!("Failed to read response: {e}")))?;
 
         if !status.is_success() {
-            return Err(parse_api_error(status.as_u16(), &body_text));
+            return Ok(build_error_with_recovery(
+                status.as_u16(),
+                &body_text,
+                service,
+                method_name,
+            ));
         }
 
         if body_text.is_empty() {
@@ -397,33 +572,8 @@ fn build_mcp_binary_content(b64_data: &str, mime_type: &str, size: usize) -> Vec
     content
 }
 
-fn build_url(
-    doc: &RestDescription,
-    method: &RestMethod,
-    params: &Map<String, Value>,
-) -> Result<(String, Vec<(String, String)>), GwsError> {
-    let base_url = if let Some(b) = &doc.base_url {
-        b.clone()
-    } else {
-        format!("{}{}", doc.root_url, doc.service_path)
-    };
-
-    let path_template = match method.flat_path.as_deref() {
-        Some(fp) => {
-            let all_match = method
-                .parameters
-                .iter()
-                .filter(|(_, p)| p.location.as_deref() == Some("path"))
-                .all(|(name, _)| {
-                    let plain = format!("{{{name}}}");
-                    let plus = format!("{{+{name}}}");
-                    fp.contains(&plain) || fp.contains(&plus)
-                });
-            if all_match { fp } else { method.path.as_str() }
-        }
-        None => method.path.as_str(),
-    };
-
+fn build_query_params(method: &RestMethod, params: &Map<String, Value>) -> Vec<(String, String)> {
+    let path_template = method.flat_path.as_deref().unwrap_or(method.path.as_str());
     let path_params = extract_path_params(path_template);
     let mut query_params: Vec<(String, String)> = Vec::new();
 
@@ -453,6 +603,37 @@ fn build_url(
         query_params.push((key.clone(), val_str));
     }
 
+    query_params
+}
+
+fn build_url(
+    doc: &RestDescription,
+    method: &RestMethod,
+    params: &Map<String, Value>,
+) -> Result<(String, Vec<(String, String)>), GwsError> {
+    let base_url = if let Some(b) = &doc.base_url {
+        b.clone()
+    } else {
+        format!("{}{}", doc.root_url, doc.service_path)
+    };
+
+    let path_template = match method.flat_path.as_deref() {
+        Some(fp) => {
+            let all_match = method
+                .parameters
+                .iter()
+                .filter(|(_, p)| p.location.as_deref() == Some("path"))
+                .all(|(name, _)| {
+                    let plain = format!("{{{name}}}");
+                    let plus = format!("{{+{name}}}");
+                    fp.contains(&plain) || fp.contains(&plus)
+                });
+            if all_match { fp } else { method.path.as_str() }
+        }
+        None => method.path.as_str(),
+    };
+
+    let query_params = build_query_params(method, params);
     let url_path = render_path_template(path_template, params)?;
     let full_url = format!("{base_url}{url_path}");
     Ok((full_url, query_params))
@@ -518,6 +699,62 @@ fn render_path_template(template: &str, params: &Map<String, Value>) -> Result<S
     Ok(rendered)
 }
 
+fn recovery_hints(
+    status: u16,
+    reason: &str,
+    _message: &str,
+    _service: &str,
+    _method_name: &str,
+) -> Option<Value> {
+    match (status, reason) {
+        (403, "insufficientPermissions") => Some(json!({
+            "hint": "Check that the OAuth scope covers this operation. Required scope may be broader than the current token's scope.",
+            "action": "scope_check",
+            "retryable": false
+        })),
+        (403, r)
+            if r == "rateLimitExceeded" || r == "usageLimits" || r == "userRateLimitExceeded" =>
+        {
+            Some(json!({
+                "hint": "API quota exceeded. Wait before retrying. Consider using batch operations for bulk work.",
+                "action": "wait_and_retry",
+                "retryable": true
+            }))
+        }
+        (404, "notFound") => Some(json!({
+            "hint": "The resource may not exist or you may lack access. Try listing resources first to confirm the ID.",
+            "action": "verify_resource",
+            "retryable": false
+        })),
+        (400, r) if r == "invalidArgument" || r == "invalid" || r == "badRequest" => Some(json!({
+            "hint": "Check parameter values against the API schema. Use dry_run: true to inspect the request before sending.",
+            "action": "check_params",
+            "retryable": false
+        })),
+        (401, _) => Some(json!({
+            "hint": "Credential expired or invalid. Run --check-auth to diagnose.",
+            "action": "reauth",
+            "retryable": false
+        })),
+        (409, r) if r == "conflict" || r == "alreadyExists" || r == "duplicate" => Some(json!({
+            "hint": "Resource already exists or was modified concurrently. Fetch the latest version before retrying.",
+            "action": "fetch_latest",
+            "retryable": true
+        })),
+        (429, _) => Some(json!({
+            "hint": "Rate limited. Wait 30-60 seconds before retrying.",
+            "action": "backoff",
+            "retryable": true
+        })),
+        (s, _) if s >= 500 => Some(json!({
+            "hint": "Google server error. Retry with exponential backoff.",
+            "action": "retry",
+            "retryable": true
+        })),
+        _ => None,
+    }
+}
+
 fn parse_api_error(status: u16, body: &str) -> GwsError {
     if let Ok(json) = serde_json::from_str::<Value>(body)
         && let Some(err) = json.get("error")
@@ -542,12 +779,57 @@ fn parse_api_error(status: u16, body: &str) -> GwsError {
             enable_url: None,
         };
     }
+    let truncated: String = body.chars().take(200).collect();
     GwsError::Api {
         code: status,
-        message: body.to_string(),
+        message: format!("Non-JSON error response: {truncated}"),
         reason: String::new(),
         enable_url: None,
     }
+}
+
+fn build_error_with_recovery(status: u16, body: &str, service: &str, method_name: &str) -> Value {
+    let (message, reason) = if let Ok(json) = serde_json::from_str::<Value>(body)
+        && let Some(err) = json.get("error")
+    {
+        let msg = err
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("Unknown error")
+            .to_string();
+        let rsn = err
+            .get("errors")
+            .and_then(|e| e.as_array())
+            .and_then(|a| a.first())
+            .and_then(|e| e.get("reason"))
+            .and_then(|r| r.as_str())
+            .unwrap_or("")
+            .to_string();
+        (msg, rsn)
+    } else {
+        let truncated: String = body.chars().take(200).collect();
+        (
+            format!("Non-JSON error response: {truncated}"),
+            String::new(),
+        )
+    };
+
+    let error_label = if reason.is_empty() {
+        message.clone()
+    } else {
+        format!("{reason}: {message}")
+    };
+
+    let mut result = json!({
+        "error": error_label,
+        "status": status,
+    });
+
+    if let Some(recovery) = recovery_hints(status, &reason, &message, service, method_name) {
+        result["recovery"] = recovery;
+    }
+
+    result
 }
 
 pub(crate) async fn initiate_resumable_upload(
@@ -559,11 +841,6 @@ pub(crate) async fn initiate_resumable_upload(
     meta: &RequestMeta,
     token_cache: &mut Option<crate::auth::TokenCache>,
 ) -> Result<Value, GwsError> {
-    let body: Option<Value> = arguments
-        .get("body")
-        .filter(|v| !v.as_object().is_some_and(|m| m.is_empty()))
-        .cloned();
-
     let resource_path = arguments
         .get("resource")
         .and_then(|v| v.as_str())
@@ -572,14 +849,15 @@ pub(crate) async fn initiate_resumable_upload(
         .get("method")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    policy.check_method(service, resource_path, method_name, method)?;
 
-    let mut params: serde_json::Map<String, serde_json::Value> = arguments
-        .get("params")
-        .and_then(|v| v.as_object())
-        .cloned()
-        .unwrap_or_default();
-    policy.enforce_constraints(service, method, &mut params, &body)?;
+    let ParsedArgs { params, body } = parse_args(
+        arguments,
+        service,
+        resource_path,
+        method_name,
+        method,
+        policy,
+    )?;
 
     let content_type = arguments
         .get("media_content_type")
@@ -658,6 +936,9 @@ pub(crate) async fn upload_chunk(
     total_size: u64,
     content_type: &str,
 ) -> Result<Value, GwsError> {
+    if chunk.is_empty() {
+        return Err(GwsError::Validation("Empty chunk data".into()));
+    }
     let http_client = client::shared_client()?;
     let end = offset + chunk.len() as u64 - 1;
 
@@ -865,7 +1146,20 @@ mod tests {
         match err {
             GwsError::Api { code, message, .. } => {
                 assert_eq!(code, 500);
-                assert_eq!(message, "Internal Server Error");
+                assert_eq!(message, "Non-JSON error response: Internal Server Error");
+            }
+            _ => panic!("expected Api error"),
+        }
+    }
+
+    #[test]
+    fn test_parse_api_error_truncates_long_body() {
+        let long_body = "x".repeat(500);
+        let err = parse_api_error(500, &long_body);
+        match err {
+            GwsError::Api { message, .. } => {
+                assert!(message.len() < 250);
+                assert!(message.starts_with("Non-JSON error response: "));
             }
             _ => panic!("expected Api error"),
         }
@@ -1060,6 +1354,7 @@ mod tests {
         let args = json!({
             "resource": "files",
             "method": "get",
+            "params": { "fileId": "abc" },
             "media_data": "SGVsbG8=",
             "media_content_type": "text/plain"
         });
@@ -1214,6 +1509,7 @@ mod tests {
         let args = json!({
             "resource": "files",
             "method": "create",
+            "params": { "fileId": "abc" },
             "media_data": big_data,
             "media_content_type": "application/octet-stream"
         });
@@ -1226,5 +1522,333 @@ mod tests {
 
         assert_eq!(result["auto_resumable"], true);
         assert!(result["upload_total_size"].as_u64().unwrap() > MAX_UPLOAD_BYTES as u64);
+    }
+
+    #[tokio::test]
+    async fn test_smart_fields_injected() {
+        let doc = test_doc();
+        let mut method = test_method();
+        method.path = "files".to_string();
+        method.parameters.clear();
+        let policy = test_policy();
+        let meta = RequestMeta::default();
+        let args = json!({
+            "resource": "files",
+            "method": "list",
+            "params": {}
+        });
+
+        let result = execute_tool(
+            &doc, &method, "files", "list", &args, "drive", &policy, &meta, None, true, &mut None,
+        )
+        .await
+        .unwrap();
+
+        let qp = result["query_params"].as_array().unwrap();
+        let has_fields = qp
+            .iter()
+            .any(|entry| entry.as_object().unwrap().contains_key("fields"));
+        assert!(
+            has_fields,
+            "smart fields should be injected when caller omits fields"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_smart_fields_not_overridden() {
+        let doc = test_doc();
+        let method = test_method();
+        let policy = test_policy();
+        let meta = RequestMeta::default();
+        let args = json!({
+            "resource": "files",
+            "method": "get",
+            "params": { "fileId": "abc123", "fields": "id,name" }
+        });
+
+        let result = execute_tool(
+            &doc, &method, "files", "get", &args, "drive", &policy, &meta, None, true, &mut None,
+        )
+        .await
+        .unwrap();
+
+        let qp = result["query_params"].as_array().unwrap();
+        let fields_entry = qp
+            .iter()
+            .find(|entry| entry.as_object().unwrap().contains_key("fields"))
+            .unwrap();
+        assert_eq!(
+            fields_entry.as_object().unwrap()["fields"],
+            "id,name",
+            "explicit fields should not be overridden by smart defaults"
+        );
+    }
+
+    // -- Recovery hints tests --
+
+    #[test]
+    fn test_recovery_hints_403_insufficient_permissions() {
+        let hints = recovery_hints(403, "insufficientPermissions", "", "drive", "files.list");
+        assert!(hints.is_some());
+        let h = hints.unwrap();
+        assert_eq!(h["action"], "scope_check");
+        assert_eq!(h["retryable"], false);
+        assert!(h["hint"].as_str().unwrap().contains("OAuth scope"));
+    }
+
+    #[test]
+    fn test_recovery_hints_403_rate_limit() {
+        let hints = recovery_hints(403, "rateLimitExceeded", "", "drive", "files.list");
+        assert!(hints.is_some());
+        let h = hints.unwrap();
+        assert_eq!(h["action"], "wait_and_retry");
+        assert_eq!(h["retryable"], true);
+    }
+
+    #[test]
+    fn test_recovery_hints_404_not_found() {
+        let hints = recovery_hints(404, "notFound", "", "drive", "files.get");
+        assert!(hints.is_some());
+        let h = hints.unwrap();
+        assert_eq!(h["action"], "verify_resource");
+        assert_eq!(h["retryable"], false);
+    }
+
+    #[test]
+    fn test_recovery_hints_400_invalid() {
+        for reason in &["invalidArgument", "invalid", "badRequest"] {
+            let hints = recovery_hints(400, reason, "", "gmail", "messages.send");
+            assert!(hints.is_some(), "expected hints for 400/{reason}");
+            assert_eq!(hints.unwrap()["action"], "check_params");
+        }
+    }
+
+    #[test]
+    fn test_recovery_hints_401() {
+        let hints = recovery_hints(401, "unauthorized", "", "calendar", "events.list");
+        assert!(hints.is_some());
+        let h = hints.unwrap();
+        assert_eq!(h["action"], "reauth");
+        assert_eq!(h["retryable"], false);
+    }
+
+    #[test]
+    fn test_recovery_hints_409_conflict() {
+        let hints = recovery_hints(409, "conflict", "", "drive", "files.update");
+        assert!(hints.is_some());
+        let h = hints.unwrap();
+        assert_eq!(h["action"], "fetch_latest");
+        assert_eq!(h["retryable"], true);
+    }
+
+    #[test]
+    fn test_recovery_hints_429() {
+        let hints = recovery_hints(429, "tooManyRequests", "", "drive", "files.list");
+        assert!(hints.is_some());
+        let h = hints.unwrap();
+        assert_eq!(h["action"], "backoff");
+        assert_eq!(h["retryable"], true);
+    }
+
+    #[test]
+    fn test_recovery_hints_500() {
+        let hints = recovery_hints(500, "", "", "drive", "files.list");
+        assert!(hints.is_some());
+        let h = hints.unwrap();
+        assert_eq!(h["action"], "retry");
+        assert_eq!(h["retryable"], true);
+    }
+
+    #[test]
+    fn test_recovery_hints_503() {
+        let hints = recovery_hints(503, "backendError", "", "gmail", "messages.get");
+        assert!(hints.is_some());
+        assert_eq!(hints.unwrap()["action"], "retry");
+    }
+
+    #[test]
+    fn test_recovery_hints_unknown_returns_none() {
+        let hints = recovery_hints(418, "teapot", "", "drive", "files.list");
+        assert!(hints.is_none());
+    }
+
+    #[test]
+    fn test_build_error_with_recovery_structured_json() {
+        let body = r#"{"error":{"message":"Insufficient Permission","errors":[{"reason":"insufficientPermissions"}]}}"#;
+        let result = build_error_with_recovery(403, body, "drive", "files.list");
+        assert_eq!(result["status"], 403);
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap()
+                .contains("insufficientPermissions")
+        );
+        assert!(result.get("recovery").is_some());
+        assert_eq!(result["recovery"]["action"], "scope_check");
+    }
+
+    #[test]
+    fn test_build_error_with_recovery_plain_text() {
+        let result = build_error_with_recovery(500, "Internal Server Error", "drive", "files.list");
+        assert_eq!(result["status"], 500);
+        assert!(result["error"].as_str().unwrap().contains("Non-JSON error"));
+        assert!(result.get("recovery").is_some());
+        assert_eq!(result["recovery"]["action"], "retry");
+    }
+
+    #[test]
+    fn test_build_error_with_recovery_no_hints() {
+        let body = r#"{"error":{"message":"I'm a teapot","errors":[{"reason":"teapot"}]}}"#;
+        let result = build_error_with_recovery(418, body, "drive", "files.list");
+        assert_eq!(result["status"], 418);
+        assert!(result.get("recovery").is_none());
+    }
+
+    #[test]
+    fn test_build_error_with_recovery_404_structured() {
+        let body =
+            r#"{"error":{"message":"File not found: abc123","errors":[{"reason":"notFound"}]}}"#;
+        let result = build_error_with_recovery(404, body, "drive", "files.get");
+        assert_eq!(result["status"], 404);
+        assert_eq!(result["error"], "notFound: File not found: abc123");
+        let recovery = &result["recovery"];
+        assert_eq!(recovery["action"], "verify_resource");
+        assert_eq!(recovery["retryable"], false);
+        assert!(
+            recovery["hint"]
+                .as_str()
+                .unwrap()
+                .contains("listing resources")
+        );
+    }
+
+    // -- Parameter validation tests --
+
+    #[test]
+    fn test_validate_params_missing_required() {
+        let mut params = HashMap::new();
+        params.insert(
+            "fileId".to_string(),
+            MethodParameter {
+                required: true,
+                param_type: Some("string".to_string()),
+                location: Some("path".to_string()),
+                ..Default::default()
+            },
+        );
+        params.insert(
+            "fields".to_string(),
+            MethodParameter {
+                required: false,
+                param_type: Some("string".to_string()),
+                ..Default::default()
+            },
+        );
+        let method = RestMethod {
+            parameters: params,
+            ..Default::default()
+        };
+        let result = validate_params(&method, &json!({}));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err["validation_error"], true);
+        let errors = err["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0]["param"], "fileId");
+        assert_eq!(errors[0]["issue"], "missing_required");
+    }
+
+    #[test]
+    fn test_validate_params_invalid_enum() {
+        let mut params = HashMap::new();
+        params.insert(
+            "orderBy".to_string(),
+            MethodParameter {
+                param_type: Some("string".to_string()),
+                enum_values: Some(vec![
+                    "createdTime".to_string(),
+                    "modifiedTime".to_string(),
+                    "name".to_string(),
+                ]),
+                ..Default::default()
+            },
+        );
+        let method = RestMethod {
+            parameters: params,
+            ..Default::default()
+        };
+        let result = validate_params(&method, &json!({"orderBy": "date"}));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err["validation_error"], true);
+        let errors = err["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0]["param"], "orderBy");
+        assert_eq!(errors[0]["issue"], "invalid_enum_value");
+        assert_eq!(errors[0]["provided"], "date");
+        let allowed = errors[0]["allowed"].as_array().unwrap();
+        assert!(allowed.contains(&json!("createdTime")));
+        assert!(allowed.contains(&json!("modifiedTime")));
+        assert!(allowed.contains(&json!("name")));
+    }
+
+    #[test]
+    fn test_validate_params_passes() {
+        let mut params = HashMap::new();
+        params.insert(
+            "fileId".to_string(),
+            MethodParameter {
+                required: true,
+                param_type: Some("string".to_string()),
+                location: Some("path".to_string()),
+                ..Default::default()
+            },
+        );
+        params.insert(
+            "orderBy".to_string(),
+            MethodParameter {
+                param_type: Some("string".to_string()),
+                enum_values: Some(vec!["name".to_string(), "modifiedTime".to_string()]),
+                ..Default::default()
+            },
+        );
+        let method = RestMethod {
+            parameters: params,
+            ..Default::default()
+        };
+        let result = validate_params(&method, &json!({"fileId": "abc123", "orderBy": "name"}));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_params_wrong_type() {
+        let mut params = HashMap::new();
+        params.insert(
+            "maxResults".to_string(),
+            MethodParameter {
+                param_type: Some("integer".to_string()),
+                ..Default::default()
+            },
+        );
+        let method = RestMethod {
+            parameters: params,
+            ..Default::default()
+        };
+        let result = validate_params(&method, &json!({"maxResults": "ten"}));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let errors = err["errors"].as_array().unwrap();
+        assert_eq!(errors[0]["issue"], "wrong_type");
+        assert_eq!(errors[0]["expected"], "integer");
+    }
+
+    #[test]
+    fn test_validate_params_unknown_warns() {
+        let method = RestMethod {
+            parameters: HashMap::new(),
+            ..Default::default()
+        };
+        let result = validate_params(&method, &json!({"bogus": "value"}));
+        assert!(result.is_ok());
     }
 }

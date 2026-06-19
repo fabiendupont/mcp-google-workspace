@@ -36,7 +36,7 @@ pub(crate) struct UploadData {
 }
 
 pub(crate) struct DownloadData {
-    pub b64_data: String,
+    pub raw_data: Vec<u8>,
     pub content_type: String,
     pub total_size: usize,
 }
@@ -342,7 +342,7 @@ mod tests {
             "d1".to_string(),
             60000,
             TaskKind::Download(DownloadData {
-                b64_data: "abc".to_string(),
+                raw_data: vec![0u8; 2048],
                 content_type: "application/pdf".to_string(),
                 total_size: 2048,
             }),

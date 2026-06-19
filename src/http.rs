@@ -1,9 +1,12 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::hash::{Hash, Hasher};
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -13,6 +16,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
+use tower_http::cors::CorsLayer;
 
 use google_workspace::error::GwsError;
 
@@ -22,7 +26,7 @@ use crate::protocol;
 use crate::server::ServerState;
 
 struct RateLimiter {
-    requests: HashMap<String, Vec<Instant>>,
+    requests: HashMap<SocketAddr, Vec<Instant>>,
     max_rpm: u32,
 }
 
@@ -34,11 +38,14 @@ impl RateLimiter {
         }
     }
 
-    fn check(&mut self, key: &str) -> bool {
+    fn check(&mut self, key: SocketAddr) -> bool {
         let now = Instant::now();
         let one_minute = std::time::Duration::from_secs(60);
-        let entries = self.requests.entry(key.to_string()).or_default();
-        entries.retain(|t| now.duration_since(*t) < one_minute);
+        self.requests.retain(|_, timestamps| {
+            timestamps.retain(|t| now.duration_since(*t) < one_minute);
+            !timestamps.is_empty()
+        });
+        let entries = self.requests.entry(key).or_default();
         if entries.len() >= self.max_rpm as usize {
             return false;
         }
@@ -74,13 +81,18 @@ pub async fn serve(
     let max_body = p.max_request_bytes;
     drop(p);
 
-    let session_id = Arc::new(format!(
-        "{:016x}",
+    let session_id = Arc::new({
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let mut hasher = std::hash::DefaultHasher::new();
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos()
-    ));
+            .hash(&mut hasher);
+        std::process::id().hash(&mut hasher);
+        COUNTER.fetch_add(1, Ordering::Relaxed).hash(&mut hasher);
+        format!("{:016x}", hasher.finish())
+    });
 
     let app_state = AppState {
         policy: policy.clone(),
@@ -93,6 +105,7 @@ pub async fn serve(
 
     if policy_path.is_some() {
         let reload_policy = policy.clone();
+        let reload_state = app_state.state.clone();
         let reload_path = policy_path.clone().unwrap();
         tokio::spawn(async move {
             let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
@@ -104,7 +117,8 @@ pub async fn serve(
                     Ok(new_policy) => {
                         let svcs = new_policy.allowed_services().join(", ");
                         *reload_policy.write().await = new_policy;
-                        tracing::info!(services = %svcs, "Policy reloaded");
+                        reload_state.lock().await.tools_json = None;
+                        tracing::info!(services = %svcs, "Policy reloaded, tools cache cleared");
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "Policy reload failed, keeping current policy");
@@ -121,6 +135,7 @@ pub async fn serve(
         .route("/readyz", get(handle_readyz))
         .route("/livez", get(handle_livez))
         .route("/metrics", get(handle_metrics))
+        .layer(CorsLayer::permissive())
         .layer(axum::extract::DefaultBodyLimit::max(max_body))
         .with_state(app_state);
 
@@ -130,10 +145,13 @@ pub async fn serve(
 
     tracing::info!(addr = addr, "HTTP server listening");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .map_err(|e| GwsError::Other(anyhow::anyhow!("HTTP server error: {e}")))?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .map_err(|e| GwsError::Other(anyhow::anyhow!("HTTP server error: {e}")))?;
 
     Ok(())
 }
@@ -154,6 +172,7 @@ async fn shutdown_signal() {
 #[axum::debug_handler]
 async fn handle_post(
     State(app): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: String,
 ) -> impl IntoResponse {
@@ -165,12 +184,7 @@ async fn handle_post(
     }
 
     if let Some(ref rl) = app.rate_limiter {
-        let client_ip = headers
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("unknown")
-            .to_string();
-        let allowed = rl.lock().await.check(&client_ip);
+        let allowed = rl.lock().await.check(peer);
         if !allowed {
             return (
                 StatusCode::TOO_MANY_REQUESTS,
@@ -215,11 +229,17 @@ async fn handle_post(
         return handle_post_streaming(app, req, meta).await;
     }
 
-    let policy = app.policy.read().await;
-    let mut state = app.state.lock().await;
+    let policy = app.policy.read().await.clone();
 
-    let (response, notifications) =
-        crate::server::handle_request(&req.method, &req.params, &meta, &policy, &mut state).await;
+    let (response, notifications) = crate::server::handle_request_concurrent(
+        &req.method,
+        &req.params,
+        &meta,
+        &policy,
+        &app.state,
+        id,
+    )
+    .await;
 
     for notif in &notifications {
         let _ = app.notify_tx.send(notif.clone());
@@ -247,12 +267,17 @@ async fn handle_post_streaming(
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(64);
 
     tokio::spawn(async move {
-        let policy = app.policy.read().await;
-        let mut state = app.state.lock().await;
+        let policy = app.policy.read().await.clone();
 
-        let (response, notifications) =
-            crate::server::handle_request(&req.method, &req.params, &meta, &policy, &mut state)
-                .await;
+        let (response, notifications) = crate::server::handle_request_concurrent(
+            &req.method,
+            &req.params,
+            &meta,
+            &policy,
+            &app.state,
+            &id,
+        )
+        .await;
 
         for notif in &notifications {
             let _ = app.notify_tx.send(notif.clone());
@@ -494,29 +519,33 @@ mod tests {
         assert!(validate_mcp_headers(&headers, "tools/call", &params).is_ok());
     }
 
+    fn addr(port: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
     #[tokio::test]
     async fn test_rate_limiter_allows_under_limit() {
         let mut rl = RateLimiter::new(5);
         for _ in 0..5 {
-            assert!(rl.check("client1"));
+            assert!(rl.check(addr(1001)));
         }
     }
 
     #[tokio::test]
     async fn test_rate_limiter_blocks_over_limit() {
         let mut rl = RateLimiter::new(3);
-        assert!(rl.check("client1"));
-        assert!(rl.check("client1"));
-        assert!(rl.check("client1"));
-        assert!(!rl.check("client1"));
+        assert!(rl.check(addr(1001)));
+        assert!(rl.check(addr(1001)));
+        assert!(rl.check(addr(1001)));
+        assert!(!rl.check(addr(1001)));
     }
 
     #[tokio::test]
     async fn test_rate_limiter_separate_clients() {
         let mut rl = RateLimiter::new(1);
-        assert!(rl.check("client1"));
-        assert!(!rl.check("client1"));
-        assert!(rl.check("client2"));
+        assert!(rl.check(addr(1001)));
+        assert!(!rl.check(addr(1001)));
+        assert!(rl.check(addr(1002)));
     }
 
     #[test]

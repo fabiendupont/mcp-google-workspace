@@ -67,7 +67,7 @@ fn default_max_request_bytes() -> usize {
     16 * 1024 * 1024
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct ServicePolicy {
     pub name: String,
     #[serde(default)]
@@ -78,7 +78,7 @@ pub struct ServicePolicy {
     pub constraints: Vec<Constraint>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Policy {
     pub global_read_only: bool,
     pub max_request_bytes: usize,

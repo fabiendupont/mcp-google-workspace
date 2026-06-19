@@ -59,10 +59,9 @@ impl AuditLogger {
     }
 
     fn write(&self, entry: Value) {
-        if let Ok(mut f) = self.file.lock() {
-            let line = serde_json::to_string(&entry).unwrap_or_default();
-            let _ = writeln!(f, "{line}");
-        }
+        let mut f = self.file.lock().unwrap_or_else(|e| e.into_inner());
+        let line = serde_json::to_string(&entry).unwrap_or_default();
+        let _ = writeln!(f, "{line}");
     }
 }
 

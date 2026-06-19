@@ -1,18 +1,18 @@
-use once_cell::sync::Lazy;
 use prometheus::{
     Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, Opts, Registry, TextEncoder,
 };
+use std::sync::LazyLock;
 
-static REGISTRY: Lazy<Registry> = Lazy::new(Registry::new);
+static REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::new);
 
-static REQUEST_COUNT: Lazy<IntCounterVec> = Lazy::new(|| {
+static REQUEST_COUNT: LazyLock<IntCounterVec> = LazyLock::new(|| {
     let opts = Opts::new("mcp_requests_total", "Total MCP requests").namespace("mcp_gws");
     let counter = IntCounterVec::new(opts, &["method", "status"]).unwrap();
     REGISTRY.register(Box::new(counter.clone())).unwrap();
     counter
 });
 
-static REQUEST_DURATION: Lazy<HistogramVec> = Lazy::new(|| {
+static REQUEST_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
     let opts = HistogramOpts::new("mcp_request_duration_seconds", "MCP request latency")
         .namespace("mcp_gws")
         .buckets(vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 30.0]);
@@ -21,7 +21,7 @@ static REQUEST_DURATION: Lazy<HistogramVec> = Lazy::new(|| {
     hist
 });
 
-static ACTIVE_TASKS: Lazy<IntGauge> = Lazy::new(|| {
+static ACTIVE_TASKS: LazyLock<IntGauge> = LazyLock::new(|| {
     let gauge = IntGauge::new(
         "mcp_gws_active_tasks",
         "Currently active upload/download tasks",
@@ -31,7 +31,7 @@ static ACTIVE_TASKS: Lazy<IntGauge> = Lazy::new(|| {
     gauge
 });
 
-static ERRORS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+static ERRORS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     let opts = Opts::new("mcp_errors_total", "Total MCP errors").namespace("mcp_gws");
     let counter = IntCounterVec::new(opts, &["method", "error_type"]).unwrap();
     REGISTRY.register(Box::new(counter.clone())).unwrap();

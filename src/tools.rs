@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde_json::{Value, json};
 
@@ -8,22 +9,27 @@ use google_workspace::services;
 
 use crate::policy::Policy;
 
-pub(crate) async fn get_or_fetch_doc<'a>(
-    docs: &'a mut HashMap<String, RestDescription>,
+pub(crate) async fn get_or_fetch_doc(
+    docs: &mut HashMap<String, Arc<RestDescription>>,
     svc_alias: &str,
-) -> Result<&'a RestDescription, GwsError> {
+) -> Result<Arc<RestDescription>, GwsError> {
     if !docs.contains_key(svc_alias) {
         let (api_name, version) = services::resolve_service(svc_alias)?;
-        let doc = google_workspace::discovery::fetch_discovery_document(&api_name, &version, None)
-            .await?;
-        docs.insert(svc_alias.to_string(), doc);
+        let cache_dir = dirs_next::cache_dir().map(|d| d.join("mcp-gws").join("discovery"));
+        let doc = google_workspace::discovery::fetch_discovery_document(
+            &api_name,
+            &version,
+            cache_dir.as_deref(),
+        )
+        .await?;
+        docs.insert(svc_alias.to_string(), Arc::new(doc));
     }
-    Ok(docs.get(svc_alias).unwrap())
+    Ok(Arc::clone(docs.get(svc_alias).unwrap()))
 }
 
 pub async fn build_tools_list(
     policy: &Policy,
-    docs: &mut HashMap<String, RestDescription>,
+    docs: &mut HashMap<String, Arc<RestDescription>>,
 ) -> Result<Vec<Value>, GwsError> {
     let mut tools = Vec::new();
 
@@ -131,6 +137,10 @@ pub async fn build_tools_list(
                     "download_chunk_offset": {
                         "type": "integer",
                         "description": "Base64 char offset for the next download chunk (0-based)"
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "If true, returns the HTTP request that would be sent without executing it. Shows URL, method, scopes, and body."
                     }
                 },
                 "required": ["resource", "method"]
@@ -168,13 +178,65 @@ pub async fn build_tools_list(
         }
     }));
 
+    tools.push(json!({
+        "name": "gws_batch",
+        "title": "Batch API Calls",
+        "description": "Execute multiple Google API calls in a single request. All sub-requests are validated against policy before any are executed. Max 100 requests per batch.",
+        "annotations": {
+            "readOnlyHint": false,
+            "destructiveHint": false,
+            "idempotentHint": false,
+            "openWorldHint": true
+        },
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "service": {
+                    "type": "string",
+                    "description": "Service name (e.g., drive, gmail)"
+                },
+                "requests": {
+                    "type": "array",
+                    "description": "Array of sub-requests to execute",
+                    "maxItems": 100,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "resource": {
+                                "type": "string",
+                                "description": "Resource name (e.g., files, permissions)"
+                            },
+                            "method": {
+                                "type": "string",
+                                "description": "Method name (e.g., list, get, create)"
+                            },
+                            "params": {
+                                "type": "object",
+                                "description": "Query or path parameters"
+                            },
+                            "body": {
+                                "type": "object",
+                                "description": "Request body"
+                            }
+                        },
+                        "required": ["resource", "method"]
+                    }
+                }
+            },
+            "required": ["service", "requests"]
+        }
+    }));
+
+    tools.extend(crate::helpers::helper_tool_schemas());
+    tools.push(crate::helpers::markdown_tool_schema());
+
     Ok(tools)
 }
 
 pub async fn handle_discover(
     arguments: &Value,
     policy: &Policy,
-    docs: &mut HashMap<String, RestDescription>,
+    docs: &mut HashMap<String, Arc<RestDescription>>,
 ) -> Result<Value, GwsError> {
     let service = arguments
         .get("service")

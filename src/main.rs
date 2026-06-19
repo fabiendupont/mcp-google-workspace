@@ -1,6 +1,7 @@
 mod audit;
 mod auth;
 mod execute;
+mod helpers;
 mod http;
 mod meta;
 mod metrics;
@@ -35,6 +36,14 @@ enum Command {
         path: PathBuf,
         verify: bool,
     },
+    CheckAuth {
+        policy_path: Option<PathBuf>,
+    },
+    Simulate {
+        policy_path: PathBuf,
+        scenarios_path: PathBuf,
+    },
+    ShowHelp,
 }
 
 #[derive(Debug)]
@@ -71,6 +80,8 @@ fn print_usage() {
         "  --verify              With --check-policy: test credentials and resolve folder paths"
     );
     eprintln!("  --audit-log <path>    Write structured audit log (JSONL) of all API calls");
+    eprintln!("  --check-auth          Walk the credential chain and report what is available");
+    eprintln!("  --simulate <path>     Dry-run scenarios against a policy (requires --policy)");
     eprintln!("  --help                Show this help message");
 }
 
@@ -84,11 +95,17 @@ fn parse_args_from(args: &[String]) -> Result<Command, GwsError> {
     let mut template: Option<String> = None;
     let mut audit_log: Option<PathBuf> = None;
 
+    let mut check_auth = false;
+    let mut simulate_path: Option<PathBuf> = None;
+
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--help" | "-h" => {
-                return Err(GwsError::Validation("help".to_string()));
+                return Ok(Command::ShowHelp);
+            }
+            "--check-auth" => {
+                check_auth = true;
             }
             "--policy" => {
                 i += 1;
@@ -149,6 +166,15 @@ fn parse_args_from(args: &[String]) -> Result<Command, GwsError> {
                 }
                 check_policy_path = Some(PathBuf::from(&args[i]));
             }
+            "--simulate" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(GwsError::Validation(
+                        "--simulate requires a path to a scenarios JSON file".to_string(),
+                    ));
+                }
+                simulate_path = Some(PathBuf::from(&args[i]));
+            }
             other => {
                 return Err(GwsError::Validation(format!("Unknown argument: {other}")));
             }
@@ -158,6 +184,20 @@ fn parse_args_from(args: &[String]) -> Result<Command, GwsError> {
 
     if let Some(path) = check_policy_path {
         return Ok(Command::CheckPolicy { path, verify });
+    }
+
+    if check_auth {
+        return Ok(Command::CheckAuth { policy_path });
+    }
+
+    if let Some(scenarios_path) = simulate_path {
+        let policy_path = policy_path.ok_or_else(|| {
+            GwsError::Validation("--simulate requires --policy to also be set".to_string())
+        })?;
+        return Ok(Command::Simulate {
+            policy_path,
+            scenarios_path,
+        });
     }
 
     if init_policy {
@@ -719,6 +759,82 @@ async fn verify_policy(p: &mut policy::Policy) -> Result<(), GwsError> {
     Ok(())
 }
 
+fn print_effective_policy(policy: &policy::Policy) {
+    let services = policy.allowed_services();
+    tracing::info!(
+        count = services.len(),
+        "Policy loaded: {} service(s)",
+        services.len()
+    );
+
+    for svc in &services {
+        let access = if policy.is_read_only(svc) {
+            "read-only"
+        } else {
+            "read-write"
+        };
+
+        let constraints = policy.constraints(svc);
+        let constraint_detail = if constraints.is_empty() {
+            "0 constraints".to_string()
+        } else {
+            let params: Vec<&str> = constraints
+                .iter()
+                .map(|c| c.param.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+            format!(
+                "{} constraint(s) ({})",
+                constraints.len(),
+                params.join(", ")
+            )
+        };
+
+        let denied = policy.denied_methods(svc);
+        let denied_detail = if denied.is_empty() {
+            "0 denied methods".to_string()
+        } else if denied.len() <= 5 {
+            let mut methods: Vec<&str> = denied.into_iter().collect();
+            methods.sort();
+            format!(
+                "{} denied method(s) [{}]",
+                methods.len(),
+                methods.join(", ")
+            )
+        } else {
+            format!("{} denied method(s)", denied.len())
+        };
+
+        tracing::info!(
+            service = svc,
+            access,
+            "  {svc}: {access}, {constraint_detail}, {denied_detail}"
+        );
+    }
+
+    let read_only_label = if policy.global_read_only { "yes" } else { "no" };
+    let rate_limit_label = match policy.rate_limit_rpm {
+        Some(rpm) => format!("{rpm} rpm"),
+        None => "none".to_string(),
+    };
+    let max_bytes = policy.max_request_bytes;
+    let max_request_label = if max_bytes >= 1024 * 1024 {
+        format!("{} MB", max_bytes / (1024 * 1024))
+    } else if max_bytes >= 1024 {
+        format!("{} KB", max_bytes / 1024)
+    } else {
+        format!("{max_bytes} B")
+    };
+
+    tracing::info!(
+        global_read_only = policy.global_read_only,
+        rate_limit_rpm = ?policy.rate_limit_rpm,
+        max_request_bytes = policy.max_request_bytes,
+        "  Global: read-only {read_only_label}, rate limit {rate_limit_label}, max request {max_request_label}"
+    );
+}
+
 fn init_telemetry() {
     let env_filter = tracing_subscriber::EnvFilter::from_default_env()
         .add_directive(tracing::Level::INFO.into());
@@ -759,15 +875,170 @@ fn init_telemetry() {
     }
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct Scenario {
+    service: String,
+    #[serde(default)]
+    resource: Option<String>,
+    #[serde(default)]
+    method: Option<String>,
+    #[serde(default)]
+    params: Option<serde_json::Map<String, serde_json::Value>>,
+    #[serde(default)]
+    body: Option<serde_json::Value>,
+}
+
+fn simulate_policy(policy_path: &Path, scenarios_path: &Path) -> Result<(), GwsError> {
+    let p = policy::Policy::from_file(policy_path)?;
+
+    let content = std::fs::read_to_string(scenarios_path)
+        .map_err(|e| GwsError::Validation(format!("Failed to read scenarios file: {e}")))?;
+    let scenarios: Vec<Scenario> = serde_json::from_str(&content)
+        .map_err(|e| GwsError::Validation(format!("Invalid scenarios JSON: {e}")))?;
+
+    if scenarios.is_empty() {
+        eprintln!("No scenarios to simulate.");
+        return Ok(());
+    }
+
+    for (i, scenario) in scenarios.iter().enumerate() {
+        let resource = scenario.resource.as_deref().unwrap_or("*");
+        let method = scenario.method.as_deref().unwrap_or("*");
+        let label = format!("{}.{}.{}", scenario.service, resource, method);
+        eprintln!("Scenario {}: {label}", i + 1);
+
+        let mut verdict = "ALLOWED";
+
+        let service_ok = p.is_service_allowed(&scenario.service);
+        if service_ok {
+            eprintln!("  Service: \u{2713} allowed");
+        } else {
+            eprintln!("  Service: \u{2717} not in policy");
+            eprintln!("  Verdict: DENIED (service not allowed)");
+            eprintln!();
+            continue;
+        }
+
+        let denied = p.denied_methods(&scenario.service);
+        let full_name = format!("{resource}.{method}");
+        let method_denied = denied.contains(method) || denied.contains(full_name.as_str());
+        if method_denied {
+            eprintln!("  Method:  \u{2717} denied by denylist");
+            verdict = "DENIED (method in denylist)";
+        } else {
+            eprintln!("  Method:  \u{2713} not denied");
+        }
+
+        let read_only = p.is_read_only(&scenario.service);
+        let is_write = scenario.body.is_some()
+            || method.starts_with("create")
+            || method.starts_with("insert")
+            || method.starts_with("update")
+            || method.starts_with("patch")
+            || method.starts_with("delete")
+            || method.starts_with("send")
+            || method.starts_with("trash");
+        if read_only && is_write {
+            eprintln!("  Access:  \u{2717} write blocked (read-only)");
+            if verdict == "ALLOWED" {
+                verdict = "DENIED (read-only)";
+            }
+        } else if read_only {
+            eprintln!("  Access:  \u{2713} read operation (read-only OK)");
+        } else {
+            eprintln!("  Access:  \u{2713} read-write permitted");
+        }
+
+        let constraints = p.constraints(&scenario.service);
+        if !constraints.is_empty() {
+            let params = scenario.params.as_ref();
+            let mut constraint_ok = true;
+
+            for c in constraints {
+                let is_body = c.location.as_deref() == Some("body");
+                if is_body {
+                    if is_write {
+                        let body_values: Vec<&str> = scenario
+                            .body
+                            .as_ref()
+                            .and_then(|b| b.get(&c.param))
+                            .map(|v| match v {
+                                serde_json::Value::Array(arr) => {
+                                    arr.iter().filter_map(|v| v.as_str()).collect()
+                                }
+                                serde_json::Value::String(s) => vec![s.as_str()],
+                                _ => vec![],
+                            })
+                            .unwrap_or_default();
+
+                        if body_values.is_empty() {
+                            eprintln!(
+                                "  Params:  \u{2717} '{}' required in body for writes",
+                                c.param
+                            );
+                            constraint_ok = false;
+                        } else {
+                            for val in &body_values {
+                                if !c.values.iter().any(|v| v == val) {
+                                    eprintln!(
+                                        "  Params:  \u{2717} '{}' value '{}' not in allowed list",
+                                        c.param, val
+                                    );
+                                    constraint_ok = false;
+                                } else if is_write && c.access == policy::Access::ReadOnly {
+                                    eprintln!(
+                                        "  Params:  \u{2717} '{}' value '{}' is read-only",
+                                        c.param, val
+                                    );
+                                    constraint_ok = false;
+                                }
+                            }
+                        }
+                    }
+                } else if let Some(params) = params {
+                    if let Some(serde_json::Value::String(value)) = params.get(&c.param) {
+                        if !c.values.iter().any(|v| v == value) {
+                            eprintln!(
+                                "  Params:  \u{2717} '{}' value '{}' not allowed",
+                                c.param, value
+                            );
+                            constraint_ok = false;
+                        } else if is_write && c.access == policy::Access::ReadOnly {
+                            eprintln!(
+                                "  Params:  \u{2717} '{}' value '{}' is read-only",
+                                c.param, value
+                            );
+                            constraint_ok = false;
+                        }
+                    } else {
+                        eprintln!("  Params:  \u{2717} '{}' not specified", c.param);
+                        constraint_ok = false;
+                    }
+                } else {
+                    eprintln!("  Params:  \u{2717} '{}' not specified", c.param);
+                    constraint_ok = false;
+                }
+            }
+
+            if constraint_ok {
+                eprintln!("  Params:  \u{2713} constraints satisfied");
+            } else if verdict == "ALLOWED" {
+                verdict = "DENIED (constraint violation)";
+            }
+        }
+
+        eprintln!("  Verdict: {verdict}");
+        eprintln!();
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = match parse_args_from(&args) {
         Ok(c) => c,
-        Err(e) if e.to_string() == "help" => {
-            print_usage();
-            std::process::exit(0);
-        }
         Err(e) => {
             eprintln!("Error: {e}");
             print_usage();
@@ -854,6 +1125,66 @@ async fn main() {
             }
             std::process::exit(0);
         }
+        Command::Simulate {
+            policy_path,
+            scenarios_path,
+        } => {
+            match simulate_policy(&policy_path, &scenarios_path) {
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!("Simulation error: {e}");
+                    std::process::exit(1);
+                }
+            }
+            std::process::exit(0);
+        }
+        Command::CheckAuth { policy_path } => {
+            let creds_path = policy_path.as_ref().and_then(|path| {
+                let content = std::fs::read_to_string(path).ok()?;
+                let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+                json.get("server")
+                    .and_then(|s| s.get("credentials_file"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            });
+
+            let results = auth::diagnose_chain(creds_path.as_deref()).await;
+
+            eprintln!("Credential chain diagnostics:");
+            let mut active_source: Option<usize> = None;
+            for (i, r) in results.iter().enumerate() {
+                let mark = if r.found && r.parseable {
+                    "\u{2713}"
+                } else {
+                    "\u{2717}"
+                };
+                eprintln!("  {}. [{}] {}: {}", i + 1, mark, r.source, r.detail);
+                if active_source.is_none() && r.found && r.parseable {
+                    active_source = Some(i);
+                }
+            }
+
+            eprintln!();
+            match active_source {
+                Some(idx) => {
+                    eprintln!(
+                        "Active credential source: #{} ({})",
+                        idx + 1,
+                        results[idx].source
+                    );
+                }
+                None => {
+                    eprintln!("No usable credentials found.");
+                    eprintln!("Run --help for credential setup options.");
+                }
+            }
+
+            std::process::exit(0);
+        }
+        Command::ShowHelp => {
+            print_usage();
+            std::process::exit(0);
+        }
         Command::Serve(p) => p,
     };
 
@@ -870,6 +1201,8 @@ async fn main() {
             std::process::exit(1);
         }
     };
+
+    print_effective_policy(&policy);
 
     let audit = audit_log_path.map(|path| {
         let logger = audit::AuditLogger::new(path.clone()).unwrap_or_else(|e| {
@@ -976,8 +1309,8 @@ mod tests {
 
     #[test]
     fn test_parse_help_flag() {
-        let err = parse_args_from(&args(&["--help"]));
-        assert!(err.is_err());
+        let cmd = parse_args_from(&args(&["--help"])).unwrap();
+        assert!(matches!(cmd, Command::ShowHelp));
     }
 
     #[test]
@@ -1145,6 +1478,29 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_check_auth() {
+        let cmd = parse_args_from(&args(&["--check-auth"])).unwrap();
+        match cmd {
+            Command::CheckAuth { policy_path } => {
+                assert!(policy_path.is_none());
+            }
+            other => panic!("Expected CheckAuth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_check_auth_with_policy() {
+        let cmd =
+            parse_args_from(&args(&["--check-auth", "--policy", "/tmp/policy.json"])).unwrap();
+        match cmd {
+            Command::CheckAuth { policy_path } => {
+                assert_eq!(policy_path, Some(PathBuf::from("/tmp/policy.json")));
+            }
+            other => panic!("Expected CheckAuth, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_generate_policy_drive() {
         let json = generate_policy(&["drive".to_string()]);
         let services = json["services"].as_array().unwrap();
@@ -1182,6 +1538,101 @@ mod tests {
         let path = dir.join("policy.json");
         std::fs::write(&path, "not json").unwrap();
         assert!(check_policy(&path).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_parse_simulate_flag() {
+        let cmd = parse_args_from(&args(&[
+            "--policy",
+            "/tmp/policy.json",
+            "--simulate",
+            "/tmp/scenarios.json",
+        ]))
+        .unwrap();
+        match cmd {
+            Command::Simulate {
+                policy_path,
+                scenarios_path,
+            } => {
+                assert_eq!(policy_path, PathBuf::from("/tmp/policy.json"));
+                assert_eq!(scenarios_path, PathBuf::from("/tmp/scenarios.json"));
+            }
+            other => panic!("Expected Simulate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_simulate_requires_policy() {
+        let err = parse_args_from(&args(&["--simulate", "/tmp/scenarios.json"]));
+        assert!(err.is_err());
+        assert!(
+            err.unwrap_err()
+                .to_string()
+                .contains("--simulate requires --policy")
+        );
+    }
+
+    #[test]
+    fn test_parse_simulate_missing_value() {
+        let err = parse_args_from(&args(&["--policy", "/tmp/policy.json", "--simulate"]));
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("requires a path"));
+    }
+
+    #[test]
+    fn test_simulate_allowed_scenario() {
+        let dir = std::env::temp_dir().join("mcp-gws-test-sim-allow");
+        std::fs::create_dir_all(&dir).unwrap();
+        let policy_path = dir.join("policy.json");
+        std::fs::write(
+            &policy_path,
+            r#"{"services": [{"name": "drive"}, {"name": "gmail"}]}"#,
+        )
+        .unwrap();
+        let scenarios_path = dir.join("scenarios.json");
+        std::fs::write(
+            &scenarios_path,
+            r#"[{"service": "drive", "resource": "files", "method": "list"}]"#,
+        )
+        .unwrap();
+        assert!(simulate_policy(&policy_path, &scenarios_path).is_ok());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_simulate_denied_service() {
+        let dir = std::env::temp_dir().join("mcp-gws-test-sim-deny-svc");
+        std::fs::create_dir_all(&dir).unwrap();
+        let policy_path = dir.join("policy.json");
+        std::fs::write(&policy_path, r#"{"services": [{"name": "drive"}]}"#).unwrap();
+        let scenarios_path = dir.join("scenarios.json");
+        std::fs::write(
+            &scenarios_path,
+            r#"[{"service": "gmail", "resource": "messages", "method": "list"}]"#,
+        )
+        .unwrap();
+        assert!(simulate_policy(&policy_path, &scenarios_path).is_ok());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_simulate_denied_method() {
+        let dir = std::env::temp_dir().join("mcp-gws-test-sim-deny-method");
+        std::fs::create_dir_all(&dir).unwrap();
+        let policy_path = dir.join("policy.json");
+        std::fs::write(
+            &policy_path,
+            r#"{"services": [{"name": "gmail", "denied_methods": ["messages.send"]}]}"#,
+        )
+        .unwrap();
+        let scenarios_path = dir.join("scenarios.json");
+        std::fs::write(
+            &scenarios_path,
+            r#"[{"service": "gmail", "resource": "messages", "method": "send"}]"#,
+        )
+        .unwrap();
+        assert!(simulate_policy(&policy_path, &scenarios_path).is_ok());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
