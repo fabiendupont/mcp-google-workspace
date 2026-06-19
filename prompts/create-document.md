@@ -10,11 +10,13 @@ arguments:
     required: false
 ---
 
-There are two approaches to creating a Google Doc. Use Option A for most cases; use Option B when you need precise control over individual elements.
+**IMPORTANT: Generate ALL content as one Markdown string and import it in a SINGLE `gws_docs_import_markdown` call.** Do NOT call the tool multiple times for different sections — that wastes tokens on 15+ round-trips when one call suffices. Compose the full document in Markdown first, then import once.
 
-## Option A: Markdown import (preferred)
+There are two approaches. Use Option A for most cases; use Option B only when you need precise control over individual elements (e.g., inserting images at specific positions after the document exists).
 
-Use `gws_docs_import_markdown` to create a new doc from Markdown content in a single call:
+## Option A: Markdown import (preferred — single call)
+
+Compose the ENTIRE document as one Markdown string, then import in a single call:
 
 ```json
 {
@@ -35,7 +37,10 @@ Supported Markdown syntax:
 - `- item` for bullet lists, `1. item` for numbered lists
 - `> text` for blockquotes
 - `~~strikethrough~~` for strikethrough
+- `| col | col |` pipe tables with `|---|---|` separator — converted to native Google Docs tables with populated cells and bold headers
 - `![alt](url)` for inline images
+
+Compose the full document — all headings, paragraphs, lists, tables, code blocks — as one Markdown string. One call creates the doc, applies the template, and renders all formatting. If the doc already exists (same title + folder), it is updated in place.
 
 Omit `document_id` to create a new document. The response returns the new document ID.
 
