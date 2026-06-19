@@ -6,6 +6,7 @@ mod http;
 mod meta;
 mod metrics;
 mod policy;
+mod prompts;
 mod protocol;
 mod server;
 mod tasks;
@@ -52,6 +53,7 @@ struct ParsedArgs {
     services_str: Option<String>,
     http_addr: Option<String>,
     audit_log: Option<PathBuf>,
+    prompts_dir: Option<PathBuf>,
 }
 
 fn print_usage() {
@@ -79,6 +81,7 @@ fn print_usage() {
     eprintln!(
         "  --verify              With --check-policy: test credentials and resolve folder paths"
     );
+    eprintln!("  --prompts-dir <path>  Directory containing prompt .md files");
     eprintln!("  --audit-log <path>    Write structured audit log (JSONL) of all API calls");
     eprintln!("  --check-auth          Walk the credential chain and report what is available");
     eprintln!("  --simulate <path>     Dry-run scenarios against a policy (requires --policy)");
@@ -95,6 +98,7 @@ fn parse_args_from(args: &[String]) -> Result<Command, GwsError> {
     let mut template: Option<String> = None;
     let mut audit_log: Option<PathBuf> = None;
 
+    let mut prompts_dir: Option<PathBuf> = None;
     let mut check_auth = false;
     let mut simulate_path: Option<PathBuf> = None;
 
@@ -166,6 +170,15 @@ fn parse_args_from(args: &[String]) -> Result<Command, GwsError> {
                 }
                 check_policy_path = Some(PathBuf::from(&args[i]));
             }
+            "--prompts-dir" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(GwsError::Validation(
+                        "--prompts-dir requires a path".to_string(),
+                    ));
+                }
+                prompts_dir = Some(PathBuf::from(&args[i]));
+            }
             "--simulate" => {
                 i += 1;
                 if i >= args.len() {
@@ -210,6 +223,7 @@ fn parse_args_from(args: &[String]) -> Result<Command, GwsError> {
         services_str,
         http_addr,
         audit_log,
+        prompts_dir,
     }))
 }
 
@@ -1192,6 +1206,7 @@ async fn main() {
 
     let audit_log_path = parsed.audit_log.clone();
     let policy_file_path = parsed.policy_path.clone();
+    let prompts_dir_flag = parsed.prompts_dir.clone();
 
     let (policy, transport) = match resolve_config(parsed) {
         Ok(p) => p,
@@ -1204,6 +1219,20 @@ async fn main() {
 
     print_effective_policy(&policy);
 
+    let prompts_dir = prompts_dir_flag
+        .or_else(|| {
+            policy_file_path
+                .as_ref()
+                .and_then(|p| p.parent())
+                .map(|d| d.join("prompts"))
+        })
+        .filter(|d| d.is_dir());
+
+    let prompts = prompts::load_prompts(prompts_dir.as_deref());
+    if !prompts.is_empty() {
+        tracing::info!(count = prompts.len(), "Loaded MCP prompts");
+    }
+
     let audit = audit_log_path.map(|path| {
         let logger = audit::AuditLogger::new(path.clone()).unwrap_or_else(|e| {
             eprintln!("Error opening audit log {}: {e}", path.display());
@@ -1214,8 +1243,10 @@ async fn main() {
     });
 
     let result = match transport {
-        Transport::Stdio => server::run_stdio(policy, audit).await,
-        Transport::Http(addr) => server::run_http(policy, policy_file_path, &addr, audit).await,
+        Transport::Stdio => server::run_stdio(policy, prompts, audit).await,
+        Transport::Http(addr) => {
+            server::run_http(policy, prompts, policy_file_path, &addr, audit).await
+        }
     };
 
     if let Err(e) = result {
@@ -1320,6 +1351,7 @@ mod tests {
             services_str: Some("drive,gmail".to_string()),
             http_addr: None,
             audit_log: None,
+            prompts_dir: None,
         };
         let (policy, _) = resolve_config(parsed).unwrap();
         assert!(policy.is_service_allowed("drive"));
@@ -1334,6 +1366,7 @@ mod tests {
             services_str: None,
             http_addr: None,
             audit_log: None,
+            prompts_dir: None,
         };
         assert!(resolve_config(parsed).is_err());
     }
@@ -1345,6 +1378,7 @@ mod tests {
             services_str: Some("drive".to_string()),
             http_addr: Some("0.0.0.0:8080".to_string()),
             audit_log: None,
+            prompts_dir: None,
         };
         let (_, transport) = resolve_config(parsed).unwrap();
         assert!(matches!(transport, Transport::Http(addr) if addr == "0.0.0.0:8080"));
@@ -1357,6 +1391,7 @@ mod tests {
             services_str: Some("drive".to_string()),
             http_addr: None,
             audit_log: None,
+            prompts_dir: None,
         };
         let (_, transport) = resolve_config(parsed).unwrap();
         assert!(matches!(transport, Transport::Stdio));
@@ -1369,6 +1404,7 @@ mod tests {
             services_str: None,
             http_addr: None,
             audit_log: None,
+            prompts_dir: None,
         };
         assert!(resolve_config(parsed).is_err());
     }
@@ -1634,5 +1670,26 @@ mod tests {
         .unwrap();
         assert!(simulate_policy(&policy_path, &scenarios_path).is_ok());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_parse_prompts_dir() {
+        let parsed = unwrap_serve(
+            parse_args_from(&args(&[
+                "--services",
+                "drive",
+                "--prompts-dir",
+                "/tmp/prompts",
+            ]))
+            .unwrap(),
+        );
+        assert_eq!(parsed.prompts_dir, Some(PathBuf::from("/tmp/prompts")));
+    }
+
+    #[test]
+    fn test_parse_prompts_dir_missing_value() {
+        let err = parse_args_from(&args(&["--prompts-dir"]));
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("requires a path"));
     }
 }

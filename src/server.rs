@@ -25,6 +25,7 @@ pub(crate) struct ServerState {
     pub tasks: HashMap<String, tasks::Task>,
     pub token_cache: Option<crate::auth::TokenCache>,
     pub audit: Option<Arc<crate::audit::AuditLogger>>,
+    pub prompts: Vec<crate::prompts::Prompt>,
 }
 
 #[derive(Debug)]
@@ -44,6 +45,7 @@ impl ServerState {
             tasks: HashMap::new(),
             token_cache: None,
             audit: None,
+            prompts: Vec::new(),
         }
     }
 
@@ -73,6 +75,7 @@ impl ServerState {
 
 pub async fn run_stdio(
     policy: Policy,
+    prompts: Vec<crate::prompts::Prompt>,
     audit: Option<Arc<crate::audit::AuditLogger>>,
 ) -> Result<(), GwsError> {
     let svc_list = policy.allowed_services();
@@ -83,6 +86,7 @@ pub async fn run_stdio(
     }
 
     let mut state = ServerState::new();
+    state.prompts = prompts;
     state.audit = audit;
 
     let mut stdin = BufReader::new(tokio::io::stdin()).lines();
@@ -204,11 +208,13 @@ pub async fn run_stdio(
 
 pub async fn run_http(
     policy: Policy,
+    prompts: Vec<crate::prompts::Prompt>,
     policy_path: Option<std::path::PathBuf>,
     addr: &str,
     audit: Option<Arc<crate::audit::AuditLogger>>,
 ) -> Result<(), GwsError> {
     let mut s = ServerState::new();
+    s.prompts = prompts;
     s.audit = audit;
     s.era = ClientEra::Modern;
     let state = Arc::new(Mutex::new(s));
@@ -344,6 +350,24 @@ pub(crate) async fn handle_request(
         "tasks/list" => tasks::handle_tasks_list(params, &state.tasks)
             .map_err(|e| protocol::internal_error(id, &e.to_string())),
 
+        "prompts/list" => Ok(crate::prompts::list_prompts(&state.prompts)),
+
+        "prompts/get" => {
+            let name = match params.get("name").and_then(|v| v.as_str()) {
+                Some(n) => n,
+                None => {
+                    return (
+                        Err(protocol::invalid_params(id, "Missing 'name' parameter")),
+                        vec![],
+                    );
+                }
+            };
+            let default_args = json!({});
+            let args = params.get("arguments").unwrap_or(&default_args);
+            crate::prompts::get_prompt(&state.prompts, name, args)
+                .map_err(|msg| protocol::invalid_params(id, &msg))
+        }
+
         _ => Err(protocol::method_not_found(id, method)),
     };
 
@@ -425,6 +449,28 @@ pub(crate) async fn handle_request_concurrent(
                     .map_err(|e| protocol::internal_error(id, &e.to_string())),
                 _ => unreachable!(),
             }
+        }
+
+        "prompts/list" => {
+            let st = state.lock().await;
+            Ok(crate::prompts::list_prompts(&st.prompts))
+        }
+
+        "prompts/get" => {
+            let name = match params.get("name").and_then(|v| v.as_str()) {
+                Some(n) => n,
+                None => {
+                    return (
+                        Err(protocol::invalid_params(id, "Missing 'name' parameter")),
+                        vec![],
+                    );
+                }
+            };
+            let default_args = json!({});
+            let args = params.get("arguments").unwrap_or(&default_args);
+            let st = state.lock().await;
+            crate::prompts::get_prompt(&st.prompts, name, args)
+                .map_err(|msg| protocol::invalid_params(id, &msg))
         }
 
         _ => Err(protocol::method_not_found(id, method)),
@@ -2181,6 +2227,7 @@ fn server_info() -> Value {
 fn server_capabilities() -> Value {
     json!({
         "tools": {},
+        "prompts": {},
         "extensions": {
             "io.modelcontextprotocol/tasks": {}
         }
