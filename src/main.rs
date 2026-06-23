@@ -1,6 +1,7 @@
 mod audit;
 mod auth;
 mod execute;
+mod handler;
 mod helpers;
 mod http;
 mod image_gen;
@@ -9,7 +10,6 @@ mod meta;
 mod metrics;
 mod policy;
 mod prompts;
-mod protocol;
 mod server;
 mod slides_helpers;
 mod tasks;
@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use google_workspace::error::GwsError;
+use rmcp::ServiceExt;
 use opentelemetry::trace::TracerProvider;
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
@@ -1246,16 +1247,50 @@ async fn main() {
         Arc::new(logger)
     });
 
-    let result = match transport {
-        Transport::Stdio => server::run_stdio(policy, prompts, audit).await,
-        Transport::Http(addr) => {
-            server::run_http(policy, prompts, policy_file_path, &addr, audit).await
-        }
-    };
+    match transport {
+        Transport::Stdio => {
+            let svc_list = policy.allowed_services();
+            if svc_list.is_empty() {
+                tracing::warn!("No services configured. Zero tools will be exposed.");
+            } else {
+                tracing::info!(services = %svc_list.join(", "), "Starting MCP server");
+            }
 
-    if let Err(e) = result {
-        eprintln!("Fatal: {e}");
-        std::process::exit(1);
+            let handler = handler::GwsHandler::new(policy, prompts, audit);
+            let service = handler
+                .serve(rmcp::transport::io::stdio())
+                .await
+                .map_err(|e| {
+                    eprintln!("Fatal: failed to start MCP server: {e}");
+                    std::process::exit(1);
+                })
+                .unwrap();
+
+            if let Err(e) = service.waiting().await {
+                eprintln!("Fatal: {e}");
+                std::process::exit(1);
+            }
+        }
+        Transport::Http(addr) => {
+            let svc_list = policy.allowed_services();
+            if svc_list.is_empty() {
+                tracing::warn!("No services configured. Zero tools will be exposed.");
+            } else {
+                tracing::info!(services = %svc_list.join(", "), "Starting MCP HTTP server");
+            }
+
+            let mut state = server::ServerState::new();
+            state.prompts = prompts;
+            state.audit = audit;
+            let state = Arc::new(tokio::sync::Mutex::new(state));
+            let policy = Arc::new(tokio::sync::RwLock::new(policy));
+
+            let result = http::serve(policy, policy_file_path, state, &addr).await;
+            if let Err(e) = result {
+                eprintln!("Fatal: {e}");
+                std::process::exit(1);
+            }
+        }
     }
 }
 

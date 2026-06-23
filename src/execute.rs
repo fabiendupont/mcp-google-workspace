@@ -195,14 +195,12 @@ fn value_type_name(v: &Value) -> &'static str {
     }
 }
 
-pub type NotifySender = tokio::sync::mpsc::UnboundedSender<Value>;
-
 const MAX_UPLOAD_BYTES: usize = 10 * 1024 * 1024;
 const DOWNLOAD_CHUNK_SIZE: usize = 10 * 1024 * 1024;
 const MAX_DOWNLOAD_SIZE: usize = 100 * 1024 * 1024;
 
 #[allow(clippy::too_many_arguments)]
-#[tracing::instrument(skip(doc, method, arguments, policy, meta, notify_tx), fields(service, resource = resource_path, method_name))]
+#[tracing::instrument(skip(doc, method, arguments, policy, meta, peer), fields(service, resource = resource_path, method_name))]
 pub async fn execute_tool(
     doc: &RestDescription,
     method: &RestMethod,
@@ -212,7 +210,8 @@ pub async fn execute_tool(
     service: &str,
     policy: &Policy,
     meta: &RequestMeta,
-    notify_tx: Option<&NotifySender>,
+    peer: Option<&rmcp::Peer<rmcp::RoleServer>>,
+    progress_token: Option<&rmcp::model::ProgressToken>,
     dry_run: bool,
     token_cache: &mut Option<crate::auth::TokenCache>,
 ) -> Result<Value, GwsError> {
@@ -340,12 +339,11 @@ pub async fn execute_tool(
             if let Some(b64_data) = media_data {
                 let raw_bytes = b64_decode(b64_data)?;
                 if raw_bytes.len() > MAX_UPLOAD_BYTES {
-                    return Ok(json!({
-                        "_mcp_auto_resumable": {
-                            "total_size": raw_bytes.len(),
-                            "content_type": media_content_type
-                        }
-                    }));
+                    let result = resumable_upload_all(
+                        doc, method, arguments, service, policy, meta, token_cache,
+                        &raw_bytes, media_content_type, peer, progress_token,
+                    ).await?;
+                    return Ok(result);
                 }
                 let (multipart_body, content_type) =
                     build_multipart_body(&body, &raw_bytes, media_content_type)?;
@@ -449,16 +447,13 @@ pub async fn execute_tool(
         match next_token {
             Some(nt) if all_results.len() < page_limit as usize => {
                 page_token = Some(nt);
-                if let Some(tx) = notify_tx {
-                    let _ = tx.send(json!({
-                        "jsonrpc": "2.0",
-                        "method": "notifications/progress",
-                        "params": {
-                            "progress": all_results.len(),
-                            "total": page_limit,
-                            "message": format!("Fetched page {}", all_results.len())
-                        }
-                    }));
+                if let (Some(p), Some(pt)) = (peer, progress_token) {
+                    let _ = p.notify_progress(rmcp::model::ProgressNotificationParam::new(
+                        pt.clone(),
+                        all_results.len() as f64,
+                    ).with_total(page_limit as f64)
+                     .with_message(format!("Fetched page {}", all_results.len()))
+                    ).await;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
@@ -991,6 +986,62 @@ pub(crate) async fn upload_chunk(
     Err(parse_api_error(status.as_u16(), &body_text))
 }
 
+const RESUMABLE_CHUNK_SIZE: usize = 5 * 1024 * 1024;
+
+#[allow(clippy::too_many_arguments)]
+async fn resumable_upload_all(
+    doc: &RestDescription,
+    method: &RestMethod,
+    arguments: &Value,
+    service: &str,
+    policy: &Policy,
+    meta: &RequestMeta,
+    token_cache: &mut Option<crate::auth::TokenCache>,
+    data: &[u8],
+    content_type: &str,
+    peer: Option<&rmcp::Peer<rmcp::RoleServer>>,
+    progress_token: Option<&rmcp::model::ProgressToken>,
+) -> Result<Value, GwsError> {
+    let init_result = initiate_resumable_upload(
+        doc, method, arguments, service, policy, meta, token_cache,
+    ).await?;
+
+    let session_uri = init_result["sessionUri"]
+        .as_str()
+        .ok_or_else(|| gws_err("No session URI in upload init response"))?;
+
+    let total_size = data.len() as u64;
+    let mut offset: u64 = 0;
+
+    loop {
+        let end = ((offset as usize) + RESUMABLE_CHUNK_SIZE).min(data.len());
+        let chunk = &data[offset as usize..end];
+
+        let chunk_result = upload_chunk(
+            session_uri, chunk, offset, total_size, content_type,
+        ).await?;
+
+        let is_complete = chunk_result
+            .get("complete")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        offset = end as u64;
+
+        if let (Some(p), Some(pt)) = (peer, progress_token) {
+            let _ = p.notify_progress(rmcp::model::ProgressNotificationParam::new(
+                pt.clone(), offset as f64,
+            ).with_total(total_size as f64)
+             .with_message(format!("Uploaded {} of {} bytes", offset, total_size))
+            ).await;
+        }
+
+        if is_complete {
+            return Ok(chunk_result.get("result").cloned().unwrap_or(json!({"status": "ok"})));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1298,7 +1349,7 @@ mod tests {
         });
 
         let result = execute_tool(
-            &doc, &method, "files", "get", &args, "drive", &policy, &meta, None, true, &mut None,
+            &doc, &method, "files", "get", &args, "drive", &policy, &meta, None, None, true, &mut None,
         )
         .await
         .unwrap();
@@ -1337,7 +1388,7 @@ mod tests {
         });
 
         let err = execute_tool(
-            &doc, &method, "files", "create", &args, "drive", &policy, &meta, None, true, &mut None,
+            &doc, &method, "files", "create", &args, "drive", &policy, &meta, None, None, true, &mut None,
         )
         .await;
 
@@ -1360,7 +1411,7 @@ mod tests {
         });
 
         let err = execute_tool(
-            &doc, &method, "files", "get", &args, "drive", &policy, &meta, None, true, &mut None,
+            &doc, &method, "files", "get", &args, "drive", &policy, &meta, None, None, true, &mut None,
         )
         .await;
 
@@ -1400,7 +1451,7 @@ mod tests {
         });
 
         let result = execute_tool(
-            &doc, &method, "files", "create", &args, "drive", &policy, &meta, None, true, &mut None,
+            &doc, &method, "files", "create", &args, "drive", &policy, &meta, None, None, true, &mut None,
         )
         .await
         .unwrap();
@@ -1437,7 +1488,7 @@ mod tests {
         });
 
         let result = execute_tool(
-            &doc, &method, "files", "get", &args, "drive", &policy, &meta, None, true, &mut None,
+            &doc, &method, "files", "get", &args, "drive", &policy, &meta, None, None, true, &mut None,
         )
         .await
         .unwrap();
@@ -1459,7 +1510,7 @@ mod tests {
         });
 
         let result = execute_tool(
-            &doc, &method, "files", "get", &args, "drive", &policy, &meta, None, true, &mut None,
+            &doc, &method, "files", "get", &args, "drive", &policy, &meta, None, None, true, &mut None,
         )
         .await
         .unwrap();
@@ -1480,7 +1531,7 @@ mod tests {
         });
 
         let err = execute_tool(
-            &doc, &method, "files", "get", &args, "drive", &policy, &meta, None, true, &mut None,
+            &doc, &method, "files", "get", &args, "drive", &policy, &meta, None, None, true, &mut None,
         )
         .await;
 
@@ -1515,7 +1566,7 @@ mod tests {
         });
 
         let result = execute_tool(
-            &doc, &method, "files", "create", &args, "drive", &policy, &meta, None, true, &mut None,
+            &doc, &method, "files", "create", &args, "drive", &policy, &meta, None, None, true, &mut None,
         )
         .await
         .unwrap();
@@ -1539,7 +1590,7 @@ mod tests {
         });
 
         let result = execute_tool(
-            &doc, &method, "files", "list", &args, "drive", &policy, &meta, None, true, &mut None,
+            &doc, &method, "files", "list", &args, "drive", &policy, &meta, None, None, true, &mut None,
         )
         .await
         .unwrap();
@@ -1567,7 +1618,7 @@ mod tests {
         });
 
         let result = execute_tool(
-            &doc, &method, "files", "get", &args, "drive", &policy, &meta, None, true, &mut None,
+            &doc, &method, "files", "get", &args, "drive", &policy, &meta, None, None, true, &mut None,
         )
         .await
         .unwrap();

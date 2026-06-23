@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use rmcp::model::{Tool, ToolAnnotations};
 use serde_json::{Value, json};
 
 use google_workspace::discovery::{RestDescription, RestResource};
@@ -8,6 +9,17 @@ use google_workspace::error::GwsError;
 use google_workspace::services;
 
 use crate::policy::Policy;
+
+fn tool_from_json(schema: Value) -> Tool {
+    serde_json::from_value(schema).expect("tool schema must be valid")
+}
+
+fn make_tool(name: impl Into<String>, title: impl Into<String>, description: impl Into<String>, annotations: ToolAnnotations, input_schema: Value) -> Tool {
+    let schema: rmcp::model::JsonObject = serde_json::from_value(input_schema).expect("input schema must be an object");
+    Tool::new(name.into(), description.into(), Arc::new(schema))
+        .with_title(title.into())
+        .with_annotations(annotations)
+}
 
 pub(crate) async fn get_or_fetch_doc(
     docs: &mut HashMap<String, Arc<RestDescription>>,
@@ -30,7 +42,7 @@ pub(crate) async fn get_or_fetch_doc(
 pub async fn build_tools_list(
     policy: &Policy,
     docs: &mut HashMap<String, Arc<RestDescription>>,
-) -> Result<Vec<Value>, GwsError> {
+) -> Result<Vec<Tool>, GwsError> {
     let mut tools = Vec::new();
 
     for svc_name in policy.allowed_services() {
@@ -69,132 +81,105 @@ pub async fn build_tools_list(
             )
         };
 
-        tools.push(json!({
-            "name": svc_name,
-            "title": title,
-            "description": description,
-            "annotations": {
-                "readOnlyHint": is_read_only,
-                "destructiveHint": false,
-                "idempotentHint": false,
-                "openWorldHint": true
-            },
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "resource": {
-                        "type": "string",
-                        "description": "Resource name (e.g., files, permissions)"
-                    },
-                    "method": {
-                        "type": "string",
-                        "description": "Method name (e.g., list, get, create)"
-                    },
-                    "params": {
-                        "type": "object",
-                        "description": "Query or path parameters"
-                    },
-                    "body": {
-                        "type": "object",
-                        "description": "Request body"
-                    },
-                    "page_all": {
-                        "type": "boolean",
-                        "description": "Auto-paginate, returning all pages"
-                    },
-                    "media_data": {
-                        "type": "string",
-                        "description": "Base64-encoded file content for media upload"
-                    },
-                    "media_content_type": {
-                        "type": "string",
-                        "description": "MIME type of the media content (e.g., application/pdf, image/png)"
-                    },
-                    "media_upload_init": {
-                        "type": "boolean",
-                        "description": "Start a resumable upload session for large files (>10MB)"
-                    },
-                    "media_total_size": {
-                        "type": "integer",
-                        "description": "Total file size in bytes (for resumable uploads)"
-                    },
-                    "upload_handle": {
-                        "type": "string",
-                        "description": "Handle from a previous media_upload_init call"
-                    },
-                    "media_chunk": {
-                        "type": "string",
-                        "description": "Base64-encoded chunk data (for resumable uploads)"
-                    },
-                    "media_chunk_offset": {
-                        "type": "integer",
-                        "description": "Byte offset of this chunk (0-based, for resumable uploads)"
-                    },
-                    "download_handle": {
-                        "type": "string",
-                        "description": "Handle from a large file download to retrieve chunks"
-                    },
-                    "download_chunk_offset": {
-                        "type": "integer",
-                        "description": "Base64 char offset for the next download chunk (0-based)"
-                    },
-                    "dry_run": {
-                        "type": "boolean",
-                        "description": "If true, returns the HTTP request that would be sent without executing it. Shows URL, method, scopes, and body."
-                    }
-                },
-                "required": ["resource", "method"]
-            }
-        }));
-    }
+        let annotations = ToolAnnotations::new()
+            .read_only(is_read_only)
+            .destructive(false)
+            .idempotent(false)
+            .open_world(true);
 
-    tools.push(json!({
-        "name": "gws_discover",
-        "title": "API Schema Discovery",
-        "description": "Query available resources, methods, and parameter schemas for any enabled service. Call with service only to list resources; add resource to list methods; add method to get full parameter schema.",
-        "annotations": {
-            "readOnlyHint": true,
-            "destructiveHint": false,
-            "idempotentHint": true,
-            "openWorldHint": false
-        },
-        "inputSchema": {
+        tools.push(make_tool(svc_name, &title, &description, annotations, json!({
             "type": "object",
             "properties": {
-                "service": {
-                    "type": "string",
-                    "description": "Service name (e.g., drive, gmail)"
-                },
                 "resource": {
                     "type": "string",
-                    "description": "Resource name to list methods for"
+                    "description": "Resource name (e.g., files, permissions)"
                 },
                 "method": {
                     "type": "string",
-                    "description": "Method name to get full parameter schema"
+                    "description": "Method name (e.g., list, get, create)"
+                },
+                "params": {
+                    "type": "object",
+                    "description": "Query or path parameters"
+                },
+                "body": {
+                    "type": "object",
+                    "description": "Request body"
+                },
+                "page_all": {
+                    "type": "boolean",
+                    "description": "Auto-paginate, returning all pages"
+                },
+                "media_data": {
+                    "type": "string",
+                    "description": "Base64-encoded file content for media upload"
+                },
+                "media_content_type": {
+                    "type": "string",
+                    "description": "MIME type of the media content (e.g., application/pdf, image/png)"
+                },
+                "media_upload_init": {
+                    "type": "boolean",
+                    "description": "Start a resumable upload session for large files (>10MB)"
+                },
+                "media_total_size": {
+                    "type": "integer",
+                    "description": "Total file size in bytes (for resumable uploads)"
+                },
+                "upload_handle": {
+                    "type": "string",
+                    "description": "Handle from a previous media_upload_init call"
+                },
+                "media_chunk": {
+                    "type": "string",
+                    "description": "Base64-encoded chunk data (for resumable uploads)"
+                },
+                "media_chunk_offset": {
+                    "type": "integer",
+                    "description": "Byte offset of this chunk (0-based, for resumable uploads)"
+                },
+                "download_handle": {
+                    "type": "string",
+                    "description": "Handle from a large file download to retrieve chunks"
+                },
+                "download_chunk_offset": {
+                    "type": "integer",
+                    "description": "Base64 char offset for the next download chunk (0-based)"
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "description": "If true, returns the HTTP request that would be sent without executing it. Shows URL, method, scopes, and body."
                 }
             },
-            "required": ["service"]
-        }
-    }));
+            "required": ["resource", "method"]
+        })));
+    }
 
-    tools.push(json!({
-        "name": "gws_batch",
-        "title": "Batch API Calls",
-        "description": "Execute multiple Google API calls in a single request. All sub-requests are validated against policy before any are executed. Max 100 requests per batch.",
-        "annotations": {
-            "readOnlyHint": false,
-            "destructiveHint": false,
-            "idempotentHint": false,
-            "openWorldHint": true
-        },
-        "inputSchema": {
+    tools.push(make_tool(
+        "gws_discover",
+        "API Schema Discovery",
+        "Query available resources, methods, and parameter schemas for any enabled service. Call with service only to list resources; add resource to list methods; add method to get full parameter schema.",
+        ToolAnnotations::new().read_only(true).destructive(false).idempotent(true).open_world(false),
+        json!({
             "type": "object",
             "properties": {
-                "service": {
-                    "type": "string",
-                    "description": "Service name (e.g., drive, gmail)"
-                },
+                "service": { "type": "string", "description": "Service name (e.g., drive, gmail)" },
+                "resource": { "type": "string", "description": "Resource name to list methods for" },
+                "method": { "type": "string", "description": "Method name to get full parameter schema" }
+            },
+            "required": ["service"]
+        }),
+    ));
+
+    tools.push(make_tool(
+        "gws_batch",
+        "Batch API Calls",
+        "Execute multiple Google API calls in a single request. All sub-requests are validated against policy before any are executed. Max 100 requests per batch.",
+        ToolAnnotations::new().read_only(false).destructive(false).idempotent(false).open_world(true),
+        json!({
+            "type": "object",
+            "properties": {
+                "service": { "type": "string", "description": "Service name (e.g., drive, gmail)" },
                 "requests": {
                     "type": "array",
                     "description": "Array of sub-requests to execute",
@@ -202,36 +187,26 @@ pub async fn build_tools_list(
                     "items": {
                         "type": "object",
                         "properties": {
-                            "resource": {
-                                "type": "string",
-                                "description": "Resource name (e.g., files, permissions)"
-                            },
-                            "method": {
-                                "type": "string",
-                                "description": "Method name (e.g., list, get, create)"
-                            },
-                            "params": {
-                                "type": "object",
-                                "description": "Query or path parameters"
-                            },
-                            "body": {
-                                "type": "object",
-                                "description": "Request body"
-                            }
+                            "resource": { "type": "string", "description": "Resource name" },
+                            "method": { "type": "string", "description": "Method name" },
+                            "params": { "type": "object", "description": "Query or path parameters" },
+                            "body": { "type": "object", "description": "Request body" }
                         },
                         "required": ["resource", "method"]
                     }
                 }
             },
             "required": ["service", "requests"]
-        }
-    }));
+        }),
+    ));
 
-    tools.extend(crate::helpers::helper_tool_schemas());
-    tools.push(crate::helpers::markdown_tool_schema());
-    tools.push(crate::slides_helpers::marp_tool_schema());
-    tools.push(crate::slides_helpers::templates_tool_schema());
-    tools.push(crate::image_gen::image_gen_tool_schema());
+    for v in crate::helpers::helper_tool_schemas() {
+        tools.push(tool_from_json(v));
+    }
+    tools.push(tool_from_json(crate::helpers::markdown_tool_schema()));
+    tools.push(tool_from_json(crate::slides_helpers::marp_tool_schema()));
+    tools.push(tool_from_json(crate::slides_helpers::templates_tool_schema()));
+    tools.push(tool_from_json(crate::image_gen::image_gen_tool_schema()));
 
     Ok(tools)
 }

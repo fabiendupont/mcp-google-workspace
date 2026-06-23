@@ -7,9 +7,8 @@ Written in Rust, uses direct Google REST API calls (not a CLI wrapper).
 
 ```
 main.rs       — CLI arg parsing, templates, interactive wizard, policy checker
-server.rs     — JSON-RPC stdio loop, dual-era MCP dispatch, request explanation
-protocol.rs   — Typed JSON-RPC layer: request parsing, error codes, response construction
-meta.rs       — Request metadata extraction (_meta, W3C Trace Context)
+handler.rs    — rmcp ServerHandler impl: get_info, list_tools, call_tool, prompts
+server.rs     — Tool dispatch business logic, Docs/Slides/Batch helpers, request explanation
 tools.rs      — Builds MCP tool list from Google Discovery Documents, handles gws_discover
 execute.rs    — HTTP execution: URL template rendering, params, pagination, auto-resumable uploads
 helpers.rs    — Google Docs enrichment: Markdown-to-Docs converter, insert text/table/image/bullets
@@ -17,9 +16,10 @@ prompts.rs    — MCP prompts: load external Markdown files, argument substituti
 policy.rs     — JSON policy engine: generic constraints, method denylists, read-only mode
 auth.rs       — OAuth2 chain: env var → credentials file → service account → ADC/gcloud
 audit.rs      — Structured JSONL audit log writer
-http.rs       — Axum HTTP server, SSE streaming, rate limiter, SIGHUP reload, session IDs
+http.rs       — Hybrid Axum server: rmcp StreamableHttpService + health/metrics endpoints
 tasks.rs      — Task lifecycle for resumable uploads and chunked downloads
 metrics.rs    — Prometheus counters, histograms, gauges
+meta.rs       — Request metadata (W3C Trace Context) — bridge for business logic
 ```
 
 ## Key Design Decisions
@@ -40,15 +40,19 @@ metrics.rs    — Prometheus counters, histograms, gauges
 - **MCP prompts**: External Markdown files with YAML frontmatter in `prompts/` directory,
   loaded at startup. Teaches models workflow recipes (document creation, API exploration,
   batch operations). Discoverable via `prompts/list` and `prompts/get`.
+- **rmcp-based transport**: Uses the `rmcp` crate (official Rust MCP SDK) for
+  protocol handling, stdio transport, and Streamable HTTP server. The handler
+  implements `ServerHandler` directly (not via tool macros) because tools are
+  built dynamically from Discovery Documents.
 - **Direct API calls**: Uses `reqwest` + `yup-oauth2` to call googleapis.com
   directly. The `google-workspace` crate (path dependency) provides Discovery
   Document types, service registry, HTTP client with retry, and validation.
 
 ## Dependencies
 
+- `rmcp` crate: Official Rust MCP SDK — ServerHandler trait, stdio/HTTP transports.
 - `google-workspace` crate: git dependency from `github.com/googleworkspace/cli` (pinned to rev `a3768d0`).
 - `pulldown-cmark` crate: Markdown parsing for the Docs enrichment converter.
-- `tower-http` crate: CORS support for HTTP transport.
 - `dialoguer` crate: interactive terminal prompts for the policy wizard.
 - OAuth2 credentials: Requires one of the 7 sources in the credential chain.
 

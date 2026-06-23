@@ -1,10 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
 use base64::Engine;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
 use google_workspace::discovery::RestDescription;
@@ -13,52 +12,28 @@ use google_workspace::error::GwsError;
 use crate::helpers::{self, ParagraphStyle, Position, TextStyle};
 use crate::meta::RequestMeta;
 use crate::policy::Policy;
-use crate::protocol::{self, JsonRpcResponse};
 use crate::tasks;
 use crate::tools;
 
 pub(crate) struct ServerState {
-    pub tools_json: Option<Vec<Value>>,
+    pub tools: Option<Vec<rmcp::model::Tool>>,
     pub docs: HashMap<String, Arc<RestDescription>>,
-    pub era: ClientEra,
-    pub active_ids: HashSet<String>,
     pub tasks: HashMap<String, tasks::Task>,
     pub token_cache: Option<crate::auth::TokenCache>,
     pub audit: Option<Arc<crate::audit::AuditLogger>>,
     pub prompts: Vec<crate::prompts::Prompt>,
 }
 
-#[derive(Debug)]
-pub(crate) enum ClientEra {
-    Unknown,
-    Legacy { initialized: bool },
-    Modern,
-}
-
 impl ServerState {
     pub(crate) fn new() -> Self {
         Self {
-            tools_json: None,
+            tools: None,
             docs: HashMap::new(),
-            era: ClientEra::Unknown,
-            active_ids: HashSet::new(),
             tasks: HashMap::new(),
             token_cache: None,
             audit: None,
             prompts: Vec::new(),
         }
-    }
-
-    pub(crate) fn track_id(&mut self, id: &Value) -> Result<(), JsonRpcResponse> {
-        let key = id.to_string();
-        if !self.active_ids.insert(key) {
-            return Err(protocol::invalid_params(id, "Duplicate request ID"));
-        }
-        Ok(())
-    }
-
-    pub(crate) fn release_id(&mut self, id: &Value) {
-        self.active_ids.remove(&id.to_string());
     }
 
     pub(crate) async fn get_doc(
@@ -73,435 +48,26 @@ impl ServerState {
     }
 }
 
-pub async fn run_stdio(
-    policy: Policy,
-    prompts: Vec<crate::prompts::Prompt>,
-    audit: Option<Arc<crate::audit::AuditLogger>>,
-) -> Result<(), GwsError> {
-    let svc_list = policy.allowed_services();
-    if svc_list.is_empty() {
-        tracing::warn!("No services configured. Zero tools will be exposed.");
-    } else {
-        tracing::info!(services = %svc_list.join(", "), "Starting MCP server");
-    }
-
-    let mut state = ServerState::new();
-    state.prompts = prompts;
-    state.audit = audit;
-
-    let mut stdin = BufReader::new(tokio::io::stdin()).lines();
-    let mut stdout = tokio::io::stdout();
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .map_err(|e| GwsError::Other(anyhow::anyhow!("Failed to register SIGTERM handler: {e}")))?;
-
-    loop {
-        let line = tokio::select! {
-            result = stdin.next_line() => {
-                match result {
-                    Ok(Some(line)) => line,
-                    _ => break,
-                }
-            }
-            _ = sigterm.recv() => {
-                tracing::info!("Received SIGTERM, shutting down");
-                break;
-            }
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("Received SIGINT, shutting down");
-                break;
-            }
-        };
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        if line.len() > MAX_REQUEST_SIZE {
-            tracing::warn!(
-                size = line.len(),
-                limit = MAX_REQUEST_SIZE,
-                "Oversized request rejected"
-            );
-            let resp = JsonRpcResponse::Error {
-                id: Value::Null,
-                code: protocol::INVALID_REQUEST,
-                message: "Request too large".to_string(),
-            };
-            if let Err(e) = write_stdio_response(&mut stdout, &resp).await {
-                tracing::error!(error = %e, "stdout write failed");
-                break;
-            }
-            continue;
-        }
-
-        let req = match protocol::parse_request(&line) {
-            Ok(r) => r,
-            Err(resp) => {
-                if let Err(e) = write_stdio_response(&mut stdout, &resp).await {
-                    tracing::error!(error = %e, "stdout write failed");
-                    break;
-                }
-                continue;
-            }
-        };
-
-        if req.is_notification() {
-            detect_era(
-                &mut state.era,
-                &req.method,
-                &RequestMeta::from_params(&req.params),
-            );
-            continue;
-        }
-
-        let id = req.id.as_ref().unwrap();
-
-        if let Err(resp) = state.track_id(id) {
-            if let Err(e) = write_stdio_response(&mut stdout, &resp).await {
-                tracing::error!(error = %e, "stdout write failed");
-                break;
-            }
-            continue;
-        }
-
-        let meta = RequestMeta::from_params(&req.params);
-        detect_era(&mut state.era, &req.method, &meta);
-
-        if let Some(resp) = check_pre_init(&state.era, &req.method, id) {
-            state.release_id(id);
-            if let Err(e) = write_stdio_response(&mut stdout, &resp).await {
-                tracing::error!(error = %e, "stdout write failed");
-                break;
-            }
-            continue;
-        }
-
-        let (response, notifications) =
-            handle_request(&req.method, &req.params, &meta, &policy, &mut state, id).await;
-
-        let mut write_failed = false;
-        for notif in &notifications {
-            let n = JsonRpcResponse::Notification(notif.clone());
-            if let Err(e) = write_stdio_response(&mut stdout, &n).await {
-                tracing::error!(error = %e, "stdout write failed");
-                write_failed = true;
-                break;
-            }
-        }
-
-        let resp = match response {
-            Ok(result) => protocol::success(id, result),
-            Err(err_resp) => err_resp,
-        };
-
-        state.release_id(id);
-        if write_failed {
-            break;
-        }
-        if let Err(e) = write_stdio_response(&mut stdout, &resp).await {
-            tracing::error!(error = %e, "stdout write failed");
-            break;
-        }
-    }
-
-    Ok(())
-}
-
-pub async fn run_http(
-    policy: Policy,
-    prompts: Vec<crate::prompts::Prompt>,
-    policy_path: Option<std::path::PathBuf>,
-    addr: &str,
-    audit: Option<Arc<crate::audit::AuditLogger>>,
-) -> Result<(), GwsError> {
-    let mut s = ServerState::new();
-    s.prompts = prompts;
-    s.audit = audit;
-    s.era = ClientEra::Modern;
-    let state = Arc::new(Mutex::new(s));
-    let policy = Arc::new(tokio::sync::RwLock::new(policy));
-
-    crate::http::serve(policy, policy_path, state, addr).await
-}
-
-pub(crate) fn detect_era(era: &mut ClientEra, method: &str, meta: &RequestMeta) {
-    if matches!(era, ClientEra::Unknown) {
-        if meta.is_modern() || method == "server/discover" {
-            *era = ClientEra::Modern;
-        } else if method == "initialize" {
-            *era = ClientEra::Legacy { initialized: false };
-        }
-        if let Some(ref ci) = meta.client_info {
-            tracing::info!(client.name = %ci.name, client.version = %ci.version, "Client connected");
-        }
-    }
-    if let ClientEra::Legacy { initialized } = era
-        && method == "notifications/initialized"
+pub(crate) async fn handle_tool_call_concurrent(
+    params: &Value,
+    meta: &RequestMeta,
+    policy: &Policy,
+    state: &Arc<Mutex<ServerState>>,
+    peer: Option<&rmcp::Peer<rmcp::RoleServer>>,
+    progress_token: Option<&rmcp::model::ProgressToken>,
+) -> Result<Value, GwsError> {
+    match handle_tool_call_inner_concurrent(params, meta, policy, state, peer, progress_token).await
     {
-        *initialized = true;
-    }
-}
-
-pub(crate) fn check_pre_init(era: &ClientEra, method: &str, id: &Value) -> Option<JsonRpcResponse> {
-    match era {
-        ClientEra::Legacy { initialized: false } => {
-            if method != "initialize" && method != "ping" {
-                return Some(protocol::invalid_params(
-                    id,
-                    "Server not initialized. Send 'initialize' first.",
-                ));
-            }
-        }
-        ClientEra::Unknown
-            if method != "initialize" && method != "server/discover" && method != "ping" =>
-        {
-            return Some(protocol::invalid_params(
-                id,
-                "Send 'initialize' or 'server/discover' first.",
-            ));
-        }
-        _ => {}
-    }
-    None
-}
-
-async fn write_stdio_response(
-    stdout: &mut tokio::io::Stdout,
-    resp: &JsonRpcResponse,
-) -> Result<(), std::io::Error> {
-    let json = resp.to_json();
-    let Ok(mut out) = serde_json::to_string(&json) else {
-        tracing::error!("Failed to serialize JSON-RPC response");
-        return Ok(());
-    };
-    out.push('\n');
-    stdout.write_all(out.as_bytes()).await?;
-    stdout.flush().await?;
-    Ok(())
-}
-
-pub(crate) async fn handle_request(
-    method: &str,
-    params: &Value,
-    meta: &RequestMeta,
-    policy: &Policy,
-    state: &mut ServerState,
-    id: &Value,
-) -> (Result<Value, JsonRpcResponse>, Vec<Value>) {
-    let start = Instant::now();
-
-    let result = match method {
-        "initialize" => {
-            let client_version = params
-                .get("protocolVersion")
-                .and_then(|v| v.as_str())
-                .unwrap_or("2024-11-05");
-
-            let negotiated = negotiate_version(client_version);
-
-            Ok(json!({
-                "protocolVersion": negotiated,
-                "serverInfo": server_info(),
-                "capabilities": server_capabilities(),
-                "instructions": server_instructions()
-            }))
-        }
-
-        "server/discover" => Ok(json!({
-            "capabilities": server_capabilities(),
-            "serverInfo": server_info(),
-            "supportedVersions": SUPPORTED_VERSIONS,
-            "instructions": server_instructions()
-        })),
-
-        "ping" => Ok(json!({})),
-
-        "tools/list" => {
-            if state.tools_json.is_none() {
-                match tools::build_tools_list(policy, &mut state.docs).await {
-                    Ok(tools) => state.tools_json = Some(tools),
-                    Err(e) => {
-                        return (Err(protocol::internal_error(id, &e.to_string())), vec![]);
-                    }
-                }
-            }
-            let all_tools = state.tools_json.as_ref().unwrap();
-            let cursor = params.get("cursor").and_then(|v| v.as_str());
-            paginate_tools(all_tools, cursor)
-                .map_err(|e| protocol::invalid_params(id, &e.to_string()))
-        }
-
-        "tools/call" => {
-            let (result, notifications) = handle_tool_call(params, meta, policy, state).await;
-            let mapped = result.map_err(|e| protocol::internal_error(id, &e.to_string()));
-            crate::metrics::record_request(method, mapped.is_err(), start.elapsed().as_secs_f64());
-            crate::metrics::set_active_tasks(state.tasks.len() as i64);
-            return (mapped, notifications);
-        }
-
-        "tasks/get" => tasks::handle_tasks_get(params, &state.tasks)
-            .map_err(|e| protocol::invalid_params(id, &e.to_string())),
-
-        "tasks/result" => tasks::handle_tasks_result(params, &state.tasks)
-            .map_err(|e| protocol::invalid_params(id, &e.to_string())),
-
-        "tasks/cancel" => tasks::handle_tasks_cancel(params, &mut state.tasks)
-            .map_err(|e| protocol::invalid_params(id, &e.to_string())),
-
-        "tasks/list" => tasks::handle_tasks_list(params, &state.tasks)
-            .map_err(|e| protocol::internal_error(id, &e.to_string())),
-
-        "prompts/list" => Ok(crate::prompts::list_prompts(&state.prompts)),
-
-        "prompts/get" => {
-            let name = match params.get("name").and_then(|v| v.as_str()) {
-                Some(n) => n,
-                None => {
-                    return (
-                        Err(protocol::invalid_params(id, "Missing 'name' parameter")),
-                        vec![],
-                    );
-                }
-            };
-            let default_args = json!({});
-            let args = params.get("arguments").unwrap_or(&default_args);
-            crate::prompts::get_prompt(&state.prompts, name, args)
-                .map_err(|msg| protocol::invalid_params(id, &msg))
-        }
-
-        _ => Err(protocol::method_not_found(id, method)),
-    };
-
-    crate::metrics::record_request(method, result.is_err(), start.elapsed().as_secs_f64());
-    crate::metrics::set_active_tasks(state.tasks.len() as i64);
-    (result, vec![])
-}
-
-pub(crate) async fn handle_request_concurrent(
-    method: &str,
-    params: &Value,
-    meta: &RequestMeta,
-    policy: &Policy,
-    state: &Arc<Mutex<ServerState>>,
-    id: &Value,
-) -> (Result<Value, JsonRpcResponse>, Vec<Value>) {
-    let start = Instant::now();
-
-    let result = match method {
-        "initialize" => {
-            let client_version = params
-                .get("protocolVersion")
-                .and_then(|v| v.as_str())
-                .unwrap_or("2024-11-05");
-            let negotiated = negotiate_version(client_version);
-            Ok(json!({
-                "protocolVersion": negotiated,
-                "serverInfo": server_info(),
-                "capabilities": server_capabilities(),
-                "instructions": server_instructions()
-            }))
-        }
-
-        "server/discover" => Ok(json!({
-            "capabilities": server_capabilities(),
-            "serverInfo": server_info(),
-            "supportedVersions": SUPPORTED_VERSIONS,
-            "instructions": server_instructions()
-        })),
-
-        "ping" => Ok(json!({})),
-
-        "tools/list" => {
-            let mut st = state.lock().await;
-            if st.tools_json.is_none() {
-                match tools::build_tools_list(policy, &mut st.docs).await {
-                    Ok(tools) => st.tools_json = Some(tools),
-                    Err(e) => {
-                        return (Err(protocol::internal_error(id, &e.to_string())), vec![]);
-                    }
-                }
-            }
-            let all_tools = st.tools_json.as_ref().unwrap();
-            let cursor = params.get("cursor").and_then(|v| v.as_str());
-            paginate_tools(all_tools, cursor)
-                .map_err(|e| protocol::invalid_params(id, &e.to_string()))
-        }
-
-        "tools/call" => {
-            let (result, notifications) =
-                handle_tool_call_concurrent(params, meta, policy, state).await;
-            let task_count = state.lock().await.tasks.len();
-            let mapped = result.map_err(|e| protocol::internal_error(id, &e.to_string()));
-            crate::metrics::record_request(method, mapped.is_err(), start.elapsed().as_secs_f64());
-            crate::metrics::set_active_tasks(task_count as i64);
-            return (mapped, notifications);
-        }
-
-        "tasks/get" | "tasks/result" | "tasks/cancel" | "tasks/list" => {
-            let mut st = state.lock().await;
-            match method {
-                "tasks/get" => tasks::handle_tasks_get(params, &st.tasks)
-                    .map_err(|e| protocol::invalid_params(id, &e.to_string())),
-                "tasks/result" => tasks::handle_tasks_result(params, &st.tasks)
-                    .map_err(|e| protocol::invalid_params(id, &e.to_string())),
-                "tasks/cancel" => tasks::handle_tasks_cancel(params, &mut st.tasks)
-                    .map_err(|e| protocol::invalid_params(id, &e.to_string())),
-                "tasks/list" => tasks::handle_tasks_list(params, &st.tasks)
-                    .map_err(|e| protocol::internal_error(id, &e.to_string())),
-                _ => unreachable!(),
-            }
-        }
-
-        "prompts/list" => {
-            let st = state.lock().await;
-            Ok(crate::prompts::list_prompts(&st.prompts))
-        }
-
-        "prompts/get" => {
-            let name = match params.get("name").and_then(|v| v.as_str()) {
-                Some(n) => n,
-                None => {
-                    return (
-                        Err(protocol::invalid_params(id, "Missing 'name' parameter")),
-                        vec![],
-                    );
-                }
-            };
-            let default_args = json!({});
-            let args = params.get("arguments").unwrap_or(&default_args);
-            let st = state.lock().await;
-            crate::prompts::get_prompt(&st.prompts, name, args)
-                .map_err(|msg| protocol::invalid_params(id, &msg))
-        }
-
-        _ => Err(protocol::method_not_found(id, method)),
-    };
-
-    let task_count = state.lock().await.tasks.len();
-    crate::metrics::record_request(method, result.is_err(), start.elapsed().as_secs_f64());
-    crate::metrics::set_active_tasks(task_count as i64);
-    (result, vec![])
-}
-
-async fn handle_tool_call_concurrent(
-    params: &Value,
-    meta: &RequestMeta,
-    policy: &Policy,
-    state: &Arc<Mutex<ServerState>>,
-) -> (Result<Value, GwsError>, Vec<Value>) {
-    match handle_tool_call_inner_concurrent(params, meta, policy, state).await {
-        Ok((result, notifications)) => (Ok(result), notifications),
+        Ok(result) => Ok(result),
         Err(e) => {
             let msg = e.to_string();
             if is_policy_denial(&msg) {
                 tracing::warn!(reason = %msg, "Policy denied tool call");
-                (
-                    Err(GwsError::Validation(
-                        "Operation not allowed by policy".to_string(),
-                    )),
-                    vec![],
-                )
+                Err(GwsError::Validation(
+                    "Operation not allowed by policy".to_string(),
+                ))
             } else {
-                (Err(e), vec![])
+                Err(e)
             }
         }
     }
@@ -512,7 +78,9 @@ async fn handle_tool_call_inner_concurrent(
     meta: &RequestMeta,
     policy: &Policy,
     state: &Arc<Mutex<ServerState>>,
-) -> Result<(Value, Vec<Value>), GwsError> {
+    peer: Option<&rmcp::Peer<rmcp::RoleServer>>,
+    progress_token: Option<&rmcp::model::ProgressToken>,
+) -> Result<Value, GwsError> {
     let tool_name = params
         .get("name")
         .and_then(|n| n.as_str())
@@ -531,7 +99,7 @@ async fn handle_tool_call_inner_concurrent(
     if tool_name == "gws_discover" {
         let mut st = state.lock().await;
         let result = tools::handle_discover(arguments, policy, &mut st.docs).await?;
-        return Ok((result, vec![]));
+        return Ok(result);
     }
 
     if tool_name == "gws_batch" {
@@ -547,34 +115,34 @@ async fn handle_tool_call_inner_concurrent(
             })?;
         let mut st = state.lock().await;
         let result = execute_batch(service, requests, policy, meta, &mut st).await?;
-        return Ok((result, vec![]));
+        return Ok(result);
     }
 
     if tool_name.starts_with("gws_docs_") {
         let mut st = state.lock().await;
         let result =
             execute_docs_helper(tool_name, arguments, policy, meta, &mut st, dry_run).await?;
-        return Ok((result, vec![]));
+        return Ok(result);
     }
 
     if tool_name == "gws_templates" {
         let mut st = state.lock().await;
         let result = execute_list_templates(policy, meta, &mut st).await;
-        return Ok((result, vec![]));
+        return Ok(result);
     }
 
     if tool_name.starts_with("gws_slides_") {
         let mut st = state.lock().await;
         let result =
             execute_slides_helper(tool_name, arguments, policy, meta, &mut st, dry_run).await?;
-        return Ok((result, vec![]));
+        return Ok(result);
     }
 
     if tool_name == "gws_generate_image" {
         let mut st = state.lock().await;
         let result =
             execute_generate_image(arguments, policy, meta, &mut st, dry_run).await?;
-        return Ok((result, vec![]));
+        return Ok(result);
     }
 
     let task_id = arguments
@@ -585,7 +153,7 @@ async fn handle_tool_call_inner_concurrent(
     if let Some(tid) = task_id {
         let mut st = state.lock().await;
         let result = handle_task_chunk(tid, arguments, &mut st).await?;
-        return Ok((result, vec![]));
+        return Ok(result);
     }
 
     let svc_alias = tool_name;
@@ -656,10 +224,8 @@ async fn handle_tool_call_inner_concurrent(
         );
 
         let result = create_upload_task(&mut st, &handle, session_uri, total_size, content_type);
-        return Ok((result, vec![]));
+        return Ok(result);
     }
-
-    let (notify_tx, mut notify_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let exec_start = Instant::now();
     let result = crate::execute::execute_tool(
@@ -671,7 +237,8 @@ async fn handle_tool_call_inner_concurrent(
         svc_alias,
         policy,
         meta,
-        Some(&notify_tx),
+        peer,
+        progress_token,
         dry_run,
         &mut tc,
     )
@@ -699,12 +266,6 @@ async fn handle_tool_call_inner_concurrent(
     }
     let result = result?;
 
-    drop(notify_tx);
-    let mut notifications = Vec::new();
-    while let Ok(notification) = notify_rx.try_recv() {
-        notifications.push(notification);
-    }
-
     let mut st = state.lock().await;
     let mcp_result = format_execute_result(
         result,
@@ -722,32 +283,7 @@ async fn handle_tool_call_inner_concurrent(
     .await?;
 
     st.token_cache = tc;
-    Ok((mcp_result, notifications))
-}
-
-async fn handle_tool_call(
-    params: &Value,
-    meta: &RequestMeta,
-    policy: &Policy,
-    state: &mut ServerState,
-) -> (Result<Value, GwsError>, Vec<Value>) {
-    match handle_tool_call_inner(params, meta, policy, state).await {
-        Ok((result, notifications)) => (Ok(result), notifications),
-        Err(e) => {
-            let msg = e.to_string();
-            if is_policy_denial(&msg) {
-                tracing::warn!(reason = %msg, "Policy denied tool call");
-                (
-                    Err(GwsError::Validation(
-                        "Operation not allowed by policy".to_string(),
-                    )),
-                    vec![],
-                )
-            } else {
-                (Err(e), vec![])
-            }
-        }
-    }
+    Ok(mcp_result)
 }
 
 fn create_upload_task(
@@ -810,47 +346,6 @@ fn create_download_task(
             "total_size": total_size,
             "content_type": content_type,
             "status": "ready"
-        },
-        "isError": false
-    })
-}
-
-fn create_auto_resumable_task(
-    state: &mut ServerState,
-    session_uri: String,
-    total_size: u64,
-    content_type: String,
-) -> Value {
-    let handle = format!(
-        "upload_{:016x}",
-        crate::execute::simple_hash(session_uri.as_bytes())
-    );
-    state.clean_expired_sessions();
-    state.tasks.insert(
-        handle.clone(),
-        tasks::Task::new(
-            handle.clone(),
-            3_600_000,
-            tasks::TaskKind::Upload(tasks::UploadData {
-                session_uri,
-                total_size,
-                bytes_uploaded: 0,
-                content_type: content_type.clone(),
-            }),
-        ),
-    );
-    json!({
-        "content": [{ "type": "text", "text": format!(
-            "File too large for simple upload ({total_size} bytes). \
-             Resumable session started. Send chunks with upload_handle=\"{handle}\" + media_chunk."
-        ) }],
-        "structuredContent": {
-            "upload_handle": handle,
-            "taskId": handle,
-            "total_size": total_size,
-            "content_type": content_type,
-            "status": "initiated",
-            "auto_resumable": true
         },
         "isError": false
     })
@@ -931,27 +426,6 @@ async fn format_execute_result(
             raw_data,
             content_type,
             total_size,
-        ));
-    }
-
-    if let Some(ar) = result.get("_mcp_auto_resumable") {
-        let total_size = ar["total_size"].as_u64().unwrap_or(0);
-        let content_type = ar["content_type"]
-            .as_str()
-            .unwrap_or("application/octet-stream")
-            .to_string();
-
-        let init_result = crate::execute::initiate_resumable_upload(
-            doc, method, arguments, service, policy, meta, tc,
-        )
-        .await?;
-
-        let session_uri = extract_session_uri(&init_result)?;
-        return Ok(create_auto_resumable_task(
-            state,
-            session_uri,
-            total_size,
-            content_type,
         ));
     }
 
@@ -1084,6 +558,7 @@ async fn execute_docs_helper(
             policy,
             meta,
             None,
+            None,
             false,
             &mut state.token_cache,
         )
@@ -1159,7 +634,14 @@ async fn execute_docs_helper(
             let position = parse_position(arguments);
             let w = arguments.get("width_pt").and_then(|v| v.as_f64());
             let h = arguments.get("height_pt").and_then(|v| v.as_f64());
-            vec![helpers::build_insert_image_request(&uri, position, w, h)]
+            let mut reqs = vec![helpers::build_insert_image_request(&uri, position, w, h)];
+            reqs.push(json!({
+                "insertText": {
+                    "text": "\n",
+                    "endOfSegmentLocation": { "segmentId": "" }
+                }
+            }));
+            reqs
         }
         "gws_docs_format_text" => {
             let start = arguments
@@ -1236,6 +718,7 @@ async fn execute_docs_helper(
         "docs",
         policy,
         meta,
+        None,
         None,
         dry_run,
         &mut state.token_cache,
@@ -1350,6 +833,7 @@ async fn execute_docs_import_markdown(
                 policy,
                 meta,
                 None,
+                None,
                 false,
                 &mut state.token_cache,
             )
@@ -1383,6 +867,7 @@ async fn execute_docs_import_markdown(
                 policy,
                 meta,
                 None,
+                None,
                 false,
                 &mut state.token_cache,
             )
@@ -1410,6 +895,7 @@ async fn execute_docs_import_markdown(
                     "docs",
                     policy,
                     meta,
+                    None,
                     None,
                     false,
                     &mut state.token_cache,
@@ -1441,6 +927,7 @@ async fn execute_docs_import_markdown(
                 "drive",
                 policy,
                 meta,
+                None,
                 None,
                 dry_run,
                 &mut state.token_cache,
@@ -1480,6 +967,7 @@ async fn execute_docs_import_markdown(
             "docs",
             policy,
             meta,
+            None,
             None,
             false,
             &mut state.token_cache,
@@ -1537,6 +1025,7 @@ async fn execute_docs_import_markdown(
             policy,
             meta,
             None,
+            None,
             false,
             &mut state.token_cache,
         )
@@ -1586,6 +1075,7 @@ async fn execute_docs_import_markdown(
                         policy,
                         meta,
                         None,
+                        None,
                         false,
                         &mut state.token_cache,
                     )
@@ -1626,6 +1116,7 @@ async fn execute_docs_import_markdown(
             policy,
             meta,
             None,
+            None,
             dry_run,
             &mut state.token_cache,
         )
@@ -1653,6 +1144,7 @@ async fn execute_docs_import_markdown(
         "docs",
         policy,
         meta,
+        None,
         None,
         dry_run,
         &mut state.token_cache,
@@ -1691,7 +1183,7 @@ async fn execute_list_templates(
                     let mut tc = state.token_cache.take();
                     if let Ok(pres_data) = crate::execute::execute_tool(
                         &slides_doc, get_method, "presentations", "get", &args,
-                        "slides", policy, meta, None, false, &mut tc,
+                        "slides", policy, meta, None, None, false, &mut tc,
                     ).await {
                         let layouts = crate::slides_helpers::extract_layouts(&pres_data);
                         let layout_names: Vec<&str> = layouts.iter()
@@ -1790,7 +1282,7 @@ async fn execute_slides_import_marp(
         let mut tc = state.token_cache.take();
         let copy_result = crate::execute::execute_tool(
             &drive_doc, copy_method, "files", "copy", &copy_args,
-            "drive", policy, meta, None, dry_run, &mut tc,
+            "drive", policy, meta, None, None, dry_run, &mut tc,
         )
         .await?;
         state.token_cache = tc;
@@ -1824,7 +1316,7 @@ async fn execute_slides_import_marp(
         let mut tc = state.token_cache.take();
         let list_result = crate::execute::execute_tool(
             &drive_doc, list_method, "files", "list", &list_args,
-            "drive", policy, meta, None, dry_run, &mut tc,
+            "drive", policy, meta, None, None, dry_run, &mut tc,
         )
         .await?;
         state.token_cache = tc;
@@ -1858,7 +1350,7 @@ async fn execute_slides_import_marp(
             let mut tc = state.token_cache.take();
             let create_result = crate::execute::execute_tool(
                 &slides_doc, create_method, "presentations", "create", &create_args,
-                "slides", policy, meta, None, dry_run, &mut tc,
+                "slides", policy, meta, None, None, dry_run, &mut tc,
             )
             .await?;
             state.token_cache = tc;
@@ -1898,7 +1390,7 @@ async fn execute_slides_import_marp(
         let mut tc = state.token_cache.take();
         let get_result = crate::execute::execute_tool(
             &slides_doc, get_method, "presentations", "get", &get_args,
-            "slides", policy, meta, None, false, &mut tc,
+            "slides", policy, meta, None, None, false, &mut tc,
         )
         .await?;
         state.token_cache = tc;
@@ -1955,7 +1447,7 @@ async fn execute_slides_import_marp(
         let mut tc = state.token_cache.take();
         let cleanup_result = crate::execute::execute_tool(
             &slides_doc, batch_method, "presentations", "batchUpdate", &batch_args,
-            "slides", policy, meta, None, false, &mut tc,
+            "slides", policy, meta, None, None, false, &mut tc,
         )
         .await?;
         state.token_cache = tc;
@@ -1978,7 +1470,7 @@ async fn execute_slides_import_marp(
         let mut tc = state.token_cache.take();
         let create_result = crate::execute::execute_tool(
             &slides_doc, batch_method, "presentations", "batchUpdate", &batch_args,
-            "slides", policy, meta, None, false, &mut tc,
+            "slides", policy, meta, None, None, false, &mut tc,
         )
         .await?;
         state.token_cache = tc;
@@ -2000,7 +1492,7 @@ async fn execute_slides_import_marp(
         let mut tc = state.token_cache.take();
         let get_result = crate::execute::execute_tool(
             &slides_doc, get_method, "presentations", "get", &get_args,
-            "slides", policy, meta, None, false, &mut tc,
+            "slides", policy, meta, None, None, false, &mut tc,
         )
         .await?;
         state.token_cache = tc;
@@ -2054,7 +1546,7 @@ async fn execute_slides_import_marp(
         let mut tc = state.token_cache.take();
         let result = crate::execute::execute_tool(
             &slides_doc, batch_method, "presentations", "batchUpdate", &batch_args,
-            "slides", policy, meta, None, false, &mut tc,
+            "slides", policy, meta, None, None, false, &mut tc,
         )
         .await?;
         state.token_cache = tc;
@@ -2228,7 +1720,7 @@ async fn upload_image_to_drive(
     let mut tc = state.token_cache.take();
     let upload_result = crate::execute::execute_tool(
         &drive_doc, create_method, "files", "create", &upload_args,
-        "drive", policy, meta, None, false, &mut tc,
+        "drive", policy, meta, None, None, false, &mut tc,
     )
     .await?;
     state.token_cache = tc;
@@ -2362,6 +1854,7 @@ async fn execute_batch(
             policy,
             meta,
             None,
+            None,
             false,
             &mut state.token_cache,
         )
@@ -2428,209 +1921,6 @@ fn is_policy_denial(msg: &str) -> bool {
         || msg.contains("Write denied")
 }
 
-async fn handle_tool_call_inner(
-    params: &Value,
-    meta: &RequestMeta,
-    policy: &Policy,
-    state: &mut ServerState,
-) -> Result<(Value, Vec<Value>), GwsError> {
-    let tool_name = params
-        .get("name")
-        .and_then(|n| n.as_str())
-        .ok_or_else(|| GwsError::Validation("Missing 'name' in tools/call".to_string()))?;
-
-    tracing::info!(tool = tool_name, "Tool call");
-
-    let default_args = json!({});
-    let raw_arguments = params.get("arguments").unwrap_or(&default_args);
-    let dry_run = raw_arguments
-        .get("dry_run")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let arguments = &strip_key(raw_arguments, "dry_run");
-
-    if tool_name == "gws_discover" {
-        let result = tools::handle_discover(arguments, policy, &mut state.docs).await?;
-        return Ok((result, vec![]));
-    }
-
-    if tool_name == "gws_batch" {
-        let service = arguments
-            .get("service")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| GwsError::Validation("Missing 'service' in gws_batch".to_string()))?;
-        let requests = arguments
-            .get("requests")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| {
-                GwsError::Validation("Missing 'requests' array in gws_batch".to_string())
-            })?;
-        let result = execute_batch(service, requests, policy, meta, state).await?;
-        return Ok((result, vec![]));
-    }
-
-    if tool_name.starts_with("gws_docs_") {
-        let result =
-            execute_docs_helper(tool_name, arguments, policy, meta, state, dry_run).await?;
-        return Ok((result, vec![]));
-    }
-
-    if tool_name == "gws_templates" {
-        let result = execute_list_templates(policy, meta, state).await;
-        return Ok((result, vec![]));
-    }
-
-    if tool_name.starts_with("gws_slides_") {
-        let result =
-            execute_slides_helper(tool_name, arguments, policy, meta, state, dry_run).await?;
-        return Ok((result, vec![]));
-    }
-
-    if tool_name == "gws_generate_image" {
-        let result =
-            execute_generate_image(arguments, policy, meta, state, dry_run).await?;
-        return Ok((result, vec![]));
-    }
-
-    let task_id = arguments
-        .get("upload_handle")
-        .or_else(|| arguments.get("download_handle"))
-        .or_else(|| arguments.get("task_id"))
-        .and_then(|v| v.as_str());
-    if let Some(tid) = task_id {
-        let result = handle_task_chunk(tid, arguments, state).await?;
-        return Ok((result, vec![]));
-    }
-
-    let svc_alias = tool_name;
-    if !policy.is_service_allowed(svc_alias) {
-        tracing::warn!(service = svc_alias, "Policy denied: service not enabled");
-        return Err(GwsError::Validation(
-            "Operation not allowed by policy".to_string(),
-        ));
-    }
-
-    let resource_path = arguments
-        .get("resource")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| GwsError::Validation("Missing 'resource' argument".to_string()))?;
-    let method_name = arguments
-        .get("method")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| GwsError::Validation("Missing 'method' argument".to_string()))?;
-
-    let mut tc = state.token_cache.take();
-    let audit = state.audit.clone();
-    let doc = state.get_doc(svc_alias).await?;
-
-    let resource = tools::find_resource(&doc.resources, resource_path).ok_or_else(|| {
-        GwsError::Validation(format!(
-            "Resource '{resource_path}' not found in {svc_alias}"
-        ))
-    })?;
-
-    let method = resource.methods.get(method_name).ok_or_else(|| {
-        GwsError::Validation(format!(
-            "Method '{method_name}' not found in {svc_alias}.{resource_path}"
-        ))
-    })?;
-
-    if arguments
-        .get("media_upload_init")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
-        let init_result = crate::execute::initiate_resumable_upload(
-            &doc, method, arguments, svc_alias, policy, meta, &mut tc,
-        )
-        .await;
-        state.token_cache = tc;
-        let init_result = init_result?;
-
-        let session_uri = extract_session_uri(&init_result)?;
-        let total_size = arguments
-            .get("media_total_size")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let content_type = arguments
-            .get("media_content_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("application/octet-stream")
-            .to_string();
-
-        let handle = format!(
-            "upload_{:016x}",
-            crate::execute::simple_hash(session_uri.as_bytes())
-        );
-
-        let result = create_upload_task(state, &handle, session_uri, total_size, content_type);
-        return Ok((result, vec![]));
-    }
-
-    let (notify_tx, mut notify_rx) = tokio::sync::mpsc::unbounded_channel();
-
-    let exec_start = Instant::now();
-    let result = crate::execute::execute_tool(
-        &doc,
-        method,
-        resource_path,
-        method_name,
-        arguments,
-        svc_alias,
-        policy,
-        meta,
-        Some(&notify_tx),
-        dry_run,
-        &mut tc,
-    )
-    .await;
-    let duration_ms = exec_start.elapsed().as_millis() as u64;
-
-    match &result {
-        Ok(_) => {
-            if let Some(ref a) = audit {
-                a.log_allowed(
-                    svc_alias,
-                    resource_path,
-                    method_name,
-                    &method.http_method,
-                    0,
-                    duration_ms,
-                );
-            }
-        }
-        Err(e) => {
-            if let Some(ref a) = audit {
-                a.log_denied(svc_alias, resource_path, method_name, &e.to_string());
-            }
-        }
-    }
-    let result = result?;
-
-    drop(notify_tx);
-    let mut notifications = Vec::new();
-    while let Ok(notification) = notify_rx.try_recv() {
-        notifications.push(notification);
-    }
-
-    let mcp_result = format_execute_result(
-        result,
-        method,
-        svc_alias,
-        resource_path,
-        method_name,
-        arguments,
-        &doc,
-        policy,
-        meta,
-        &mut tc,
-        state,
-    )
-    .await?;
-
-    state.token_cache = tc;
-    Ok((mcp_result, notifications))
-}
 
 fn explain_request(
     service: &str,
@@ -2914,250 +2204,16 @@ fn chunk_response(
     })
 }
 
-fn server_info() -> Value {
-    json!({
-        "name": "mcp-google-workspace",
-        "version": env!("CARGO_PKG_VERSION")
-    })
-}
-
-fn server_capabilities() -> Value {
-    json!({
-        "tools": {},
-        "prompts": {},
-        "extensions": {
-            "io.modelcontextprotocol/tasks": {}
-        }
-    })
-}
-
-fn server_instructions() -> &'static str {
+pub(crate) fn server_instructions() -> &'static str {
     "MCP server for Google Workspace APIs with per-project safety policies. \
      Use gws_discover to explore available services, resources, and methods. \
      Each enabled Google service is exposed as a tool."
 }
 
-const SUPPORTED_VERSIONS: &[&str] = &["2026-07-28", "2025-11-25", "2024-11-05"];
-
-fn negotiate_version(client_version: &str) -> &'static str {
-    SUPPORTED_VERSIONS
-        .iter()
-        .find(|&&v| v == client_version)
-        .copied()
-        .unwrap_or(SUPPORTED_VERSIONS.last().unwrap())
-}
-
-const MAX_REQUEST_SIZE: usize = 10 * 1024 * 1024;
-const TOOLS_PAGE_SIZE: usize = 50;
-const TOOLS_TTL_MS: u64 = 300_000;
-
-fn paginate_tools(tools: &[Value], cursor: Option<&str>) -> Result<Value, GwsError> {
-    let start = match cursor {
-        None => 0,
-        Some(c) => {
-            let decoded = String::from_utf8(
-                base64::engine::general_purpose::STANDARD
-                    .decode(c)
-                    .map_err(|_| GwsError::Validation("Invalid cursor".to_string()))?,
-            )
-            .map_err(|_| GwsError::Validation("Invalid cursor".to_string()))?;
-            decoded
-                .parse::<usize>()
-                .map_err(|_| GwsError::Validation("Invalid cursor".to_string()))?
-        }
-    };
-
-    if cursor.is_some() && start >= tools.len() {
-        return Err(GwsError::Validation("Invalid cursor".to_string()));
-    }
-
-    let end = (start + TOOLS_PAGE_SIZE).min(tools.len());
-    let page = &tools[start..end];
-
-    let mut result = json!({
-        "tools": page,
-        "ttlMs": TOOLS_TTL_MS,
-        "cacheScope": "instance"
-    });
-
-    if end < tools.len() {
-        let next = base64::engine::general_purpose::STANDARD.encode(end.to_string().as_bytes());
-        result["nextCursor"] = json!(next);
-    }
-
-    Ok(result)
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::meta::RequestMeta;
-
-    #[test]
-    fn test_detect_era_initialize_sets_legacy() {
-        let mut era = ClientEra::Unknown;
-        let meta = RequestMeta::default();
-        detect_era(&mut era, "initialize", &meta);
-        assert!(matches!(era, ClientEra::Legacy { initialized: false }));
-    }
-
-    #[test]
-    fn test_detect_era_modern_meta_sets_modern() {
-        let mut era = ClientEra::Unknown;
-        let params = json!({
-            "_meta": { "io.modelcontextprotocol/protocolVersion": "2026-07-28" }
-        });
-        let meta = RequestMeta::from_params(&params);
-        detect_era(&mut era, "tools/list", &meta);
-        assert!(matches!(era, ClientEra::Modern));
-    }
-
-    #[test]
-    fn test_detect_era_server_discover_sets_modern() {
-        let mut era = ClientEra::Unknown;
-        let meta = RequestMeta::default();
-        detect_era(&mut era, "server/discover", &meta);
-        assert!(matches!(era, ClientEra::Modern));
-    }
-
-    #[test]
-    fn test_detect_era_initialized_notification() {
-        let mut era = ClientEra::Legacy { initialized: false };
-        let meta = RequestMeta::default();
-        detect_era(&mut era, "notifications/initialized", &meta);
-        assert!(matches!(era, ClientEra::Legacy { initialized: true }));
-    }
-
-    #[test]
-    fn test_detect_era_unknown_stays_unknown_on_random_method() {
-        let mut era = ClientEra::Unknown;
-        let meta = RequestMeta::default();
-        detect_era(&mut era, "tools/list", &meta);
-        assert!(matches!(era, ClientEra::Unknown));
-    }
-
-    #[test]
-    fn test_pre_init_blocks_tools_list_in_unknown() {
-        let resp = check_pre_init(&ClientEra::Unknown, "tools/list", &json!(1));
-        assert!(resp.is_some());
-    }
-
-    #[test]
-    fn test_pre_init_allows_initialize_in_unknown() {
-        let resp = check_pre_init(&ClientEra::Unknown, "initialize", &json!(1));
-        assert!(resp.is_none());
-    }
-
-    #[test]
-    fn test_pre_init_allows_server_discover_in_unknown() {
-        let resp = check_pre_init(&ClientEra::Unknown, "server/discover", &json!(1));
-        assert!(resp.is_none());
-    }
-
-    #[test]
-    fn test_pre_init_allows_ping_in_unknown() {
-        let resp = check_pre_init(&ClientEra::Unknown, "ping", &json!(1));
-        assert!(resp.is_none());
-    }
-
-    #[test]
-    fn test_pre_init_blocks_tools_call_before_initialized() {
-        let era = ClientEra::Legacy { initialized: false };
-        let resp = check_pre_init(&era, "tools/call", &json!(1));
-        assert!(resp.is_some());
-    }
-
-    #[test]
-    fn test_pre_init_allows_tools_list_after_initialized() {
-        let era = ClientEra::Legacy { initialized: true };
-        let resp = check_pre_init(&era, "tools/list", &json!(1));
-        assert!(resp.is_none());
-    }
-
-    #[test]
-    fn test_pre_init_allows_all_in_modern() {
-        let resp = check_pre_init(&ClientEra::Modern, "tools/call", &json!(1));
-        assert!(resp.is_none());
-    }
-
-    #[test]
-    fn test_negotiate_known_version() {
-        assert_eq!(negotiate_version("2026-07-28"), "2026-07-28");
-        assert_eq!(negotiate_version("2025-11-25"), "2025-11-25");
-        assert_eq!(negotiate_version("2024-11-05"), "2024-11-05");
-    }
-
-    #[test]
-    fn test_negotiate_unknown_version_falls_back() {
-        assert_eq!(negotiate_version("1999-01-01"), "2024-11-05");
-    }
-
-    #[test]
-    fn test_paginate_no_cursor_returns_all_small_list() {
-        let tools = vec![json!({"name": "a"}), json!({"name": "b"})];
-        let result = paginate_tools(&tools, None).unwrap();
-        assert_eq!(result["tools"].as_array().unwrap().len(), 2);
-        assert!(result.get("nextCursor").is_none());
-        assert_eq!(result["ttlMs"], TOOLS_TTL_MS);
-        assert_eq!(result["cacheScope"], "instance");
-    }
-
-    #[test]
-    fn test_paginate_with_cursor_roundtrip() {
-        let tools: Vec<Value> = (0..60)
-            .map(|i| json!({"name": format!("tool-{i}")}))
-            .collect();
-        let page1 = paginate_tools(&tools, None).unwrap();
-        assert_eq!(page1["tools"].as_array().unwrap().len(), 50);
-        let cursor = page1["nextCursor"].as_str().unwrap();
-
-        let page2 = paginate_tools(&tools, Some(cursor)).unwrap();
-        assert_eq!(page2["tools"].as_array().unwrap().len(), 10);
-        assert!(page2.get("nextCursor").is_none());
-    }
-
-    #[test]
-    fn test_paginate_invalid_cursor() {
-        let tools = vec![json!({"name": "a"})];
-        let result = paginate_tools(&tools, Some("!!!invalid!!!"));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_track_id_unique() {
-        let mut state = ServerState::new();
-        assert!(state.track_id(&json!(1)).is_ok());
-        assert!(state.track_id(&json!(2)).is_ok());
-    }
-
-    #[test]
-    fn test_track_id_duplicate_rejected() {
-        let mut state = ServerState::new();
-        assert!(state.track_id(&json!(1)).is_ok());
-        assert!(state.track_id(&json!(1)).is_err());
-    }
-
-    #[test]
-    fn test_track_id_released_can_reuse() {
-        let mut state = ServerState::new();
-        assert!(state.track_id(&json!(1)).is_ok());
-        state.release_id(&json!(1));
-        assert!(state.track_id(&json!(1)).is_ok());
-    }
-
-    #[test]
-    fn test_server_info_shape() {
-        let info = server_info();
-        assert_eq!(info["name"], "mcp-google-workspace");
-        assert!(info["version"].as_str().is_some());
-    }
-
-    #[test]
-    fn test_supported_versions_not_empty() {
-        let versions = SUPPORTED_VERSIONS;
-        assert!(versions.contains(&"2026-07-28"));
-        assert!(versions.contains(&"2024-11-05"));
-    }
 
     #[test]
     fn test_task_cleanup_removes_expired() {
@@ -3219,137 +2275,6 @@ mod tests {
         assert!(handle_task_chunk("t1", &args, &mut state).await.is_err());
     }
 
-    #[tokio::test]
-    async fn test_handle_request_ping() {
-        let policy = crate::policy::Policy::from_services(&["drive".to_string()]);
-        let mut state = ServerState::new();
-        state.era = ClientEra::Modern;
-        let meta = RequestMeta::default();
-        let (result, notifs) =
-            handle_request("ping", &json!({}), &meta, &policy, &mut state, &json!(1)).await;
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), json!({}));
-        assert!(notifs.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_handle_request_server_discover() {
-        let policy = crate::policy::Policy::from_services(&["drive".to_string()]);
-        let mut state = ServerState::new();
-        state.era = ClientEra::Modern;
-        let meta = RequestMeta::default();
-        let (result, _) = handle_request(
-            "server/discover",
-            &json!({}),
-            &meta,
-            &policy,
-            &mut state,
-            &json!(1),
-        )
-        .await;
-        let val = result.unwrap();
-        assert!(val.get("capabilities").is_some());
-        assert!(val.get("serverInfo").is_some());
-        assert!(val.get("supportedVersions").is_some());
-    }
-
-    #[tokio::test]
-    async fn test_handle_request_initialize() {
-        let policy = crate::policy::Policy::from_services(&["drive".to_string()]);
-        let mut state = ServerState::new();
-        state.era = ClientEra::Legacy { initialized: true };
-        let meta = RequestMeta::default();
-        let params = json!({"protocolVersion": "2024-11-05"});
-        let (result, _) =
-            handle_request("initialize", &params, &meta, &policy, &mut state, &json!(1)).await;
-        let val = result.unwrap();
-        assert_eq!(val["protocolVersion"], "2024-11-05");
-        assert!(val.get("serverInfo").is_some());
-    }
-
-    #[tokio::test]
-    async fn test_handle_request_unknown_method() {
-        let policy = crate::policy::Policy::from_services(&["drive".to_string()]);
-        let mut state = ServerState::new();
-        state.era = ClientEra::Modern;
-        let meta = RequestMeta::default();
-        let (result, _) = handle_request(
-            "nonexistent/method",
-            &json!({}),
-            &meta,
-            &policy,
-            &mut state,
-            &json!(1),
-        )
-        .await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_handle_request_tasks_get() {
-        let policy = crate::policy::Policy::from_services(&["drive".to_string()]);
-        let mut state = ServerState::new();
-        state.era = ClientEra::Modern;
-        state.tasks.insert(
-            "t1".to_string(),
-            tasks::Task::new("t1".to_string(), 60000, tasks::TaskKind::Generic),
-        );
-        let meta = RequestMeta::default();
-        let (result, _) = handle_request(
-            "tasks/get",
-            &json!({"taskId": "t1"}),
-            &meta,
-            &policy,
-            &mut state,
-            &json!(1),
-        )
-        .await;
-        let val = result.unwrap();
-        assert_eq!(val["taskId"], "t1");
-        assert_eq!(val["status"], "working");
-    }
-
-    #[tokio::test]
-    async fn test_handle_request_tasks_list() {
-        let policy = crate::policy::Policy::from_services(&["drive".to_string()]);
-        let mut state = ServerState::new();
-        state.era = ClientEra::Modern;
-        let meta = RequestMeta::default();
-        let (result, _) = handle_request(
-            "tasks/list",
-            &json!({}),
-            &meta,
-            &policy,
-            &mut state,
-            &json!(1),
-        )
-        .await;
-        let val = result.unwrap();
-        assert_eq!(val["tasks"].as_array().unwrap().len(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_handle_request_tasks_cancel() {
-        let policy = crate::policy::Policy::from_services(&["drive".to_string()]);
-        let mut state = ServerState::new();
-        state.era = ClientEra::Modern;
-        state.tasks.insert(
-            "t1".to_string(),
-            tasks::Task::new("t1".to_string(), 60000, tasks::TaskKind::Generic),
-        );
-        let meta = RequestMeta::default();
-        let (result, _) = handle_request(
-            "tasks/cancel",
-            &json!({"taskId": "t1"}),
-            &meta,
-            &policy,
-            &mut state,
-            &json!(1),
-        )
-        .await;
-        let val = result.unwrap();
-        assert_eq!(val["status"], "cancelled");
-    }
 
     #[test]
     fn test_chunk_response_shape() {
