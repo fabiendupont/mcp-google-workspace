@@ -22,6 +22,8 @@ pub(crate) struct ServerState {
     pub token_cache: Option<crate::auth::TokenCache>,
     pub audit: Option<Arc<crate::audit::AuditLogger>>,
     pub prompts: Vec<crate::prompts::Prompt>,
+    pub subscriptions: Arc<tokio::sync::Mutex<crate::subscriptions::SubscriptionMap>>,
+    pub webhook_url: Option<String>,
 }
 
 impl ServerState {
@@ -33,6 +35,8 @@ impl ServerState {
             token_cache: None,
             audit: None,
             prompts: Vec::new(),
+            subscriptions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            webhook_url: None,
         }
     }
 

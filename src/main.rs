@@ -1,5 +1,7 @@
 mod audit;
 mod auth;
+mod completions;
+mod elicitation;
 mod execute;
 mod handler;
 mod helpers;
@@ -10,7 +12,9 @@ mod meta;
 mod metrics;
 mod policy;
 mod prompts;
+mod resources;
 mod server;
+mod subscriptions;
 mod slides_helpers;
 mod tasks;
 mod tools;
@@ -56,6 +60,7 @@ struct ParsedArgs {
     policy_path: Option<PathBuf>,
     services_str: Option<String>,
     http_addr: Option<String>,
+    external_url: Option<String>,
     audit_log: Option<PathBuf>,
     prompts_dir: Option<PathBuf>,
 }
@@ -96,6 +101,7 @@ fn parse_args_from(args: &[String]) -> Result<Command, GwsError> {
     let mut policy_path: Option<PathBuf> = None;
     let mut services_str: Option<String> = None;
     let mut http_addr: Option<String> = None;
+    let mut external_url: Option<String> = None;
     let mut init_policy = false;
     let mut check_policy_path: Option<PathBuf> = None;
     let mut verify = false;
@@ -139,6 +145,15 @@ fn parse_args_from(args: &[String]) -> Result<Command, GwsError> {
                     ));
                 }
                 http_addr = Some(args[i].clone());
+            }
+            "--external-url" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(GwsError::Validation(
+                        "--external-url requires a URL (e.g., https://mcp.example.com)".to_string(),
+                    ));
+                }
+                external_url = Some(args[i].clone());
             }
             "--init-policy" => {
                 init_policy = true;
@@ -226,6 +241,7 @@ fn parse_args_from(args: &[String]) -> Result<Command, GwsError> {
         policy_path,
         services_str,
         http_addr,
+        external_url,
         audit_log,
         prompts_dir,
     }))
@@ -1212,6 +1228,7 @@ async fn main() {
     let audit_log_path = parsed.audit_log.clone();
     let policy_file_path = parsed.policy_path.clone();
     let prompts_dir_flag = parsed.prompts_dir.clone();
+    let external_url = parsed.external_url.clone();
 
     let (policy, transport) = match resolve_config(parsed) {
         Ok(p) => p,
@@ -1282,6 +1299,8 @@ async fn main() {
             let mut state = server::ServerState::new();
             state.prompts = prompts;
             state.audit = audit;
+            state.webhook_url = external_url.clone()
+                .or_else(|| Some(format!("http://{addr}")));
             let state = Arc::new(tokio::sync::Mutex::new(state));
             let policy = Arc::new(tokio::sync::RwLock::new(policy));
 
@@ -1389,6 +1408,7 @@ mod tests {
             policy_path: None,
             services_str: Some("drive,gmail".to_string()),
             http_addr: None,
+            external_url: None,
             audit_log: None,
             prompts_dir: None,
         };
@@ -1404,6 +1424,7 @@ mod tests {
             policy_path: None,
             services_str: None,
             http_addr: None,
+            external_url: None,
             audit_log: None,
             prompts_dir: None,
         };
@@ -1416,6 +1437,7 @@ mod tests {
             policy_path: None,
             services_str: Some("drive".to_string()),
             http_addr: Some("0.0.0.0:8080".to_string()),
+            external_url: None,
             audit_log: None,
             prompts_dir: None,
         };
@@ -1429,6 +1451,7 @@ mod tests {
             policy_path: None,
             services_str: Some("drive".to_string()),
             http_addr: None,
+            external_url: None,
             audit_log: None,
             prompts_dir: None,
         };
@@ -1442,6 +1465,7 @@ mod tests {
             policy_path: Some(PathBuf::from("/nonexistent/path/policy.json")),
             services_str: None,
             http_addr: None,
+            external_url: None,
             audit_log: None,
             prompts_dir: None,
         };

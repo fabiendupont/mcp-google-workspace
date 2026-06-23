@@ -51,6 +51,9 @@ impl ServerHandler for GwsHandler {
                 .enable_tools()
                 .enable_prompts()
                 .enable_tasks()
+                .enable_resources()
+                .enable_resources_subscribe()
+                .enable_completions()
                 .build(),
         )
         .with_server_info(Implementation::new(
@@ -125,6 +128,213 @@ impl ServerHandler for GwsHandler {
                 Ok(value) => Ok(value_to_call_tool_result(value)),
                 Err(e) => Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
             }
+        }
+    }
+
+    fn complete(
+        &self,
+        request: CompleteRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<CompleteResult, McpError>> + Send + '_ {
+        async move {
+            let policy = self.policy.read().await;
+            let st = self.state.lock().await;
+            let completion = crate::completions::complete_request(
+                &request.r#ref,
+                &request.argument,
+                &policy,
+                &st.docs,
+                &st.prompts,
+            );
+            Ok(CompleteResult::new(completion))
+        }
+    }
+
+    fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ListResourcesResult, McpError>> + Send + '_ {
+        async move {
+            Ok(ListResourcesResult::with_all_items(vec![]))
+        }
+    }
+
+    fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ListResourceTemplatesResult, McpError>> + Send + '_ {
+        async move {
+            let policy = self.policy.read().await;
+            let st = self.state.lock().await;
+            let templates = crate::resources::build_resource_templates(&policy, &st.docs);
+            Ok(ListResourceTemplatesResult::with_all_items(templates))
+        }
+    }
+
+    fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ReadResourceResult, McpError>> + Send + '_ {
+        async move {
+            let parsed = crate::resources::parse_gws_uri(&request.uri).ok_or_else(|| {
+                McpError::invalid_params(
+                    format!("Invalid resource URI: {}. Expected gws://service/resource/id", request.uri),
+                    None,
+                )
+            })?;
+
+            let policy = self.policy.read().await;
+            if !policy.is_service_allowed(&parsed.service) {
+                return Err(McpError::invalid_params(
+                    format!("Service '{}' not enabled by policy", parsed.service),
+                    None,
+                ));
+            }
+
+            let meta = crate::meta::RequestMeta::default();
+            let mut st = self.state.lock().await;
+            let doc = st.get_doc(&parsed.service).await.map_err(|e| {
+                McpError::internal_error(format!("Failed to load discovery doc: {e}"), None)
+            })?;
+
+            let resource = crate::tools::find_resource(&doc.resources, &parsed.resource)
+                .ok_or_else(|| {
+                    McpError::invalid_params(
+                        format!("Resource '{}' not found in {}", parsed.resource, parsed.service),
+                        None,
+                    )
+                })?;
+
+            let id_param = crate::resources::id_param_name(resource, "get").ok_or_else(|| {
+                McpError::invalid_params(
+                    format!("Resource '{}' has no get method with path parameter", parsed.resource),
+                    None,
+                )
+            })?;
+
+            let method = resource.methods.get("get").ok_or_else(|| {
+                McpError::invalid_params(
+                    format!("Resource '{}' has no get method", parsed.resource),
+                    None,
+                )
+            })?;
+
+            let args = json!({ "params": { &id_param: &parsed.id } });
+            let result = crate::execute::execute_tool(
+                &doc, method, &parsed.resource, "get", &args,
+                &parsed.service, &policy, &meta, None, None, false,
+                &mut st.token_cache,
+            ).await.map_err(|e| {
+                McpError::internal_error(format!("API call failed: {e}"), None)
+            })?;
+
+            let text = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
+            let contents = rmcp::model::ResourceContents::text(&text, &request.uri)
+                .with_mime_type("application/json");
+            Ok(ReadResourceResult::new(vec![contents]))
+        }
+    }
+
+    fn subscribe(
+        &self,
+        request: SubscribeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<(), McpError>> + Send + '_ {
+        let peer = context.peer.clone();
+        async move {
+            let parsed = crate::resources::parse_gws_uri(&request.uri).ok_or_else(|| {
+                McpError::invalid_params(
+                    format!("Invalid resource URI: {}", request.uri),
+                    None,
+                )
+            })?;
+
+            let mut st = self.state.lock().await;
+            let webhook_url = st.webhook_url.as_ref().ok_or_else(|| {
+                McpError::internal_error(
+                    "Subscriptions require HTTP mode with --external-url. \
+                     In stdio mode, Google cannot deliver webhook callbacks.",
+                    None,
+                )
+            })?.clone();
+
+            let policy = self.policy.read().await;
+            if !policy.is_service_allowed(&parsed.service) {
+                return Err(McpError::invalid_params(
+                    format!("Service '{}' not enabled", parsed.service),
+                    None,
+                ));
+            }
+
+            let (channel_id, resource_id, expiration_ms) =
+                crate::subscriptions::watch_resource(
+                    &parsed.service,
+                    &parsed.id,
+                    &webhook_url,
+                    &mut st.token_cache,
+                    &policy,
+                )
+                .await
+                .map_err(|e| {
+                    McpError::internal_error(format!("Failed to watch resource: {e}"), None)
+                })?;
+
+            let expiration = std::time::Instant::now()
+                + std::time::Duration::from_millis(
+                    expiration_ms.saturating_sub(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64,
+                    ),
+                );
+
+            let subscription = crate::subscriptions::Subscription {
+                uri: request.uri.clone(),
+                channel_id,
+                resource_id,
+                expiration,
+                peer,
+                service: parsed.service,
+            };
+
+            st.subscriptions.lock().await.insert(request.uri, subscription);
+            tracing::info!("Subscription created for resource");
+            Ok(())
+        }
+    }
+
+    fn unsubscribe(
+        &self,
+        request: UnsubscribeRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<(), McpError>> + Send + '_ {
+        async move {
+            let mut st = self.state.lock().await;
+            let sub = {
+                let mut subs = st.subscriptions.lock().await;
+                subs.remove(&request.uri).ok_or_else(|| {
+                    McpError::invalid_params(
+                        format!("No subscription for URI: {}", request.uri),
+                        None,
+                    )
+                })?
+            };
+
+            let policy = self.policy.read().await;
+            let _ = crate::subscriptions::stop_watch(
+                &sub.channel_id,
+                &sub.resource_id,
+                &mut st.token_cache,
+                &policy,
+            )
+            .await;
+
+            tracing::info!(uri = %request.uri, "Subscription removed");
+            Ok(())
         }
     }
 

@@ -2,9 +2,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use serde_json::json;
 use tokio::sync::{Mutex, RwLock};
@@ -77,6 +77,7 @@ pub async fn serve(
 
     let app = Router::new()
         .nest_service("/mcp", mcp_service)
+        .route("/webhooks/drive", post(handle_drive_webhook))
         .route("/healthz", get(handle_health))
         .route("/readyz", get(handle_readyz))
         .route("/livez", get(handle_livez))
@@ -112,6 +113,29 @@ pub async fn serve(
     .map_err(|e| GwsError::Other(anyhow::anyhow!("HTTP server error: {e}")))?;
 
     Ok(())
+}
+
+async fn handle_drive_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let channel_id = headers
+        .get("x-goog-channel-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let resource_state = headers
+        .get("x-goog-resource-state")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown");
+
+    if channel_id.is_empty() {
+        return StatusCode::BAD_REQUEST;
+    }
+
+    let subs = state.server_state.lock().await.subscriptions.clone();
+    crate::subscriptions::handle_webhook(channel_id, resource_state, &subs).await;
+
+    StatusCode::OK
 }
 
 async fn handle_health() -> impl IntoResponse {
