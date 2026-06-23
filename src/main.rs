@@ -3,12 +3,15 @@ mod auth;
 mod execute;
 mod helpers;
 mod http;
+mod image_gen;
+mod marp;
 mod meta;
 mod metrics;
 mod policy;
 mod prompts;
 mod protocol;
 mod server;
+mod slides_helpers;
 mod tasks;
 mod tools;
 
@@ -256,6 +259,7 @@ const KNOWN_SERVICES: &[(&str, &str)] = &[
     ("slides", "Google Slides — presentations, pages"),
     ("admin", "Admin SDK — users, groups, org units"),
     ("chat", "Google Chat — spaces, messages"),
+    ("generativelanguage", "Google Generative AI — models, content generation"),
 ];
 
 fn generate_policy(services: &[String]) -> serde_json::Value {

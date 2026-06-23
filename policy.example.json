@@ -10,8 +10,20 @@
     {
       "name": "drive",
       "constraints": [
-        { "param": "parents", "values": ["1ABC-shared-references"], "access": "read-only", "location": "body" },
-        { "param": "parents", "values": ["folder-id-for-output"], "access": "read-write", "location": "body" }
+        {
+          "param": "parents",
+          "values": ["WRITABLE_FOLDER_ID"],
+          "access": "read-write",
+          "location": "body",
+          "_comment": "All created files must land in this folder"
+        },
+        {
+          "param": "parents",
+          "values": ["READONLY_FOLDER_ID"],
+          "access": "read-only",
+          "location": "body",
+          "_comment": "Can list files in this folder but not create or move files into it"
+        }
       ]
     },
     {
@@ -41,7 +53,34 @@
     },
     {
       "name": "docs",
-      "read_only": true
+      "constraints": [
+        {
+          "param": "documentId",
+          "values": ["TEMPLATE_DOC_ID"],
+          "access": "read-only",
+          "mode": "protect",
+          "_comment": "Prevent modification of the document template; reading named styles is allowed"
+        }
+      ]
+    },
+    {
+      "name": "slides",
+      "constraints": [
+        {
+          "param": "presentationId",
+          "values": ["TEMPLATE_SLIDES_ID"],
+          "access": "read-only",
+          "mode": "protect",
+          "_comment": "Prevent modification of the presentation template; reading layouts is allowed"
+        }
+      ]
+    }
+  ],
+  "templates": [
+    {
+      "id": "TEMPLATE_SLIDES_ID",
+      "name": "standard",
+      "description": "Standard corporate presentation template"
     }
   ]
 }

@@ -557,6 +557,26 @@ async fn handle_tool_call_inner_concurrent(
         return Ok((result, vec![]));
     }
 
+    if tool_name == "gws_templates" {
+        let mut st = state.lock().await;
+        let result = execute_list_templates(policy, meta, &mut st).await;
+        return Ok((result, vec![]));
+    }
+
+    if tool_name.starts_with("gws_slides_") {
+        let mut st = state.lock().await;
+        let result =
+            execute_slides_helper(tool_name, arguments, policy, meta, &mut st, dry_run).await?;
+        return Ok((result, vec![]));
+    }
+
+    if tool_name == "gws_generate_image" {
+        let mut st = state.lock().await;
+        let result =
+            execute_generate_image(arguments, policy, meta, &mut st, dry_run).await?;
+        return Ok((result, vec![]));
+    }
+
     let task_id = arguments
         .get("upload_handle")
         .or_else(|| arguments.get("download_handle"))
@@ -1123,47 +1143,13 @@ async fn execute_docs_helper(
 
             let uri = if let Some(url) = image_url {
                 url.to_string()
-            } else if let Some(fid) = drive_file_id {
-                let drive_doc = state.get_doc("drive").await?;
-                let files_resource = tools::find_resource(&drive_doc.resources, "files")
-                    .ok_or_else(|| GwsError::Validation("files resource not found".into()))?;
-                let get_method = files_resource
-                    .methods
-                    .get("get")
-                    .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
-                let get_args = json!({"params": {"fileId": fid, "alt": "media"}});
-                let dl_result = crate::execute::execute_tool(
-                    &drive_doc,
-                    get_method,
-                    "files",
-                    "get",
-                    &get_args,
-                    "drive",
-                    policy,
-                    meta,
-                    None,
-                    false,
-                    &mut state.token_cache,
-                )
-                .await?;
-                let mcp_content = dl_result["_mcp_content"].as_array().ok_or_else(|| {
-                    GwsError::Validation("Failed to download image from Drive".into())
-                })?;
-                let image_entry = mcp_content
-                    .iter()
-                    .find(|e| e["type"].as_str() == Some("image"))
-                    .ok_or_else(|| GwsError::Validation("Drive file is not an image".into()))?;
-                let b64 = image_entry["data"]
-                    .as_str()
-                    .ok_or_else(|| GwsError::Validation("No image data in download".into()))?;
-                let mime = image_entry["mimeType"].as_str().unwrap_or("image/png");
-                format!("data:{mime};base64,{b64}")
-            } else if let Some(b64) = image_data {
-                let mime = arguments
-                    .get("image_content_type")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("image/png");
-                format!("data:{mime};base64,{b64}")
+            } else if drive_file_id.is_some() || image_data.is_some() {
+                return Err(GwsError::Validation(
+                    "Google Docs insertInlineImage requires a publicly accessible URL \
+                     (2KB URI limit prevents data URIs). Use 'image_url' with a public \
+                     URL, or insert images via the Google Docs UI from Drive."
+                        .into(),
+                ));
             } else {
                 return Err(GwsError::Validation(
                     "One of 'image_url', 'drive_file_id', or 'image_data' is required".into(),
@@ -1683,6 +1669,587 @@ async fn execute_docs_import_markdown(
     Ok(result)
 }
 
+async fn execute_list_templates(
+    policy: &Policy,
+    meta: &RequestMeta,
+    state: &mut ServerState,
+) -> Value {
+    let mut templates: Vec<Value> = Vec::new();
+
+    for t in policy.templates() {
+        let mut entry = json!({
+            "name": t.name,
+            "id": t.id
+        });
+        if let Some(ref desc) = t.description {
+            entry["description"] = json!(desc);
+        }
+        if let Ok(slides_doc) = state.get_doc("slides").await {
+            if let Some(pres_resource) = tools::find_resource(&slides_doc.resources, "presentations") {
+                if let Some(get_method) = pres_resource.methods.get("get") {
+                    let args = json!({ "params": { "presentationId": &t.id } });
+                    let mut tc = state.token_cache.take();
+                    if let Ok(pres_data) = crate::execute::execute_tool(
+                        &slides_doc, get_method, "presentations", "get", &args,
+                        "slides", policy, meta, None, false, &mut tc,
+                    ).await {
+                        let layouts = crate::slides_helpers::extract_layouts(&pres_data);
+                        let layout_names: Vec<&str> = layouts.iter()
+                            .map(|l| l.display_name.as_str())
+                            .collect();
+                        entry["layouts"] = json!(layout_names);
+                    }
+                    state.token_cache = tc;
+                }
+            }
+        }
+        templates.push(entry);
+    }
+
+    json!({
+        "templates": templates,
+        "count": templates.len(),
+        "hint": "Use the template 'name' or 'id' as the 'template' argument in gws_slides_import_marp"
+    })
+}
+
+async fn execute_slides_helper(
+    tool_name: &str,
+    arguments: &Value,
+    policy: &Policy,
+    meta: &RequestMeta,
+    state: &mut ServerState,
+    dry_run: bool,
+) -> Result<Value, GwsError> {
+    if tool_name == "gws_slides_import_marp" {
+        return execute_slides_import_marp(arguments, policy, meta, state, dry_run).await;
+    }
+    Err(GwsError::Validation(format!(
+        "Unknown slides helper: {tool_name}"
+    )))
+}
+
+async fn execute_slides_import_marp(
+    arguments: &Value,
+    policy: &Policy,
+    meta: &RequestMeta,
+    state: &mut ServerState,
+    dry_run: bool,
+) -> Result<Value, GwsError> {
+    let marp_source = arguments
+        .get("marp")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| GwsError::Validation("Missing 'marp' argument".into()))?;
+
+    let presentation_id_arg = arguments.get("presentation_id").and_then(|v| v.as_str());
+    let title = arguments.get("title").and_then(|v| v.as_str());
+    let folder_id = arguments.get("folder_id").and_then(|v| v.as_str());
+    let template_arg = arguments
+        .get("template")
+        .or_else(|| arguments.get("template_id"))
+        .and_then(|v| v.as_str());
+    let template_id = template_arg.and_then(|t| {
+        policy.find_template(t).map(|e| e.id.as_str()).or(Some(t))
+    });
+
+    let pres = crate::marp::parse_marp(marp_source)
+        .map_err(|e| GwsError::Validation(format!("Marp parse error: {e}")))?;
+
+    // Step A: Resolve or create presentation
+    let slides_doc = state.get_doc("slides").await?;
+    let drive_doc = state.get_doc("drive").await?;
+
+    let presentation_id: String;
+    let mut created_new = false;
+
+    if let Some(pid) = presentation_id_arg {
+        presentation_id = pid.to_string();
+    } else if let Some(tmpl_id) = template_id {
+        // Copy template presentation via Drive
+        let files_resource =
+            tools::find_resource(&drive_doc.resources, "files")
+                .ok_or_else(|| GwsError::Validation("Drive files resource not found".into()))?;
+        let copy_method = files_resource
+            .methods
+            .get("copy")
+            .ok_or_else(|| GwsError::Validation("Drive files.copy method not found".into()))?;
+
+        let mut copy_body = json!({});
+        if let Some(t) = title {
+            copy_body["name"] = json!(t);
+        }
+        if let Some(fid) = folder_id {
+            copy_body["parents"] = json!([fid]);
+        }
+
+        let copy_args = json!({
+            "params": { "fileId": tmpl_id },
+            "body": copy_body
+        });
+
+        let mut tc = state.token_cache.take();
+        let copy_result = crate::execute::execute_tool(
+            &drive_doc, copy_method, "files", "copy", &copy_args,
+            "drive", policy, meta, None, dry_run, &mut tc,
+        )
+        .await?;
+        state.token_cache = tc;
+
+        presentation_id = copy_result
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| GwsError::Validation("Drive copy did not return an ID".into()))?
+            .to_string();
+        created_new = true;
+    } else if let Some(t) = title {
+        // Search for existing presentation or create new one
+        let files_resource =
+            tools::find_resource(&drive_doc.resources, "files")
+                .ok_or_else(|| GwsError::Validation("Drive files resource not found".into()))?;
+
+        let mut query = format!(
+            "name = '{}' and mimeType = 'application/vnd.google-apps.presentation' and trashed = false",
+            t.replace('\'', "\\'")
+        );
+        if let Some(fid) = folder_id {
+            query.push_str(&format!(" and '{}' in parents", fid.replace('\'', "\\'")));
+        }
+
+        let list_method = files_resource
+            .methods
+            .get("list")
+            .ok_or_else(|| GwsError::Validation("Drive files.list method not found".into()))?;
+
+        let list_args = json!({ "params": { "q": query } });
+        let mut tc = state.token_cache.take();
+        let list_result = crate::execute::execute_tool(
+            &drive_doc, list_method, "files", "list", &list_args,
+            "drive", policy, meta, None, dry_run, &mut tc,
+        )
+        .await?;
+        state.token_cache = tc;
+
+        let files = list_result
+            .get("files")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        if let Some(existing) = files.first() {
+            presentation_id = existing
+                .get("id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| GwsError::Validation("Existing file has no ID".into()))?
+                .to_string();
+        } else {
+            // Create new presentation
+            let presentations_resource =
+                tools::find_resource(&slides_doc.resources, "presentations")
+                    .ok_or_else(|| GwsError::Validation("Slides presentations resource not found".into()))?;
+            let create_method = presentations_resource
+                .methods
+                .get("create")
+                .ok_or_else(|| GwsError::Validation("Slides presentations.create not found".into()))?;
+
+            let create_args = json!({
+                "body": { "title": t }
+            });
+
+            let mut tc = state.token_cache.take();
+            let create_result = crate::execute::execute_tool(
+                &slides_doc, create_method, "presentations", "create", &create_args,
+                "slides", policy, meta, None, dry_run, &mut tc,
+            )
+            .await?;
+            state.token_cache = tc;
+
+            presentation_id = create_result
+                .get("presentationId")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| GwsError::Validation("Create did not return presentationId".into()))?
+                .to_string();
+            created_new = true;
+        }
+    } else {
+        return Err(GwsError::Validation(
+            "One of 'presentation_id', 'title', or 'template_id' is required".into(),
+        ));
+    }
+
+    if dry_run {
+        return Ok(json!({
+            "dry_run": true,
+            "presentation_id": presentation_id,
+            "slide_count": pres.slides.len()
+        }));
+    }
+
+    // Step B: Fetch presentation, extract layouts, collect existing slide IDs
+    let (template_layouts, existing_slide_ids) = {
+        let presentations_resource =
+            tools::find_resource(&slides_doc.resources, "presentations")
+                .ok_or_else(|| GwsError::Validation("Slides presentations resource not found".into()))?;
+        let get_method = presentations_resource
+            .methods
+            .get("get")
+            .ok_or_else(|| GwsError::Validation("Slides presentations.get not found".into()))?;
+
+        let get_args = json!({ "params": { "presentationId": &presentation_id } });
+        let mut tc = state.token_cache.take();
+        let get_result = crate::execute::execute_tool(
+            &slides_doc, get_method, "presentations", "get", &get_args,
+            "slides", policy, meta, None, false, &mut tc,
+        )
+        .await?;
+        state.token_cache = tc;
+        check_api_result(&get_result)?;
+
+        let layouts = if template_id.is_some() {
+            crate::slides_helpers::extract_layouts(&get_result)
+        } else {
+            Vec::new()
+        };
+
+        let existing_slide_ids: Vec<String> = get_result
+            .get("slides")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|s| s.get("objectId").and_then(|id| id.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        (layouts, existing_slide_ids)
+    };
+
+    // Step C: Generate slide create requests, then batch cleanup + creation
+    let layouts_ref = if template_layouts.is_empty() {
+        None
+    } else {
+        Some(template_layouts.as_slice())
+    };
+    let (create_reqs, mut content_reqs) =
+        crate::slides_helpers::marp_to_slide_requests(&pres, None, layouts_ref);
+
+    let presentations_resource =
+        tools::find_resource(&slides_doc.resources, "presentations")
+            .ok_or_else(|| GwsError::Validation("Slides presentations resource not found".into()))?;
+    let batch_method = presentations_resource
+        .methods
+        .get("batchUpdate")
+        .ok_or_else(|| GwsError::Validation("Slides batchUpdate not found".into()))?;
+
+    // Step C1: Delete existing slides (create temp slide first, then delete all old ones)
+    if !existing_slide_ids.is_empty() {
+        let mut cleanup_reqs = vec![json!({
+            "createSlide": { "objectId": "temp_cleanup_slide" }
+        })];
+        for old_id in &existing_slide_ids {
+            cleanup_reqs.push(json!({ "deleteObject": { "objectId": old_id } }));
+        }
+        let batch_args = json!({
+            "params": { "presentationId": &presentation_id },
+            "body": { "requests": cleanup_reqs }
+        });
+        let mut tc = state.token_cache.take();
+        let cleanup_result = crate::execute::execute_tool(
+            &slides_doc, batch_method, "presentations", "batchUpdate", &batch_args,
+            "slides", policy, meta, None, false, &mut tc,
+        )
+        .await?;
+        state.token_cache = tc;
+        check_api_result(&cleanup_result)?;
+    }
+
+    // Step C2: Create new slides and delete the temp cleanup slide
+    if !create_reqs.is_empty() {
+        let mut pass1_reqs = create_reqs;
+        if !existing_slide_ids.is_empty() {
+            pass1_reqs.push(json!({
+                "deleteObject": { "objectId": "temp_cleanup_slide" }
+            }));
+        }
+
+        let batch_args = json!({
+            "params": { "presentationId": &presentation_id },
+            "body": { "requests": pass1_reqs }
+        });
+        let mut tc = state.token_cache.take();
+        let create_result = crate::execute::execute_tool(
+            &slides_doc, batch_method, "presentations", "batchUpdate", &batch_args,
+            "slides", policy, meta, None, false, &mut tc,
+        )
+        .await?;
+        state.token_cache = tc;
+        check_api_result(&create_result)?;
+    }
+
+    // Step D: Fetch presentation to get speaker notes object IDs
+    let has_notes = pres.slides.iter().any(|s| s.speaker_notes.is_some());
+    if has_notes {
+        let presentations_resource =
+            tools::find_resource(&slides_doc.resources, "presentations")
+                .ok_or_else(|| GwsError::Validation("Slides presentations resource not found".into()))?;
+        let get_method = presentations_resource
+            .methods
+            .get("get")
+            .ok_or_else(|| GwsError::Validation("Slides presentations.get not found".into()))?;
+
+        let get_args = json!({ "params": { "presentationId": &presentation_id } });
+        let mut tc = state.token_cache.take();
+        let get_result = crate::execute::execute_tool(
+            &slides_doc, get_method, "presentations", "get", &get_args,
+            "slides", policy, meta, None, false, &mut tc,
+        )
+        .await?;
+        state.token_cache = tc;
+
+        let slides_arr = get_result
+            .get("slides")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        let notes_ids: Vec<String> = slides_arr
+            .iter()
+            .filter_map(|s| {
+                s.get("slideProperties")
+                    .and_then(|sp| sp.get("notesPage"))
+                    .and_then(|np| np.get("notesProperties"))
+                    .and_then(|npp| npp.get("speakerNotesObjectId"))
+                    .and_then(|id| id.as_str())
+                    .map(String::from)
+            })
+            .collect();
+
+        let (_, notes_content_reqs) =
+            crate::slides_helpers::marp_to_slide_requests(&pres, Some(&notes_ids), None);
+        // Only add notes-related requests (insertText targeting notes IDs)
+        for req in notes_content_reqs {
+            if let Some(insert) = req.get("insertText") {
+                if let Some(obj_id) = insert.get("objectId").and_then(|v| v.as_str()) {
+                    if notes_ids.contains(&obj_id.to_string()) {
+                        content_reqs.push(req);
+                    }
+                }
+            }
+        }
+    }
+
+    // Step E: Execute pass 2 — content, styling, backgrounds, notes
+    if !content_reqs.is_empty() {
+        let presentations_resource =
+            tools::find_resource(&slides_doc.resources, "presentations")
+                .ok_or_else(|| GwsError::Validation("Slides presentations resource not found".into()))?;
+        let batch_method = presentations_resource
+            .methods
+            .get("batchUpdate")
+            .ok_or_else(|| GwsError::Validation("Slides batchUpdate not found".into()))?;
+
+        let batch_args = json!({
+            "params": { "presentationId": &presentation_id },
+            "body": { "requests": content_reqs }
+        });
+        let mut tc = state.token_cache.take();
+        let result = crate::execute::execute_tool(
+            &slides_doc, batch_method, "presentations", "batchUpdate", &batch_args,
+            "slides", policy, meta, None, false, &mut tc,
+        )
+        .await?;
+        state.token_cache = tc;
+
+        let mut final_result = result;
+        final_result["presentation_id"] = json!(presentation_id);
+        final_result["slide_count"] = json!(pres.slides.len());
+        if created_new {
+            final_result["created_presentation_id"] = json!(&presentation_id);
+        }
+        final_result["url"] = json!(format!(
+            "https://docs.google.com/presentation/d/{}/edit",
+            presentation_id
+        ));
+        return Ok(final_result);
+    }
+
+    Ok(json!({
+        "presentation_id": presentation_id,
+        "slide_count": pres.slides.len(),
+        "url": format!("https://docs.google.com/presentation/d/{}/edit", presentation_id)
+    }))
+}
+
+async fn execute_generate_image(
+    arguments: &Value,
+    policy: &Policy,
+    meta: &RequestMeta,
+    state: &mut ServerState,
+    dry_run: bool,
+) -> Result<Value, GwsError> {
+    let prompt = arguments
+        .get("prompt")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| GwsError::Validation("Missing 'prompt' argument".into()))?;
+
+    let model = arguments
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("gemini-2.5-flash-image");
+
+    let aspect_ratio = arguments.get("aspect_ratio").and_then(|v| v.as_str());
+    let image_size = arguments.get("image_size").and_then(|v| v.as_str());
+    let document_id = arguments.get("document_id").and_then(|v| v.as_str());
+    let presentation_id = arguments.get("presentation_id").and_then(|v| v.as_str());
+    let folder_id = arguments.get("folder_id").and_then(|v| v.as_str());
+
+    if dry_run {
+        return Ok(json!({
+            "dry_run": true,
+            "prompt": prompt,
+            "model": model,
+            "target": if document_id.is_some() { "document" }
+                     else if presentation_id.is_some() { "presentation" }
+                     else { "standalone" }
+        }));
+    }
+
+    let credentials_file = policy.credentials_file.as_deref();
+    let mut tc = state.token_cache.take();
+    let generated = crate::image_gen::generate_image(
+        prompt,
+        model,
+        aspect_ratio,
+        image_size,
+        credentials_file,
+        &mut tc,
+    )
+    .await?;
+    state.token_cache = tc;
+
+    // If targeting a document, upload to Drive and return the file ID.
+    // Google Docs insertInlineImage requires a publicly accessible URL, which
+    // enterprise orgs may block. The image is uploaded to Drive for the user
+    // to insert via the Docs UI or gws_docs_insert_image with image_url.
+    if let Some(doc_id) = document_id {
+        let file_id = upload_image_to_drive(&generated, folder_id, policy, meta, state).await?;
+        return Ok(json!({
+            "document_id": doc_id,
+            "drive_file_id": file_id,
+            "drive_url": format!("https://drive.google.com/file/d/{}/view", file_id),
+            "mime_type": generated.mime_type,
+            "note": "Image generated and uploaded to Drive. Google Docs API requires \
+                    a publicly accessible URL for inline image insertion. Insert the \
+                    image from Drive using the Google Docs UI (Insert > Image > By URL \
+                    or Drive), or use gws_docs_insert_image with a public image_url.",
+            "_mcp_content": [{
+                "type": "image",
+                "data": generated.base64_data,
+                "mimeType": generated.mime_type
+            }, {
+                "type": "text",
+                "text": format!("Generated image uploaded to Drive: https://drive.google.com/file/d/{}/view", file_id)
+            }]
+        }));
+    }
+
+    // Same limitation applies to Slides — createImage requires a publicly accessible URL
+    if let Some(pres_id) = presentation_id {
+        let file_id = upload_image_to_drive(&generated, folder_id, policy, meta, state).await?;
+        return Ok(json!({
+            "presentation_id": pres_id,
+            "drive_file_id": file_id,
+            "drive_url": format!("https://drive.google.com/file/d/{}/view", file_id),
+            "mime_type": generated.mime_type,
+            "note": "Image generated and uploaded to Drive. Google Slides API requires \
+                    a publicly accessible URL for image insertion. Insert the image from \
+                    Drive using the Slides UI (Insert > Image > By URL or Drive).",
+            "_mcp_content": [{
+                "type": "image",
+                "data": generated.base64_data,
+                "mimeType": generated.mime_type
+            }, {
+                "type": "text",
+                "text": format!("Generated image uploaded to Drive: https://drive.google.com/file/d/{}/view", file_id)
+            }]
+        }));
+    }
+
+    // Standalone: upload to Drive (no public sharing needed) and return reference
+    let file_id = upload_image_to_drive(&generated, folder_id, policy, meta, state).await?;
+    let drive_url = format!("https://drive.google.com/file/d/{}/view", file_id);
+    Ok(json!({
+        "drive_file_id": file_id,
+        "drive_url": drive_url,
+        "mime_type": generated.mime_type,
+        "prompt": prompt,
+        "_mcp_content": [
+            {
+                "type": "image",
+                "data": generated.base64_data,
+                "mimeType": generated.mime_type
+            },
+            {
+                "type": "text",
+                "text": format!("Generated image for prompt: {}\nDrive: {}", prompt, drive_url)
+            }
+        ]
+    }))
+}
+
+async fn upload_image_to_drive(
+    generated: &crate::image_gen::GeneratedImage,
+    folder_id: Option<&str>,
+    policy: &Policy,
+    meta: &RequestMeta,
+    state: &mut ServerState,
+) -> Result<String, GwsError> {
+    let drive_doc = state.get_doc("drive").await?;
+    let files_resource =
+        tools::find_resource(&drive_doc.resources, "files")
+            .ok_or_else(|| GwsError::Validation("Drive files resource not found".into()))?;
+    let create_method = files_resource
+        .methods
+        .get("create")
+        .ok_or_else(|| GwsError::Validation("Drive files.create not found".into()))?;
+
+    let mut body = json!({
+        "name": format!("generated_{}.png", chrono_free_timestamp()),
+        "mimeType": &generated.mime_type
+    });
+    if let Some(fid) = folder_id {
+        body["parents"] = json!([fid]);
+    }
+
+    let upload_args = json!({
+        "body": body,
+        "media_data": &generated.base64_data,
+        "media_content_type": &generated.mime_type
+    });
+    let mut tc = state.token_cache.take();
+    let upload_result = crate::execute::execute_tool(
+        &drive_doc, create_method, "files", "create", &upload_args,
+        "drive", policy, meta, None, false, &mut tc,
+    )
+    .await?;
+    state.token_cache = tc;
+    check_api_result(&upload_result)?;
+
+    upload_result
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .ok_or_else(|| GwsError::Validation("Drive upload did not return file ID".into()))
+}
+
+
+
+fn chrono_free_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 const MAX_BATCH_SIZE: usize = 100;
 
 async fn execute_batch(
@@ -1905,6 +2472,23 @@ async fn handle_tool_call_inner(
     if tool_name.starts_with("gws_docs_") {
         let result =
             execute_docs_helper(tool_name, arguments, policy, meta, state, dry_run).await?;
+        return Ok((result, vec![]));
+    }
+
+    if tool_name == "gws_templates" {
+        let result = execute_list_templates(policy, meta, state).await;
+        return Ok((result, vec![]));
+    }
+
+    if tool_name.starts_with("gws_slides_") {
+        let result =
+            execute_slides_helper(tool_name, arguments, policy, meta, state, dry_run).await?;
+        return Ok((result, vec![]));
+    }
+
+    if tool_name == "gws_generate_image" {
+        let result =
+            execute_generate_image(arguments, policy, meta, state, dry_run).await?;
         return Ok((result, vec![]));
     }
 

@@ -59,6 +59,8 @@ Pass `template_id` to copy named styles (fonts, colors, heading formats) from an
 }
 ```
 
+Any Google Doc can serve as a template — its named styles (heading fonts, colors, paragraph spacing) are copied to the new document. Ask the user which document to use as a style reference, or check the policy file for pre-approved template IDs.
+
 ## Option B: Individual helper tools
 
 For fine-grained control, use the helper tools one at a time. Each call targets a specific `document_id`.

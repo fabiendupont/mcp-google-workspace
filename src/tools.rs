@@ -229,6 +229,9 @@ pub async fn build_tools_list(
 
     tools.extend(crate::helpers::helper_tool_schemas());
     tools.push(crate::helpers::markdown_tool_schema());
+    tools.push(crate::slides_helpers::marp_tool_schema());
+    tools.push(crate::slides_helpers::templates_tool_schema());
+    tools.push(crate::image_gen::image_gen_tool_schema());
 
     Ok(tools)
 }

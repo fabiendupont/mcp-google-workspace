@@ -17,6 +17,19 @@ fn default_read_write() -> Access {
     Access::ReadWrite
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConstraintMode {
+    Restrict,
+    Protect,
+}
+
+impl Default for ConstraintMode {
+    fn default() -> Self {
+        ConstraintMode::Restrict
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Constraint {
     pub param: String,
@@ -24,6 +37,16 @@ pub struct Constraint {
     #[serde(default = "default_read_write")]
     pub access: Access,
     pub location: Option<String>,
+    #[serde(default)]
+    pub mode: ConstraintMode,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TemplateEntry {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -32,6 +55,8 @@ pub struct PolicyFile {
     pub server: ServerPolicy,
     #[serde(default)]
     pub services: Vec<ServicePolicy>,
+    #[serde(default)]
+    pub templates: Vec<TemplateEntry>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,6 +112,7 @@ pub struct Policy {
     pub credentials_file: Option<String>,
     pub project_id: Option<String>,
     services: HashMap<String, ServicePolicy>,
+    templates: Vec<TemplateEntry>,
 }
 
 impl Policy {
@@ -108,16 +134,52 @@ impl Policy {
                     ..Default::default()
                 })
                 .collect(),
+            templates: Vec::new(),
         };
         Self::from_policy_file(file)
     }
 
     pub(crate) fn from_policy_file(file: PolicyFile) -> Self {
-        let services = file
+        let mut services: HashMap<String, ServicePolicy> = file
             .services
             .into_iter()
             .map(|s| (s.name.clone(), s))
             .collect();
+
+        if !file.templates.is_empty() {
+            let template_ids: Vec<String> =
+                file.templates.iter().map(|t| t.id.clone()).collect();
+            let protect_params = [
+                ("drive", "fileId"),
+                ("slides", "presentationId"),
+                ("docs", "documentId"),
+            ];
+            for (svc, param) in &protect_params {
+                if let Some(svc_policy) = services.get_mut(*svc) {
+                    let already_protected: Vec<&str> = svc_policy
+                        .constraints
+                        .iter()
+                        .filter(|c| c.param == *param && c.mode == ConstraintMode::Protect)
+                        .flat_map(|c| c.values.iter().map(|v| v.as_str()))
+                        .collect();
+                    let missing: Vec<String> = template_ids
+                        .iter()
+                        .filter(|id| !already_protected.contains(&id.as_str()))
+                        .cloned()
+                        .collect();
+                    if !missing.is_empty() {
+                        svc_policy.constraints.push(Constraint {
+                            param: param.to_string(),
+                            values: missing,
+                            access: Access::ReadOnly,
+                            location: None,
+                            mode: ConstraintMode::Protect,
+                        });
+                    }
+                }
+            }
+        }
+
         Self {
             global_read_only: file.server.read_only,
             max_request_bytes: file.server.max_request_bytes,
@@ -126,7 +188,18 @@ impl Policy {
             credentials_file: file.server.credentials_file,
             project_id: file.server.project_id,
             services,
+            templates: file.templates,
         }
+    }
+
+    pub fn templates(&self) -> &[TemplateEntry] {
+        &self.templates
+    }
+
+    pub fn find_template(&self, name_or_id: &str) -> Option<&TemplateEntry> {
+        self.templates
+            .iter()
+            .find(|t| t.name == name_or_id || t.id == name_or_id)
     }
 
     pub fn is_origin_allowed(&self, origin: &str) -> bool {
@@ -233,13 +306,27 @@ impl Policy {
         }
 
         for (param, group) in &by_param {
-            let all_values: Vec<&str> = group
+            let restrict_group: Vec<&&Constraint> = group
+                .iter()
+                .filter(|c| c.mode == ConstraintMode::Restrict)
+                .collect();
+            let protect_group: Vec<&&Constraint> = group
+                .iter()
+                .filter(|c| c.mode == ConstraintMode::Protect)
+                .collect();
+
+            let all_values: Vec<&str> = restrict_group
                 .iter()
                 .flat_map(|c| c.values.iter().map(|v| v.as_str()))
                 .collect();
-            let rw_values: Vec<&str> = group
+            let rw_values: Vec<&str> = restrict_group
                 .iter()
                 .filter(|c| c.access == Access::ReadWrite)
+                .flat_map(|c| c.values.iter().map(|v| v.as_str()))
+                .collect();
+            let protect_ro_values: Vec<&str> = protect_group
+                .iter()
+                .filter(|c| c.access == Access::ReadOnly)
                 .flat_map(|c| c.values.iter().map(|v| v.as_str()))
                 .collect();
 
@@ -247,19 +334,31 @@ impl Policy {
             let is_body = location == Some("body");
 
             if is_body {
-                self.enforce_body_constraint(
-                    param,
-                    &all_values,
-                    &rw_values,
-                    is_write,
-                    params,
-                    body,
-                )?;
-                if is_write {
-                    self.enforce_parent_params(param, &all_values, &rw_values, params)?;
+                if !restrict_group.is_empty() {
+                    self.enforce_body_constraint(
+                        param,
+                        &all_values,
+                        &rw_values,
+                        is_write,
+                        params,
+                        body,
+                    )?;
+                    if is_write {
+                        self.enforce_parent_params(param, &all_values, &rw_values, params)?;
+                    }
+                }
+                if is_write && !protect_ro_values.is_empty() {
+                    self.enforce_body_protect(param, &protect_ro_values, body)?;
                 }
             } else {
-                self.enforce_param_constraint(param, &all_values, &rw_values, is_write, params)?;
+                if !restrict_group.is_empty() {
+                    self.enforce_param_constraint(
+                        param, &all_values, &rw_values, is_write, params,
+                    )?;
+                }
+                if is_write && !protect_ro_values.is_empty() {
+                    self.enforce_param_protect(param, &protect_ro_values, params)?;
+                }
             }
         }
 
@@ -396,6 +495,51 @@ impl Policy {
             )));
         }
 
+        Ok(())
+    }
+
+    fn enforce_param_protect(
+        &self,
+        param: &str,
+        protect_ro_values: &[&str],
+        params: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(), GwsError> {
+        if let Some(serde_json::Value::String(value)) = params.get(param) {
+            if protect_ro_values.contains(&value.as_str()) {
+                return Err(GwsError::Validation(format!(
+                    "'{param}' value '{value}' is protected as read-only; write operations \
+                     are not allowed. \
+                     Fix: change its access to \"read-write\" or remove the protect constraint"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn enforce_body_protect(
+        &self,
+        param: &str,
+        protect_ro_values: &[&str],
+        body: &Option<serde_json::Value>,
+    ) -> Result<(), GwsError> {
+        let body_values: Vec<&str> = body
+            .as_ref()
+            .and_then(|b| b.get(param))
+            .map(|v| match v {
+                serde_json::Value::Array(arr) => arr.iter().filter_map(|v| v.as_str()).collect(),
+                serde_json::Value::String(s) => vec![s.as_str()],
+                _ => vec![],
+            })
+            .unwrap_or_default();
+
+        for val in &body_values {
+            if protect_ro_values.contains(val) {
+                return Err(GwsError::Validation(format!(
+                    "Write denied: {param} value '{val}' is protected as read-only. \
+                     Fix: change its access to \"read-write\" or remove the protect constraint"
+                )));
+            }
+        }
         Ok(())
     }
 }
@@ -855,6 +999,174 @@ mod tests {
         assert!(!p.is_origin_allowed("https://corp.example.com.evil.com"));
     }
 
+    // -- Protect mode tests --
+
+    fn protect_policy() -> Policy {
+        let json_str = r#"{
+            "services": [{
+                "name": "slides",
+                "constraints": [
+                    { "param": "presentationId", "values": ["template-123"], "access": "read-only", "mode": "protect" }
+                ]
+            }, {
+                "name": "drive",
+                "constraints": [
+                    { "param": "parents", "values": ["protected-folder"], "access": "read-only", "location": "body", "mode": "protect" }
+                ]
+            }]
+        }"#;
+        let file: PolicyFile = serde_json::from_str(json_str).unwrap();
+        Policy::from_policy_file(file)
+    }
+
+    #[test]
+    fn test_protect_mode_allows_any_value() {
+        let p = protect_policy();
+        let method = get_method();
+        let mut params = serde_json::Map::new();
+        params.insert(
+            "presentationId".to_string(),
+            serde_json::Value::String("any-presentation".to_string()),
+        );
+        assert!(
+            p.enforce_constraints("slides", &method, &mut params, &None)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_protect_mode_allows_read_to_protected() {
+        let p = protect_policy();
+        let method = get_method();
+        let mut params = serde_json::Map::new();
+        params.insert(
+            "presentationId".to_string(),
+            serde_json::Value::String("template-123".to_string()),
+        );
+        assert!(
+            p.enforce_constraints("slides", &method, &mut params, &None)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_protect_mode_blocks_write_to_protected() {
+        let p = protect_policy();
+        let method = post_method();
+        let mut params = serde_json::Map::new();
+        params.insert(
+            "presentationId".to_string(),
+            serde_json::Value::String("template-123".to_string()),
+        );
+        let err = p
+            .enforce_constraints("slides", &method, &mut params, &None)
+            .unwrap_err();
+        assert!(err.to_string().contains("protected as read-only"));
+    }
+
+    #[test]
+    fn test_protect_mode_allows_write_to_other() {
+        let p = protect_policy();
+        let method = post_method();
+        let mut params = serde_json::Map::new();
+        params.insert(
+            "presentationId".to_string(),
+            serde_json::Value::String("my-presentation".to_string()),
+        );
+        assert!(
+            p.enforce_constraints("slides", &method, &mut params, &None)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_protect_mode_no_query_injection() {
+        let p = protect_policy();
+        let method = get_method();
+        let mut params = serde_json::Map::new();
+        p.enforce_constraints("drive", &method, &mut params, &None)
+            .unwrap();
+        assert!(params.get("q").is_none());
+    }
+
+    #[test]
+    fn test_protect_mode_body_blocks_write() {
+        let p = protect_policy();
+        let method = post_method();
+        let mut params = serde_json::Map::new();
+        let body = Some(serde_json::json!({
+            "parents": ["protected-folder"],
+            "name": "test.txt"
+        }));
+        let err = p
+            .enforce_constraints("drive", &method, &mut params, &body)
+            .unwrap_err();
+        assert!(err.to_string().contains("protected as read-only"));
+    }
+
+    #[test]
+    fn test_protect_mode_body_allows_other() {
+        let p = protect_policy();
+        let method = post_method();
+        let mut params = serde_json::Map::new();
+        let body = Some(serde_json::json!({
+            "parents": ["any-other-folder"],
+            "name": "test.txt"
+        }));
+        assert!(
+            p.enforce_constraints("drive", &method, &mut params, &body)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_mixed_restrict_and_protect() {
+        let json_str = r#"{
+            "services": [{
+                "name": "drive",
+                "constraints": [
+                    { "param": "fileId", "values": ["allowed-file"], "access": "read-write", "mode": "restrict" },
+                    { "param": "fileId", "values": ["template-file"], "access": "read-only", "mode": "protect" }
+                ]
+            }]
+        }"#;
+        let file: PolicyFile = serde_json::from_str(json_str).unwrap();
+        let p = Policy::from_policy_file(file);
+
+        // Restrict still enforces allowlist
+        let mut params = serde_json::Map::new();
+        params.insert(
+            "fileId".to_string(),
+            serde_json::Value::String("unknown".to_string()),
+        );
+        assert!(
+            p.enforce_constraints("drive", &get_method(), &mut params, &None)
+                .is_err()
+        );
+
+        // Allowed file can be written
+        let mut params = serde_json::Map::new();
+        params.insert(
+            "fileId".to_string(),
+            serde_json::Value::String("allowed-file".to_string()),
+        );
+        assert!(
+            p.enforce_constraints("drive", &post_method(), &mut params, &None)
+                .is_ok()
+        );
+
+        // Template file can be read but not written
+        let mut params = serde_json::Map::new();
+        params.insert(
+            "fileId".to_string(),
+            serde_json::Value::String("template-file".to_string()),
+        );
+        assert!(
+            p.enforce_constraints("drive", &get_method(), &mut params, &None)
+                .is_err(), // not in restrict allowlist
+        );
+    }
+
     // -- Security config tests --
 
     #[test]
@@ -889,5 +1201,47 @@ mod tests {
     fn test_no_rate_limit_by_default() {
         let p = test_policy();
         assert!(p.rate_limit_rpm.is_none());
+    }
+
+    #[test]
+    fn test_templates_parsed() {
+        let json_str = r#"{
+            "services": [{ "name": "slides" }],
+            "templates": [
+                { "id": "abc123", "name": "standard", "description": "Standard template" },
+                { "id": "def456", "name": "summit" }
+            ]
+        }"#;
+        let file: PolicyFile = serde_json::from_str(json_str).unwrap();
+        let p = Policy::from_policy_file(file);
+        assert_eq!(p.templates().len(), 2);
+        assert_eq!(p.templates()[0].name, "standard");
+        assert_eq!(p.templates()[0].id, "abc123");
+        assert_eq!(
+            p.templates()[0].description.as_deref(),
+            Some("Standard template")
+        );
+        assert!(p.templates()[1].description.is_none());
+    }
+
+    #[test]
+    fn test_find_template_by_name() {
+        let json_str = r#"{
+            "services": [{ "name": "slides" }],
+            "templates": [
+                { "id": "abc123", "name": "standard" }
+            ]
+        }"#;
+        let file: PolicyFile = serde_json::from_str(json_str).unwrap();
+        let p = Policy::from_policy_file(file);
+        assert!(p.find_template("standard").is_some());
+        assert!(p.find_template("abc123").is_some());
+        assert!(p.find_template("unknown").is_none());
+    }
+
+    #[test]
+    fn test_no_templates_by_default() {
+        let p = test_policy();
+        assert!(p.templates().is_empty());
     }
 }

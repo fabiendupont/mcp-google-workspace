@@ -1080,7 +1080,7 @@ pub fn helper_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "gws_docs_insert_image",
-            "description": "Insert an inline image into a Google Doc. Accepts a public URL, a Google Drive file ID (downloads and embeds automatically), or raw base64 image data.",
+            "description": "Insert an inline image into a Google Doc. Requires a publicly accessible image URL (Google Docs API limitation). Use gws_generate_image to create images — it uploads to Drive and returns a drive_file_id for manual insertion via the Docs UI.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
