@@ -858,8 +858,12 @@ fn generate_requests_from_blocks(blocks: &[Block], start_index: i32) -> Vec<Valu
                     }));
                 }
 
-                // table structural footprint: 2 + num_rows * (2*num_cols + 1)
-                current_index += 2 + num_rows * (2 * num_cols + 1);
+                let cell_text_len: i32 = rows.iter()
+                    .flat_map(|r| r.iter())
+                    .map(|s| s.chars().count() as i32)
+                    .sum();
+                // table structural footprint + cell text content
+                current_index += 2 + num_rows * (2 * num_cols + 1) + cell_text_len;
             }
             Block::Image { url } => {
                 flush_bullets(
@@ -1017,10 +1021,13 @@ pub fn helper_tool_schemas() -> Vec<Value> {
     vec![
         json!({
             "name": "gws_docs_insert_text",
-            "description": "Insert text into a Google Doc. IMPORTANT: set paragraph_style on EVERY call \
-                            (TITLE, SUBTITLE, HEADING_1, NORMAL_TEXT etc). Use 'sections' array to insert \
-                            multiple styled blocks in one call. For full sections with bullets, prefer \
-                            gws_docs_append_section instead.",
+            "description": "PURPOSE: Insert a single text block into a Google Doc with optional styling. \
+WHEN TO USE: Only when you need precise control over position and styling for a single text block. \
+For writing document content, prefer gws_docs_write which handles Markdown conversion automatically. \
+HOW TO USE: Set 'paragraph_style' on EVERY call (TITLE, SUBTITLE, HEADING_1, NORMAL_TEXT). \
+Without paragraph_style, text renders as unstyled default. Use 'sections' array to insert multiple \
+styled blocks in one call. \
+LIMITATIONS: Requires 'document_id'. Does not support Markdown — text is inserted literally.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1514,6 +1521,318 @@ pub fn append_section_tool_schema() -> Value {
                     "description": "Bullet list items"
                 },
                 "bullet_preset": { "type": "string", "description": "Bullet style (default BULLET_DISC_CIRCLE_SQUARE)" }
+            },
+            "required": ["document_id"]
+        }
+    })
+}
+
+pub fn build_table_populate_requests(
+    doc: &Value,
+    headers: Option<&[String]>,
+    rows: &[Vec<String>],
+) -> Vec<Value> {
+    let Some(content) = doc.pointer("/body/content").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+
+    let table_elem = content.iter().rev().find(|e| e.get("table").is_some());
+    let Some(table) = table_elem.and_then(|e| e.get("table")) else {
+        return Vec::new();
+    };
+    let Some(table_rows) = table.get("tableRows").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+
+    let all_rows: Vec<&[String]> = if let Some(h) = headers {
+        let mut v: Vec<&[String]> = vec![h];
+        v.extend(rows.iter().map(|r| r.as_slice()));
+        v
+    } else {
+        rows.iter().map(|r| r.as_slice()).collect()
+    };
+
+    struct CellInsert {
+        index: i32,
+        text: String,
+        bold: bool,
+    }
+
+    let mut inserts: Vec<CellInsert> = Vec::new();
+
+    for (row_idx, data_row) in all_rows.iter().enumerate() {
+        let Some(table_row) = table_rows.get(row_idx) else { break };
+        let Some(cells) = table_row.get("tableCells").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for (col_idx, cell_text) in data_row.iter().enumerate() {
+            let Some(cell) = cells.get(col_idx) else { break };
+            let cell_start = cell
+                .pointer("/content/0/startIndex")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0) as i32;
+            if cell_start > 0 && !cell_text.is_empty() {
+                inserts.push(CellInsert {
+                    index: cell_start,
+                    text: cell_text.clone(),
+                    bold: headers.is_some() && row_idx == 0,
+                });
+            }
+        }
+    }
+
+    inserts.sort_by(|a, b| b.index.cmp(&a.index));
+
+    let mut requests = Vec::new();
+    for insert in &inserts {
+        requests.push(json!({
+            "insertText": {
+                "text": &insert.text,
+                "location": { "index": insert.index }
+            }
+        }));
+        if insert.bold {
+            requests.push(json!({
+                "updateTextStyle": {
+                    "textStyle": { "bold": true },
+                    "fields": "bold",
+                    "range": {
+                        "startIndex": insert.index,
+                        "endIndex": insert.index + insert.text.len() as i32
+                    }
+                }
+            }));
+        }
+    }
+
+    requests
+}
+
+pub fn read_table_from_doc(doc: &Value, table_index: usize) -> Value {
+    let Some(content) = doc.pointer("/body/content").and_then(|v| v.as_array()) else {
+        return json!({ "error": "No document body" });
+    };
+
+    let tables: Vec<&Value> = content.iter().filter(|e| e.get("table").is_some()).collect();
+    let Some(table_elem) = tables.get(table_index) else {
+        return json!({ "error": format!("Table index {} not found ({} tables in doc)", table_index, tables.len()) });
+    };
+
+    let start_index = table_elem.get("startIndex").and_then(|v| v.as_i64()).unwrap_or(0);
+    let end_index = table_elem.get("endIndex").and_then(|v| v.as_i64()).unwrap_or(0);
+
+    let Some(table) = table_elem.get("table") else {
+        return json!({ "error": "Not a table element" });
+    };
+    let Some(table_rows) = table.get("tableRows").and_then(|v| v.as_array()) else {
+        return json!({ "rows": [], "startIndex": start_index, "endIndex": end_index });
+    };
+
+    let mut result_rows: Vec<Vec<String>> = Vec::new();
+    for row in table_rows {
+        let Some(cells) = row.get("tableCells").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        let mut row_data: Vec<String> = Vec::new();
+        for cell in cells {
+            let text: String = cell
+                .get("content")
+                .and_then(|v| v.as_array())
+                .map(|paras| {
+                    paras
+                        .iter()
+                        .filter_map(|p| {
+                            p.pointer("/paragraph/elements")
+                                .and_then(|v| v.as_array())
+                                .map(|elems| {
+                                    elems
+                                        .iter()
+                                        .filter_map(|e| {
+                                            e.pointer("/textRun/content")
+                                                .and_then(|v| v.as_str())
+                                        })
+                                        .collect::<String>()
+                                })
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            row_data.push(text);
+        }
+        result_rows.push(row_data);
+    }
+
+    json!({
+        "rows": result_rows,
+        "startIndex": start_index,
+        "endIndex": end_index,
+        "row_count": result_rows.len(),
+        "column_count": result_rows.first().map(|r| r.len()).unwrap_or(0)
+    })
+}
+
+pub fn insert_table_tool_schema() -> Value {
+    json!({
+        "name": "gws_docs_insert_table",
+        "title": "Insert Table",
+        "description": "PURPOSE: Insert a table into a Google Doc, optionally pre-filled with data. \
+WHEN TO USE: Use when you need a table in the document. Pass headers and rows as JSON arrays — \
+much easier than trying to write Markdown table syntax. \
+HOW TO USE: Set rows/columns for an empty table, OR pass headers + rows arrays to create a \
+pre-filled table with bold headers. \
+LIMITATIONS: Requires document_id. Maximum ~20 rows recommended for performance.",
+        "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": true },
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "document_id": {
+                    "type": "string",
+                    "description": "Google Doc ID (accepts documentId too)"
+                },
+                "headers": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Column header texts (creates a header row with bold text)"
+                },
+                "rows": {
+                    "type": "array",
+                    "items": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    },
+                    "description": "Data rows as array of arrays. Each inner array is one row."
+                },
+                "columns": {
+                    "type": "integer",
+                    "description": "Number of columns (only needed for empty table without headers)"
+                },
+                "position": {
+                    "type": "string",
+                    "enum": ["end", "start"],
+                    "description": "Where to insert (default: end)"
+                }
+            },
+            "required": ["document_id"]
+        }
+    })
+}
+
+pub fn read_table_tool_schema() -> Value {
+    json!({
+        "name": "gws_docs_read_table",
+        "title": "Read Table from Google Doc",
+        "description": "PURPOSE: Read a table's content from a Google Doc as a JSON array. \
+WHEN TO USE: Use when you need to inspect or extract table data from a document. \
+Returns rows as arrays of cell values, plus the table's character indexes. \
+HOW TO USE: Pass document_id and optionally table_index (0-based, default 0 for first table).",
+        "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true },
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "document_id": {
+                    "type": "string",
+                    "description": "Google Doc ID (accepts documentId too)"
+                },
+                "table_index": {
+                    "type": "integer",
+                    "description": "Which table to read (0-based, default 0 = first table)"
+                }
+            },
+            "required": ["document_id"]
+        }
+    })
+}
+
+pub fn docs_write_tool_schema() -> Value {
+    json!({
+        "name": "gws_docs_write",
+        "title": "Write to Google Doc",
+        "description": "PURPOSE: Write formatted content to a Google Doc. The server converts your content \
+to native Google Docs elements (headings, bold, italic, bullets, numbered lists, tables). \
+WHEN TO USE: Use this tool whenever you need to create or add content to a Google Doc. \
+This is the primary document writing tool — prefer it over lower-level tools. \
+HOW TO USE: Pass content as a Markdown string in the 'content' parameter. Use '\\n' for newlines. \
+To create a new doc, provide 'title' (and optionally 'folder_id'). \
+To write to an existing doc, provide 'document_id'. \
+LIMITATIONS: The 'content' parameter must be a string, not an object or array. \
+Requires either 'document_id' or 'title'. If neither is provided, the call will fail.",
+        "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": true },
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "document_id": {
+                    "type": "string",
+                    "description": "ID of an existing Google Doc to write to. Get this from drive files.create response or gws_docs_read. Also accepts camelCase 'documentId'."
+                },
+                "title": {
+                    "type": "string",
+                    "description": "Title for a new document. When provided without document_id, creates a new Google Doc with this name."
+                },
+                "folder_id": {
+                    "type": "string",
+                    "description": "Google Drive folder ID where the new doc should be created. Only used when creating a new doc with 'title'."
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Content to write as a string. Use Markdown syntax: # for title, ## for headings, **bold**, *italic*, - for bullets, 1. for numbered lists, | for tables. Use \\n for newlines within the string."
+                },
+                "format": {
+                    "type": "string",
+                    "enum": ["markdown", "plain"],
+                    "description": "Content format. 'markdown' (default): full Markdown parsing with headings, lists, tables, inline formatting. 'plain': minimal parsing, # lines become headings."
+                },
+                "section": {
+                    "type": "string",
+                    "description": "Name of an existing heading to find and replace. The content from that heading to the next same-level heading is replaced with the new content."
+                },
+                "position": {
+                    "type": "string",
+                    "enum": ["end", "start"],
+                    "description": "Where to insert content. 'end' (default) appends after existing content. 'start' inserts at the beginning."
+                },
+                "template_id": {
+                    "type": "string",
+                    "description": "Document ID of a template to copy named styles from (font families, sizes, colors for headings)."
+                }
+            },
+            "required": ["content"]
+        }
+    })
+}
+
+pub fn docs_read_tool_schema() -> Value {
+    json!({
+        "name": "gws_docs_read",
+        "title": "Read Google Doc",
+        "description": "PURPOSE: Read and inspect a Google Doc's content and structure. Returns a compact \
+representation that is much smaller than the raw Google Docs API response. \
+WHEN TO USE: Use this tool to inspect a document's structure before writing, to verify content \
+after writing, or to find text positions for formatting operations. \
+HOW TO USE: Pass the document_id and choose an output format. Use 'structure' (default) for a \
+compact outline with element types and indexes. Use 'markdown' to get the content as Markdown. \
+Use 'search' to find specific text and get its start/end character indexes. \
+LIMITATIONS: The 'full' output format returns the complete Google Docs JSON which can be very \
+large (60KB+). Prefer 'structure' or 'markdown' for token efficiency.",
+        "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true },
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "document_id": {
+                    "type": "string",
+                    "description": "ID of the Google Doc to read. Also accepts camelCase 'documentId'."
+                },
+                "output": {
+                    "type": "string",
+                    "enum": ["structure", "markdown", "plain", "full"],
+                    "description": "Output format. 'structure' (default): compact outline with element types (title, heading, paragraph, list_item, table, image) and character indexes. 'markdown': document content converted to Markdown. 'plain': raw text without formatting. 'full': complete Google Docs JSON (large)."
+                },
+                "search": {
+                    "type": "string",
+                    "description": "Search for this text in the document. Returns the startIndex and endIndex of the first match. Useful before calling formatting tools that need character positions."
+                }
             },
             "required": ["document_id"]
         }

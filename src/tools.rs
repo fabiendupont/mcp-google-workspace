@@ -191,13 +191,21 @@ pub async fn build_tools_list(
         }),
     ));
 
-    for v in crate::helpers::helper_tool_schemas() {
-        tools.push(tool_from_json(v));
+    if !policy.compact_schemas {
+        for v in crate::helpers::helper_tool_schemas() {
+            tools.push(tool_from_json(v));
+        }
+        tools.push(tool_from_json(crate::helpers::markdown_tool_schema()));
     }
-    tools.push(tool_from_json(crate::helpers::markdown_tool_schema()));
-    tools.push(tool_from_json(crate::helpers::structure_tool_schema()));
-    tools.push(tool_from_json(crate::helpers::find_text_tool_schema()));
-    tools.push(tool_from_json(crate::helpers::append_section_tool_schema()));
+    tools.push(tool_from_json(crate::helpers::docs_write_tool_schema()));
+    tools.push(tool_from_json(crate::helpers::docs_read_tool_schema()));
+    tools.push(tool_from_json(crate::helpers::insert_table_tool_schema()));
+    tools.push(tool_from_json(crate::helpers::read_table_tool_schema()));
+    if !policy.compact_schemas {
+        tools.push(tool_from_json(crate::helpers::structure_tool_schema()));
+        tools.push(tool_from_json(crate::helpers::find_text_tool_schema()));
+        tools.push(tool_from_json(crate::helpers::append_section_tool_schema()));
+    }
     tools.push(tool_from_json(crate::slides_helpers::marp_tool_schema()));
     tools.push(tool_from_json(crate::slides_helpers::templates_tool_schema()));
     tools.push(tool_from_json(crate::image_gen::image_gen_tool_schema()));

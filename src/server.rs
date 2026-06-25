@@ -544,8 +544,23 @@ async fn execute_docs_helper(
     state: &mut ServerState,
     dry_run: bool,
 ) -> Result<Value, GwsError> {
-    if tool_name == "gws_docs_import_markdown" {
-        return execute_docs_import_markdown(arguments, policy, meta, state, dry_run).await;
+    if tool_name == "gws_docs_import_markdown" || tool_name == "gws_docs_write" {
+        tracing::info!(
+            tool = tool_name,
+            has_content = arguments.get("content").is_some(),
+            has_markdown = arguments.get("markdown").is_some(),
+            has_document_id = arguments.get("document_id").is_some() || arguments.get("documentId").is_some(),
+            has_title = arguments.get("title").is_some(),
+            content_type = ?arguments.get("content").map(|v| v.is_string()),
+            arg_keys = ?arguments.as_object().map(|m| m.keys().collect::<Vec<_>>()),
+            "docs_write dispatch"
+        );
+        let format = if tool_name == "gws_docs_write" {
+            crate::format::parse_format(arguments.get("format").and_then(|v| v.as_str()))
+        } else {
+            crate::format::ContentFormat::Markdown
+        };
+        return execute_docs_write(arguments, policy, meta, state, dry_run, format).await;
     }
 
     let doc_id = arguments
@@ -556,7 +571,27 @@ async fn execute_docs_helper(
             format!("Missing 'document_id' in {tool_name}. Pass the Google Docs document ID.")
         ))?;
 
-    if tool_name == "gws_docs_structure" || tool_name == "gws_docs_find_text" {
+    if tool_name == "gws_docs_read_table" {
+        let doc_ref = state.get_doc("docs").await?;
+        let resource = tools::find_resource(&doc_ref.resources, "documents")
+            .ok_or_else(|| GwsError::Validation("documents resource not found".into()))?;
+        let get_method = resource.methods.get("get")
+            .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
+        let get_args = json!({"params": {"documentId": doc_id}});
+        let doc_content = crate::execute::execute_tool(
+            &doc_ref, get_method, "documents", "get", &get_args,
+            "docs", policy, meta, None, None, false, &mut state.token_cache,
+        ).await?;
+        let table_index = arguments.get("table_index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let result = helpers::read_table_from_doc(&doc_content, table_index);
+        return Ok(json!({
+            "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
+            "structuredContent": result,
+            "isError": false
+        }));
+    }
+
+    if tool_name == "gws_docs_read" || tool_name == "gws_docs_structure" || tool_name == "gws_docs_find_text" {
         let doc_ref = state.get_doc("docs").await?;
         let resource = tools::find_resource(&doc_ref.resources, "documents")
             .ok_or_else(|| GwsError::Validation("documents resource not found".into()))?;
@@ -568,23 +603,59 @@ async fn execute_docs_helper(
             "docs", policy, meta, None, None, false, &mut state.token_cache,
         ).await?;
 
-        return if tool_name == "gws_docs_structure" {
-            let structure = helpers::parse_doc_structure(&doc_content);
-            Ok(json!({
-                "content": [{ "type": "text", "text": serde_json::to_string_pretty(&structure).unwrap_or_default() }],
-                "structuredContent": structure,
+        if let Some(search) = arguments.get("search").and_then(|v| v.as_str()) {
+            let occurrence = arguments.get("occurrence").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+            let result = helpers::find_text_in_doc(&doc_content, search, occurrence);
+            return Ok(json!({
+                "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
+                "structuredContent": result,
                 "isError": false
-            }))
-        } else {
+            }));
+        }
+
+        if tool_name == "gws_docs_find_text" {
             let needle = arguments.get("text").and_then(|v| v.as_str())
                 .ok_or_else(|| GwsError::Validation("Missing 'text'".into()))?;
             let occurrence = arguments.get("occurrence").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
             let result = helpers::find_text_in_doc(&doc_content, needle, occurrence);
-            Ok(json!({
+            return Ok(json!({
                 "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
                 "structuredContent": result,
                 "isError": false
-            }))
+            }));
+        }
+
+        let output = arguments.get("output").and_then(|v| v.as_str()).unwrap_or("structure");
+        return match output {
+            "markdown" => {
+                let md = crate::format::doc_to_markdown(&doc_content);
+                Ok(json!({
+                    "content": [{ "type": "text", "text": md }],
+                    "isError": false
+                }))
+            }
+            "plain" => {
+                let plain = crate::format::doc_to_plain(&doc_content);
+                Ok(json!({
+                    "content": [{ "type": "text", "text": plain }],
+                    "isError": false
+                }))
+            }
+            "full" => {
+                let text = serde_json::to_string_pretty(&doc_content).unwrap_or_default();
+                Ok(json!({
+                    "content": [{ "type": "text", "text": text }],
+                    "isError": false
+                }))
+            }
+            _ => {
+                let structure = helpers::parse_doc_structure(&doc_content);
+                Ok(json!({
+                    "content": [{ "type": "text", "text": serde_json::to_string_pretty(&structure).unwrap_or_default() }],
+                    "structuredContent": structure,
+                    "isError": false
+                }))
+            }
         };
     }
 
@@ -691,16 +762,83 @@ async fn execute_docs_helper(
             }
         }
         "gws_docs_insert_table" => {
-            let rows = arguments
-                .get("rows")
-                .and_then(|v| v.as_u64())
-                .ok_or_else(|| GwsError::Validation("Missing 'rows'".into()))?
-                as u32;
-            let columns = arguments
-                .get("columns")
-                .and_then(|v| v.as_u64())
-                .ok_or_else(|| GwsError::Validation("Missing 'columns'".into()))?
-                as u32;
+            let headers: Option<Vec<String>> = arguments.get("headers")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect());
+            let data_rows: Option<Vec<Vec<String>>> = arguments.get("rows")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|row| {
+                    row.as_array().map(|cells| cells.iter().filter_map(|c| c.as_str().map(String::from)).collect())
+                }).collect());
+
+            if headers.is_some() || data_rows.is_some() {
+                let num_cols = headers.as_ref().map(|h| h.len())
+                    .or_else(|| data_rows.as_ref().and_then(|r| r.first().map(|row| row.len())))
+                    .unwrap_or(1) as u32;
+                let num_rows = (if headers.is_some() { 1 } else { 0 }
+                    + data_rows.as_ref().map(|r| r.len()).unwrap_or(0)) as u32;
+
+                let position = parse_position(arguments);
+                let insert_req = helpers::build_insert_table_request(num_rows, num_cols, position);
+
+                let doc_ref = state.get_doc("docs").await?;
+                let resource = tools::find_resource(&doc_ref.resources, "documents")
+                    .ok_or_else(|| GwsError::Validation("documents resource not found".into()))?;
+                let batch_method = resource.methods.get("batchUpdate")
+                    .ok_or_else(|| GwsError::Validation("batchUpdate not found".into()))?;
+
+                let create_args = json!({
+                    "params": { "documentId": doc_id },
+                    "body": { "requests": [insert_req] }
+                });
+                crate::execute::execute_tool(
+                    &doc_ref, batch_method, "documents", "batchUpdate", &create_args,
+                    "docs", policy, meta, None, None, dry_run, &mut state.token_cache,
+                ).await?;
+
+                let get_method = resource.methods.get("get")
+                    .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
+                let get_args = json!({"params": {"documentId": doc_id}});
+                let doc_content = crate::execute::execute_tool(
+                    &doc_ref, get_method, "documents", "get", &get_args,
+                    "docs", policy, meta, None, None, false, &mut state.token_cache,
+                ).await?;
+
+                let empty_rows: Vec<Vec<String>> = Vec::new();
+                let populate_reqs = helpers::build_table_populate_requests(
+                    &doc_content,
+                    headers.as_deref(),
+                    data_rows.as_ref().unwrap_or(&empty_rows),
+                );
+
+                if populate_reqs.is_empty() {
+                    return Ok(json!({
+                        "content": [{ "type": "text", "text": "Table created (no data to populate)" }],
+                        "isError": false
+                    }));
+                }
+
+                let populate_args = json!({
+                    "params": { "documentId": doc_id },
+                    "body": { "requests": populate_reqs }
+                });
+                let result = crate::execute::execute_tool(
+                    &doc_ref, batch_method, "documents", "batchUpdate", &populate_args,
+                    "docs", policy, meta, None, None, dry_run, &mut state.token_cache,
+                ).await?;
+                return Ok(json!({
+                    "content": [{ "type": "text", "text": format!("Table created and populated ({} rows, {} columns)", num_rows, num_cols) }],
+                    "structuredContent": result,
+                    "isError": false
+                }));
+            }
+
+            let rows = arguments.get("rows").and_then(|v| v.as_u64())
+                .or_else(|| arguments.get("row_count").and_then(|v| v.as_u64()))
+                .ok_or_else(|| GwsError::Validation("Missing 'rows' or 'headers'".into()))? as u32;
+            let columns = arguments.get("columns").and_then(|v| v.as_u64())
+                .or_else(|| arguments.get("column_count").and_then(|v| v.as_u64()))
+                .ok_or_else(|| GwsError::Validation("Missing 'columns' or 'headers'".into()))? as u32;
             let position = parse_position(arguments);
             vec![helpers::build_insert_table_request(rows, columns, position)]
         }
@@ -912,18 +1050,20 @@ fn find_section_range(doc: &Value, section: &str) -> Option<(i32, i32)> {
     None
 }
 
-async fn execute_docs_import_markdown(
+async fn execute_docs_write(
     arguments: &Value,
     policy: &Policy,
     meta: &RequestMeta,
     state: &mut ServerState,
     dry_run: bool,
+    format: crate::format::ContentFormat,
 ) -> Result<Value, GwsError> {
-    let markdown = arguments
-        .get("markdown")
+    let content = arguments
+        .get("content")
+        .or_else(|| arguments.get("markdown"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| GwsError::Validation(
-            "Missing 'markdown' parameter (must be a string). Pass the Markdown content to import.".into()
+            "Missing 'content' parameter (must be a string). Pass the content to write.".into()
         ))?;
 
     let doc_id_arg = arguments.get("document_id")
@@ -944,101 +1084,7 @@ async fn execute_docs_import_markdown(
         let drive_resource = tools::find_resource(&drive_doc.resources, "files")
             .ok_or_else(|| GwsError::Validation("gws_docs_import_markdown: files resource not found in drive API".into()))?;
 
-        // Check if a doc with this title already exists in the folder
-        let existing_id = if let Some(fid) = folder_id {
-            let q = format!(
-                "name='{}' and '{}' in parents and mimeType='application/vnd.google-apps.document' and trashed=false",
-                doc_title.replace('\'', "\\'"),
-                fid
-            );
-            let list_method = drive_resource
-                .methods
-                .get("list")
-                .ok_or_else(|| GwsError::Validation("list method not found".into()))?;
-            let list_args = json!({"params": {"q": q, "fields": "files(id)", "pageSize": 1}});
-            let list_result = crate::execute::execute_tool(
-                &drive_doc,
-                list_method,
-                "files",
-                "list",
-                &list_args,
-                "drive",
-                policy,
-                meta,
-                None,
-                None,
-                false,
-                &mut state.token_cache,
-            )
-            .await?;
-            list_result["files"]
-                .as_array()
-                .and_then(|f| f.first())
-                .and_then(|f| f["id"].as_str())
-                .map(|s| s.to_string())
-        } else {
-            None
-        };
-
-        if let Some(existing) = existing_id {
-            // Reuse existing doc — clear its content
-            let docs_doc = state.get_doc("docs").await?;
-            let resource = tools::find_resource(&docs_doc.resources, "documents")
-                .ok_or_else(|| GwsError::Validation("documents resource not found".into()))?;
-            let get_method = resource
-                .methods
-                .get("get")
-                .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
-            let get_args = json!({"params": {"documentId": &existing}});
-            let doc_content = crate::execute::execute_tool(
-                &docs_doc,
-                get_method,
-                "documents",
-                "get",
-                &get_args,
-                "docs",
-                policy,
-                meta,
-                None,
-                None,
-                false,
-                &mut state.token_cache,
-            )
-            .await?;
-            let end_idx = doc_content["body"]["content"]
-                .as_array()
-                .and_then(|arr| arr.last())
-                .and_then(|el| el["endIndex"].as_i64())
-                .unwrap_or(2) as i32;
-            if end_idx > 2 {
-                let batch_method = resource
-                    .methods
-                    .get("batchUpdate")
-                    .ok_or_else(|| GwsError::Validation("batchUpdate not found".into()))?;
-                let clear_args = json!({
-                    "params": {"documentId": &existing},
-                    "body": {"requests": [{"deleteContentRange": {"range": {"startIndex": 1, "endIndex": end_idx - 1}}}]}
-                });
-                let clear_result = crate::execute::execute_tool(
-                    &docs_doc,
-                    batch_method,
-                    "documents",
-                    "batchUpdate",
-                    &clear_args,
-                    "docs",
-                    policy,
-                    meta,
-                    None,
-                    None,
-                    false,
-                    &mut state.token_cache,
-                )
-                .await?;
-                check_api_result(&clear_result)?;
-            }
-            tracing::info!(doc_id = %existing, title = doc_title, "Reusing existing document");
-            (existing, false)
-        } else {
+        {
             let mut body = json!({
                 "name": doc_title,
                 "mimeType": "application/vnd.google-apps.document"
@@ -1073,6 +1119,7 @@ async fn execute_docs_import_markdown(
                     GwsError::Other(anyhow::anyhow!("No 'id' in drive.files.create response"))
                 })?
                 .to_string();
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             (new_id, true)
         }
     } else {
@@ -1182,7 +1229,9 @@ async fn execute_docs_import_markdown(
             }
         }
     } else {
-        let idx = if let Some(i) = arguments.get("index").and_then(|v| v.as_i64()) {
+        let idx = if created_new_doc {
+            1
+        } else if let Some(i) = arguments.get("index").and_then(|v| v.as_i64()) {
             i as i32
         } else {
             match arguments.get("position").and_then(|v| v.as_str()) {
@@ -1262,7 +1311,7 @@ async fn execute_docs_import_markdown(
     if let Some(delete_req) = section_delete {
         content_requests.push(delete_req);
     }
-    content_requests.extend(helpers::markdown_to_batch_requests(markdown, insert_index));
+    content_requests.extend(crate::format::content_to_batch_requests(content, format, insert_index));
 
     let content_args = json!({
         "params": { "documentId": doc_id },
@@ -1283,23 +1332,64 @@ async fn execute_docs_import_markdown(
         dry_run,
         &mut state.token_cache,
     )
-    .await
-    .map_err(|e| GwsError::Other(anyhow::anyhow!(
-        "gws_docs_import_markdown: batchUpdate failed for document '{}': {e}. \
-         Check that document_id is valid and you have write access.", doc_id
-    )))?;
-    check_api_result(&result).map_err(|e| GwsError::Other(anyhow::anyhow!(
-        "gws_docs_import_markdown: Google Docs API rejected the batch request for '{}': {e}. \
-         This may be caused by invalid indexes or malformed Markdown.", doc_id
-    )))?;
+    .await;
 
-    // Step E: include doc ID in result (especially useful when a new doc was created)
-    if created_new_doc {
-        result["created_document_id"] = json!(doc_id);
+    let failed = match &result {
+        Ok(r) => check_api_result(r).is_err(),
+        Err(_) => true,
+    };
+
+    if failed && created_new_doc {
+        if let Ok(drive_doc) = state.get_doc("drive").await {
+            if let Some(resource) = tools::find_resource(&drive_doc.resources, "files") {
+                if let Some(delete_method) = resource.methods.get("delete") {
+                    let args = json!({"params": {"fileId": &doc_id}});
+                    let _ = crate::execute::execute_tool(
+                        &drive_doc, delete_method, "files", "delete", &args,
+                        "drive", policy, meta, None, None, false, &mut state.token_cache,
+                    ).await;
+                    tracing::info!(doc_id = %doc_id, "Cleaned up empty doc after failed write");
+                }
+            }
+        }
     }
-    result["document_id"] = json!(doc_id);
 
-    Ok(result)
+    let result = match result {
+        Ok(mut r) => {
+            if let Err(e) = check_api_result(&r) {
+                return Ok(json!({
+                    "content": [{ "type": "text", "text": format!(
+                        "gws_docs_write: content insertion failed: {e}. \
+                         Try with simpler content or split into smaller sections."
+                    )}],
+                    "isError": true
+                }));
+            }
+            r["document_id"] = json!(doc_id);
+            r
+        }
+        Err(e) => {
+            return Ok(json!({
+                "content": [{ "type": "text", "text": format!(
+                    "gws_docs_write: failed: {e}. \
+                     Try with simpler content or split into smaller sections."
+                )}],
+                "isError": true
+            }));
+        }
+    };
+
+    let text = if created_new_doc {
+        format!("Content written to new document. document_id: {doc_id}")
+    } else {
+        format!("Content written to document. document_id: {doc_id}")
+    };
+
+    Ok(json!({
+        "content": [{ "type": "text", "text": text }],
+        "structuredContent": result,
+        "isError": false
+    }))
 }
 
 async fn execute_list_templates(

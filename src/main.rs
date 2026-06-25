@@ -3,6 +3,7 @@ mod auth;
 mod completions;
 mod elicitation;
 mod execute;
+mod format;
 mod handler;
 mod helpers;
 mod http;
