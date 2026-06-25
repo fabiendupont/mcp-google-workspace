@@ -15,23 +15,56 @@ use crate::policy::Policy;
 static FIELD_DEFAULTS: LazyLock<HashMap<(&str, &str, &str), &str>> = LazyLock::new(|| {
     let mut m = HashMap::new();
     // Drive
-    m.insert(("drive", "files", "list"), "files(id,name,mimeType,modifiedTime,size,parents),nextPageToken");
-    m.insert(("drive", "files", "get"), "id,name,mimeType,modifiedTime,size,parents,webViewLink");
-    m.insert(("drive", "files", "create"), "id,name,mimeType,parents,webViewLink");
-    m.insert(("drive", "files", "copy"), "id,name,mimeType,parents,webViewLink");
-    m.insert(("drive", "permissions", "list"), "permissions(id,role,type,emailAddress)");
-    m.insert(("drive", "permissions", "create"), "id,role,type,emailAddress");
+    m.insert(
+        ("drive", "files", "list"),
+        "files(id,name,mimeType,modifiedTime,size,parents),nextPageToken",
+    );
+    m.insert(
+        ("drive", "files", "get"),
+        "id,name,mimeType,modifiedTime,size,parents,webViewLink",
+    );
+    m.insert(
+        ("drive", "files", "create"),
+        "id,name,mimeType,parents,webViewLink",
+    );
+    m.insert(
+        ("drive", "files", "copy"),
+        "id,name,mimeType,parents,webViewLink",
+    );
+    m.insert(
+        ("drive", "permissions", "list"),
+        "permissions(id,role,type,emailAddress)",
+    );
+    m.insert(
+        ("drive", "permissions", "create"),
+        "id,role,type,emailAddress",
+    );
     // Docs
     m.insert(("docs", "documents", "get"), "documentId,title,body");
     m.insert(("docs", "documents", "create"), "documentId,title");
     // Slides
-    m.insert(("slides", "presentations", "get"), "presentationId,title,slides(objectId,pageElements(objectId,size,transform,shape))");
-    m.insert(("slides", "presentations", "create"), "presentationId,title");
+    m.insert(
+        ("slides", "presentations", "get"),
+        "presentationId,title,slides(objectId,pageElements(objectId,size,transform,shape))",
+    );
+    m.insert(
+        ("slides", "presentations", "create"),
+        "presentationId,title",
+    );
     // Gmail
-    m.insert(("gmail", "messages", "list"), "messages(id,threadId),nextPageToken,resultSizeEstimate");
+    m.insert(
+        ("gmail", "messages", "list"),
+        "messages(id,threadId),nextPageToken,resultSizeEstimate",
+    );
     m.insert(("gmail", "messages", "get"), "id,threadId,labelIds,snippet,payload(headers(name,value),mimeType,body),sizeEstimate,internalDate");
-    m.insert(("gmail", "threads", "list"), "threads(id,snippet),nextPageToken");
-    m.insert(("gmail", "drafts", "list"), "drafts(id,message(id,snippet)),nextPageToken");
+    m.insert(
+        ("gmail", "threads", "list"),
+        "threads(id,snippet),nextPageToken",
+    );
+    m.insert(
+        ("gmail", "drafts", "list"),
+        "drafts(id,message(id,snippet)),nextPageToken",
+    );
     m.insert(("gmail", "drafts", "create"), "id,message(id,threadId)");
     m.insert(("gmail", "labels", "list"), "labels(id,name,type)");
     // Calendar
@@ -53,13 +86,36 @@ fn b64_decode(input: &str) -> Result<Vec<u8>, GwsError> {
 }
 
 const STRIP_KEYS: &[&str] = &[
-    "kind", "etag", "selfLink", "iconLink", "thumbnailLink", "hasThumbnail",
-    "exportLinks", "capabilities", "permissionIds", "spaces", "shared",
-    "ownedByMe", "isAppAuthorized", "linkShareMetadata", "labelInfo",
-    "sha256Checksum", "md5Checksum", "originalFilename", "fullFileExtension",
-    "fileExtension", "headRevisionId", "imageMediaMetadata", "videoMediaMetadata",
-    "shortcutDetails", "resourceKey", "driveId", "teamDriveId",
-    "copyRequiresWriterPermission", "writersCanShare", "viewersCanCopyContent",
+    "kind",
+    "etag",
+    "selfLink",
+    "iconLink",
+    "thumbnailLink",
+    "hasThumbnail",
+    "exportLinks",
+    "capabilities",
+    "permissionIds",
+    "spaces",
+    "shared",
+    "ownedByMe",
+    "isAppAuthorized",
+    "linkShareMetadata",
+    "labelInfo",
+    "sha256Checksum",
+    "md5Checksum",
+    "originalFilename",
+    "fullFileExtension",
+    "fileExtension",
+    "headRevisionId",
+    "imageMediaMetadata",
+    "videoMediaMetadata",
+    "shortcutDetails",
+    "resourceKey",
+    "driveId",
+    "teamDriveId",
+    "copyRequiresWriterPermission",
+    "writersCanShare",
+    "viewersCanCopyContent",
 ];
 
 pub(crate) fn strip_google_metadata(value: &mut Value) {
@@ -377,9 +433,19 @@ pub async fn execute_tool(
                 let raw_bytes = b64_decode(b64_data)?;
                 if raw_bytes.len() > MAX_UPLOAD_BYTES {
                     let result = resumable_upload_all(
-                        doc, method, arguments, service, policy, meta, token_cache,
-                        &raw_bytes, media_content_type, peer, progress_token,
-                    ).await?;
+                        doc,
+                        method,
+                        arguments,
+                        service,
+                        policy,
+                        meta,
+                        token_cache,
+                        &raw_bytes,
+                        media_content_type,
+                        peer,
+                        progress_token,
+                    )
+                    .await?;
                     return Ok(result);
                 }
                 let (multipart_body, content_type) =
@@ -485,12 +551,16 @@ pub async fn execute_tool(
             Some(nt) if all_results.len() < page_limit as usize => {
                 page_token = Some(nt);
                 if let (Some(p), Some(pt)) = (peer, progress_token) {
-                    let _ = p.notify_progress(rmcp::model::ProgressNotificationParam::new(
-                        pt.clone(),
-                        all_results.len() as f64,
-                    ).with_total(page_limit as f64)
-                     .with_message(format!("Fetched page {}", all_results.len()))
-                    ).await;
+                    let _ = p
+                        .notify_progress(
+                            rmcp::model::ProgressNotificationParam::new(
+                                pt.clone(),
+                                all_results.len() as f64,
+                            )
+                            .with_total(page_limit as f64)
+                            .with_message(format!("Fetched page {}", all_results.len())),
+                        )
+                        .await;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
@@ -1039,9 +1109,9 @@ async fn resumable_upload_all(
     peer: Option<&rmcp::Peer<rmcp::RoleServer>>,
     progress_token: Option<&rmcp::model::ProgressToken>,
 ) -> Result<Value, GwsError> {
-    let init_result = initiate_resumable_upload(
-        doc, method, arguments, service, policy, meta, token_cache,
-    ).await?;
+    let init_result =
+        initiate_resumable_upload(doc, method, arguments, service, policy, meta, token_cache)
+            .await?;
 
     let session_uri = init_result["sessionUri"]
         .as_str()
@@ -1054,9 +1124,8 @@ async fn resumable_upload_all(
         let end = ((offset as usize) + RESUMABLE_CHUNK_SIZE).min(data.len());
         let chunk = &data[offset as usize..end];
 
-        let chunk_result = upload_chunk(
-            session_uri, chunk, offset, total_size, content_type,
-        ).await?;
+        let chunk_result =
+            upload_chunk(session_uri, chunk, offset, total_size, content_type).await?;
 
         let is_complete = chunk_result
             .get("complete")
@@ -1066,15 +1135,20 @@ async fn resumable_upload_all(
         offset = end as u64;
 
         if let (Some(p), Some(pt)) = (peer, progress_token) {
-            let _ = p.notify_progress(rmcp::model::ProgressNotificationParam::new(
-                pt.clone(), offset as f64,
-            ).with_total(total_size as f64)
-             .with_message(format!("Uploaded {} of {} bytes", offset, total_size))
-            ).await;
+            let _ = p
+                .notify_progress(
+                    rmcp::model::ProgressNotificationParam::new(pt.clone(), offset as f64)
+                        .with_total(total_size as f64)
+                        .with_message(format!("Uploaded {} of {} bytes", offset, total_size)),
+                )
+                .await;
         }
 
         if is_complete {
-            return Ok(chunk_result.get("result").cloned().unwrap_or(json!({"status": "ok"})));
+            return Ok(chunk_result
+                .get("result")
+                .cloned()
+                .unwrap_or(json!({"status": "ok"})));
         }
     }
 }
@@ -1386,7 +1460,8 @@ mod tests {
         });
 
         let result = execute_tool(
-            &doc, &method, "files", "get", &args, "drive", &policy, &meta, None, None, true, &mut None,
+            &doc, &method, "files", "get", &args, "drive", &policy, &meta, None, None, true,
+            &mut None,
         )
         .await
         .unwrap();
@@ -1425,7 +1500,8 @@ mod tests {
         });
 
         let err = execute_tool(
-            &doc, &method, "files", "create", &args, "drive", &policy, &meta, None, None, true, &mut None,
+            &doc, &method, "files", "create", &args, "drive", &policy, &meta, None, None, true,
+            &mut None,
         )
         .await;
 
@@ -1448,7 +1524,8 @@ mod tests {
         });
 
         let err = execute_tool(
-            &doc, &method, "files", "get", &args, "drive", &policy, &meta, None, None, true, &mut None,
+            &doc, &method, "files", "get", &args, "drive", &policy, &meta, None, None, true,
+            &mut None,
         )
         .await;
 
@@ -1488,7 +1565,8 @@ mod tests {
         });
 
         let result = execute_tool(
-            &doc, &method, "files", "create", &args, "drive", &policy, &meta, None, None, true, &mut None,
+            &doc, &method, "files", "create", &args, "drive", &policy, &meta, None, None, true,
+            &mut None,
         )
         .await
         .unwrap();
@@ -1525,7 +1603,8 @@ mod tests {
         });
 
         let result = execute_tool(
-            &doc, &method, "files", "get", &args, "drive", &policy, &meta, None, None, true, &mut None,
+            &doc, &method, "files", "get", &args, "drive", &policy, &meta, None, None, true,
+            &mut None,
         )
         .await
         .unwrap();
@@ -1547,7 +1626,8 @@ mod tests {
         });
 
         let result = execute_tool(
-            &doc, &method, "files", "get", &args, "drive", &policy, &meta, None, None, true, &mut None,
+            &doc, &method, "files", "get", &args, "drive", &policy, &meta, None, None, true,
+            &mut None,
         )
         .await
         .unwrap();
@@ -1568,7 +1648,8 @@ mod tests {
         });
 
         let err = execute_tool(
-            &doc, &method, "files", "get", &args, "drive", &policy, &meta, None, None, true, &mut None,
+            &doc, &method, "files", "get", &args, "drive", &policy, &meta, None, None, true,
+            &mut None,
         )
         .await;
 
@@ -1603,7 +1684,8 @@ mod tests {
         });
 
         let result = execute_tool(
-            &doc, &method, "files", "create", &args, "drive", &policy, &meta, None, None, true, &mut None,
+            &doc, &method, "files", "create", &args, "drive", &policy, &meta, None, None, true,
+            &mut None,
         )
         .await
         .unwrap();
@@ -1627,7 +1709,8 @@ mod tests {
         });
 
         let result = execute_tool(
-            &doc, &method, "files", "list", &args, "drive", &policy, &meta, None, None, true, &mut None,
+            &doc, &method, "files", "list", &args, "drive", &policy, &meta, None, None, true,
+            &mut None,
         )
         .await
         .unwrap();
@@ -1655,7 +1738,8 @@ mod tests {
         });
 
         let result = execute_tool(
-            &doc, &method, "files", "get", &args, "drive", &policy, &meta, None, None, true, &mut None,
+            &doc, &method, "files", "get", &args, "drive", &policy, &meta, None, None, true,
+            &mut None,
         )
         .await
         .unwrap();

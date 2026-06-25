@@ -27,13 +27,19 @@ pub async fn watch_resource(
     token_cache: &mut Option<crate::auth::TokenCache>,
     policy: &crate::policy::Policy,
 ) -> Result<(String, String, u64), GwsError> {
-    let channel_id = format!("gws-{:016x}", crate::execute::simple_hash(
-        format!("{service}/{resource_id}/{}", std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-        ).as_bytes()
-    ));
+    let channel_id = format!(
+        "gws-{:016x}",
+        crate::execute::simple_hash(
+            format!(
+                "{service}/{resource_id}/{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+            )
+            .as_bytes()
+        )
+    );
 
     let scopes = &["https://www.googleapis.com/auth/drive.readonly"];
     let token = crate::auth::get_token(
@@ -63,15 +69,10 @@ pub async fn watch_resource(
         .map_err(|e| GwsError::Other(anyhow::anyhow!("Watch request failed: {e}")))?;
 
     let status = response.status();
-    let body: Value = response
-        .json()
-        .await
-        .unwrap_or(json!({}));
+    let body: Value = response.json().await.unwrap_or(json!({}));
 
     if !status.is_success() {
-        let msg = body["error"]["message"]
-            .as_str()
-            .unwrap_or("Unknown error");
+        let msg = body["error"]["message"].as_str().unwrap_or("Unknown error");
         return Err(GwsError::Validation(format!(
             "Drive watch failed ({status}): {msg}"
         )));
@@ -81,9 +82,7 @@ pub async fn watch_resource(
         .as_str()
         .unwrap_or(resource_id)
         .to_string();
-    let expiration_ms = body["expiration"]
-        .as_u64()
-        .unwrap_or(0);
+    let expiration_ms = body["expiration"].as_u64().unwrap_or(0);
 
     Ok((channel_id, api_resource_id, expiration_ms))
 }
@@ -136,9 +135,7 @@ pub async fn handle_webhook(
     }
 
     let subs = subscriptions.lock().await;
-    let sub = subs
-        .values()
-        .find(|s| s.channel_id == channel_id);
+    let sub = subs.values().find(|s| s.channel_id == channel_id);
 
     if let Some(sub) = sub {
         tracing::info!(
@@ -172,7 +169,9 @@ pub fn spawn_renewal_task(
             let now = Instant::now();
             let expiring: Vec<String> = subs
                 .iter()
-                .filter(|(_, s)| s.expiration.saturating_duration_since(now) < Duration::from_secs(600))
+                .filter(|(_, s)| {
+                    s.expiration.saturating_duration_since(now) < Duration::from_secs(600)
+                })
                 .map(|(uri, _)| uri.clone())
                 .collect();
             drop(subs);

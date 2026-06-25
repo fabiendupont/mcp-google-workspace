@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use rmcp::model::*;
 use rmcp::service::RequestContext;
-use rmcp::task_manager::{OperationProcessor, OperationMessage, OperationDescriptor, ToolCallTaskResult};
+use rmcp::task_manager::{
+    OperationDescriptor, OperationMessage, OperationProcessor, ToolCallTaskResult,
+};
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock};
@@ -32,10 +34,7 @@ impl GwsHandler {
         }
     }
 
-    pub fn from_shared(
-        state: Arc<Mutex<ServerState>>,
-        policy: Arc<RwLock<Policy>>,
-    ) -> Self {
+    pub fn from_shared(state: Arc<Mutex<ServerState>>, policy: Arc<RwLock<Policy>>) -> Self {
         Self {
             state,
             policy,
@@ -72,10 +71,11 @@ impl ServerHandler for GwsHandler {
             let policy = self.policy.read().await;
             let mut st = self.state.lock().await;
             if st.tools.is_none() {
-                let tools =
-                    crate::tools::build_tools_list(&policy, &mut st.docs).await.map_err(
-                        |e| McpError::internal_error(format!("Failed to build tools: {e}"), None),
-                    )?;
+                let tools = crate::tools::build_tools_list(&policy, &mut st.docs)
+                    .await
+                    .map_err(|e| {
+                        McpError::internal_error(format!("Failed to build tools: {e}"), None)
+                    })?;
                 st.tools = Some(tools);
             }
             let tools = st.tools.as_ref().unwrap().clone();
@@ -155,16 +155,15 @@ impl ServerHandler for GwsHandler {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListResourcesResult, McpError>> + Send + '_ {
-        async move {
-            Ok(ListResourcesResult::with_all_items(vec![]))
-        }
+        async move { Ok(ListResourcesResult::with_all_items(vec![])) }
     }
 
     fn list_resource_templates(
         &self,
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<ListResourceTemplatesResult, McpError>> + Send + '_ {
+    ) -> impl std::future::Future<Output = Result<ListResourceTemplatesResult, McpError>> + Send + '_
+    {
         async move {
             let policy = self.policy.read().await;
             let st = self.state.lock().await;
@@ -181,7 +180,10 @@ impl ServerHandler for GwsHandler {
         async move {
             let parsed = crate::resources::parse_gws_uri(&request.uri).ok_or_else(|| {
                 McpError::invalid_params(
-                    format!("Invalid resource URI: {}. Expected gws://service/resource/id", request.uri),
+                    format!(
+                        "Invalid resource URI: {}. Expected gws://service/resource/id",
+                        request.uri
+                    ),
                     None,
                 )
             })?;
@@ -203,14 +205,20 @@ impl ServerHandler for GwsHandler {
             let resource = crate::tools::find_resource(&doc.resources, &parsed.resource)
                 .ok_or_else(|| {
                     McpError::invalid_params(
-                        format!("Resource '{}' not found in {}", parsed.resource, parsed.service),
+                        format!(
+                            "Resource '{}' not found in {}",
+                            parsed.resource, parsed.service
+                        ),
                         None,
                     )
                 })?;
 
             let id_param = crate::resources::id_param_name(resource, "get").ok_or_else(|| {
                 McpError::invalid_params(
-                    format!("Resource '{}' has no get method with path parameter", parsed.resource),
+                    format!(
+                        "Resource '{}' has no get method with path parameter",
+                        parsed.resource
+                    ),
                     None,
                 )
             })?;
@@ -224,12 +232,21 @@ impl ServerHandler for GwsHandler {
 
             let args = json!({ "params": { &id_param: &parsed.id } });
             let result = crate::execute::execute_tool(
-                &doc, method, &parsed.resource, "get", &args,
-                &parsed.service, &policy, &meta, None, None, false,
+                &doc,
+                method,
+                &parsed.resource,
+                "get",
+                &args,
+                &parsed.service,
+                &policy,
+                &meta,
+                None,
+                None,
+                false,
                 &mut st.token_cache,
-            ).await.map_err(|e| {
-                McpError::internal_error(format!("API call failed: {e}"), None)
-            })?;
+            )
+            .await
+            .map_err(|e| McpError::internal_error(format!("API call failed: {e}"), None))?;
 
             let text = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
             let contents = rmcp::model::ResourceContents::text(&text, &request.uri)
@@ -246,20 +263,21 @@ impl ServerHandler for GwsHandler {
         let peer = context.peer.clone();
         async move {
             let parsed = crate::resources::parse_gws_uri(&request.uri).ok_or_else(|| {
-                McpError::invalid_params(
-                    format!("Invalid resource URI: {}", request.uri),
-                    None,
-                )
+                McpError::invalid_params(format!("Invalid resource URI: {}", request.uri), None)
             })?;
 
             let mut st = self.state.lock().await;
-            let webhook_url = st.webhook_url.as_ref().ok_or_else(|| {
-                McpError::internal_error(
-                    "Subscriptions require HTTP mode with --external-url. \
+            let webhook_url = st
+                .webhook_url
+                .as_ref()
+                .ok_or_else(|| {
+                    McpError::internal_error(
+                        "Subscriptions require HTTP mode with --external-url. \
                      In stdio mode, Google cannot deliver webhook callbacks.",
-                    None,
-                )
-            })?.clone();
+                        None,
+                    )
+                })?
+                .clone();
 
             let policy = self.policy.read().await;
             if !policy.is_service_allowed(&parsed.service) {
@@ -269,18 +287,17 @@ impl ServerHandler for GwsHandler {
                 ));
             }
 
-            let (channel_id, resource_id, expiration_ms) =
-                crate::subscriptions::watch_resource(
-                    &parsed.service,
-                    &parsed.id,
-                    &webhook_url,
-                    &mut st.token_cache,
-                    &policy,
-                )
-                .await
-                .map_err(|e| {
-                    McpError::internal_error(format!("Failed to watch resource: {e}"), None)
-                })?;
+            let (channel_id, resource_id, expiration_ms) = crate::subscriptions::watch_resource(
+                &parsed.service,
+                &parsed.id,
+                &webhook_url,
+                &mut st.token_cache,
+                &policy,
+            )
+            .await
+            .map_err(|e| {
+                McpError::internal_error(format!("Failed to watch resource: {e}"), None)
+            })?;
 
             let expiration = std::time::Instant::now()
                 + std::time::Duration::from_millis(
@@ -301,7 +318,10 @@ impl ServerHandler for GwsHandler {
                 service: parsed.service,
             };
 
-            st.subscriptions.lock().await.insert(request.uri, subscription);
+            st.subscriptions
+                .lock()
+                .await
+                .insert(request.uri, subscription);
             tracing::info!("Subscription created for resource");
             Ok(())
         }
@@ -363,8 +383,7 @@ impl ServerHandler for GwsHandler {
                                 .collect(),
                         )
                     };
-                    let mut prompt =
-                        rmcp::model::Prompt::new(&p.name, Some(&p.description), args);
+                    let mut prompt = rmcp::model::Prompt::new(&p.name, Some(&p.description), args);
                     if !p.title.is_empty() {
                         prompt = prompt.with_title(&p.title);
                     }
@@ -461,16 +480,16 @@ impl ServerHandler for GwsHandler {
             });
 
             let message = OperationMessage::new(descriptor, future);
-            processor.lock().await.submit_operation(message).map_err(|e| {
-                McpError::internal_error(format!("Failed to enqueue task: {e}"), None)
-            })?;
+            processor
+                .lock()
+                .await
+                .submit_operation(message)
+                .map_err(|e| {
+                    McpError::internal_error(format!("Failed to enqueue task: {e}"), None)
+                })?;
 
-            let task = rmcp::model::Task::new(
-                task_id,
-                TaskStatus::Working,
-                now.clone(),
-                now,
-            ).with_poll_interval(2000);
+            let task = rmcp::model::Task::new(task_id, TaskStatus::Working, now.clone(), now)
+                .with_poll_interval(2000);
 
             Ok(CreateTaskResult::new(task))
         }
@@ -509,22 +528,20 @@ impl ServerHandler for GwsHandler {
                     } else {
                         TaskStatus::Failed
                     };
-                    let task = rmcp::model::Task::new(
-                        request.task_id, status, now.clone(), now,
-                    );
+                    let task = rmcp::model::Task::new(request.task_id, status, now.clone(), now);
                     return Ok(GetTaskResult { meta: None, task });
                 }
             }
 
             if proc.list_running().contains(&request.task_id) {
-                let task = rmcp::model::Task::new(
-                    request.task_id, TaskStatus::Working, now.clone(), now,
-                );
+                let task =
+                    rmcp::model::Task::new(request.task_id, TaskStatus::Working, now.clone(), now);
                 return Ok(GetTaskResult { meta: None, task });
             }
 
             Err(McpError::invalid_params(
-                format!("Task '{}' not found", request.task_id), None,
+                format!("Task '{}' not found", request.task_id),
+                None,
             ))
         }
     }
@@ -549,12 +566,14 @@ impl ServerHandler for GwsHandler {
                                 return Ok(GetTaskPayloadResult::new(value));
                             }
                             return Err(McpError::internal_error(
-                                "Unexpected task result type", None,
+                                "Unexpected task result type",
+                                None,
                             ));
                         }
                         Err(e) => {
                             return Err(McpError::internal_error(
-                                format!("Task failed: {e}"), None,
+                                format!("Task failed: {e}"),
+                                None,
                             ));
                         }
                     }
@@ -575,7 +594,10 @@ impl ServerHandler for GwsHandler {
             let now = rmcp::task_manager::current_timestamp();
             if proc.cancel_task(&request.task_id) {
                 let task = rmcp::model::Task::new(
-                    request.task_id, TaskStatus::Cancelled, now.clone(), now,
+                    request.task_id,
+                    TaskStatus::Cancelled,
+                    now.clone(),
+                    now,
                 );
                 Ok(CancelTaskResult { meta: None, task })
             } else {
@@ -594,40 +616,34 @@ fn value_to_call_tool_result(value: Value) -> CallToolResult {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let content: Vec<Content> =
-        if let Some(arr) = value.get("content").and_then(|v| v.as_array()) {
-            arr.iter()
-                .filter_map(|item| {
-                    let content_type =
-                        item.get("type").and_then(|v| v.as_str()).unwrap_or("text");
-                    match content_type {
-                        "text" => {
-                            let text =
-                                item.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                            Some(Content::text(text))
-                        }
-                        "image" => {
-                            let data =
-                                item.get("data").and_then(|v| v.as_str()).unwrap_or("");
-                            let mime = item
-                                .get("mimeType")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("image/png");
-                            Some(Content::image(data, mime))
-                        }
-                        _ => {
-                            let text = serde_json::to_string(item)
-                                .unwrap_or_else(|_| "{}".to_string());
-                            Some(Content::text(text))
-                        }
+    let content: Vec<Content> = if let Some(arr) = value.get("content").and_then(|v| v.as_array()) {
+        arr.iter()
+            .filter_map(|item| {
+                let content_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("text");
+                match content_type {
+                    "text" => {
+                        let text = item.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                        Some(Content::text(text))
                     }
-                })
-                .collect()
-        } else {
-            let text =
-                serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string());
-            vec![Content::text(text)]
-        };
+                    "image" => {
+                        let data = item.get("data").and_then(|v| v.as_str()).unwrap_or("");
+                        let mime = item
+                            .get("mimeType")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("image/png");
+                        Some(Content::image(data, mime))
+                    }
+                    _ => {
+                        let text = serde_json::to_string(item).unwrap_or_else(|_| "{}".to_string());
+                        Some(Content::text(text))
+                    }
+                }
+            })
+            .collect()
+    } else {
+        let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string());
+        vec![Content::text(text)]
+    };
 
     let structured_content = value.get("structuredContent").cloned();
 

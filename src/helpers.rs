@@ -858,7 +858,8 @@ fn generate_requests_from_blocks(blocks: &[Block], start_index: i32) -> Vec<Valu
                     }));
                 }
 
-                let cell_text_len: i32 = rows.iter()
+                let cell_text_len: i32 = rows
+                    .iter()
                     .flat_map(|r| r.iter())
                     .map(|s| s.chars().count() as i32)
                     .sum();
@@ -1022,12 +1023,12 @@ pub fn helper_tool_schemas() -> Vec<Value> {
         json!({
             "name": "gws_docs_insert_text",
             "description": "PURPOSE: Insert a single text block into a Google Doc with optional styling. \
-WHEN TO USE: Only when you need precise control over position and styling for a single text block. \
-For writing document content, prefer gws_docs_write which handles Markdown conversion automatically. \
-HOW TO USE: Set 'paragraph_style' on EVERY call (TITLE, SUBTITLE, HEADING_1, NORMAL_TEXT). \
-Without paragraph_style, text renders as unstyled default. Use 'sections' array to insert multiple \
-styled blocks in one call. \
-LIMITATIONS: Requires 'document_id'. Does not support Markdown — text is inserted literally.",
+        WHEN TO USE: Only when you need precise control over position and styling for a single text block. \
+        For writing document content, prefer gws_docs_write which handles Markdown conversion automatically. \
+        HOW TO USE: Set 'paragraph_style' on EVERY call (TITLE, SUBTITLE, HEADING_1, NORMAL_TEXT). \
+        Without paragraph_style, text renders as unstyled default. Use 'sections' array to insert multiple \
+        styled blocks in one call. \
+        LIMITATIONS: Requires 'document_id'. Does not support Markdown — text is inserted literally.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1342,7 +1343,11 @@ pub fn parse_doc_structure(doc: &Value) -> Value {
                 }));
             }
 
-            if let Some(inline_objs) = elem.get("paragraph").and_then(|p| p.get("elements")).and_then(|v| v.as_array()) {
+            if let Some(inline_objs) = elem
+                .get("paragraph")
+                .and_then(|p| p.get("elements"))
+                .and_then(|v| v.as_array())
+            {
                 for ie in inline_objs {
                     if ie.get("inlineObjectElement").is_some() {
                         elements.push(json!({
@@ -1376,10 +1381,8 @@ pub fn find_text_in_doc(doc: &Value, needle: &str, occurrence: usize) -> Value {
                                 .get("content")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("");
-                            let element_start = pe
-                                .get("startIndex")
-                                .and_then(|v| v.as_i64())
-                                .unwrap_or(0);
+                            let element_start =
+                                pe.get("startIndex").and_then(|v| v.as_i64()).unwrap_or(0);
 
                             let mut search_from = 0;
                             while let Some(pos) = text[search_from..].find(needle) {
@@ -1561,12 +1564,16 @@ pub fn build_table_populate_requests(
     let mut inserts: Vec<CellInsert> = Vec::new();
 
     for (row_idx, data_row) in all_rows.iter().enumerate() {
-        let Some(table_row) = table_rows.get(row_idx) else { break };
+        let Some(table_row) = table_rows.get(row_idx) else {
+            break;
+        };
         let Some(cells) = table_row.get("tableCells").and_then(|v| v.as_array()) else {
             continue;
         };
         for (col_idx, cell_text) in data_row.iter().enumerate() {
-            let Some(cell) = cells.get(col_idx) else { break };
+            let Some(cell) = cells.get(col_idx) else {
+                break;
+            };
             let cell_start = cell
                 .pointer("/content/0/startIndex")
                 .and_then(|v| v.as_i64())
@@ -1613,13 +1620,22 @@ pub fn read_table_from_doc(doc: &Value, table_index: usize) -> Value {
         return json!({ "error": "No document body" });
     };
 
-    let tables: Vec<&Value> = content.iter().filter(|e| e.get("table").is_some()).collect();
+    let tables: Vec<&Value> = content
+        .iter()
+        .filter(|e| e.get("table").is_some())
+        .collect();
     let Some(table_elem) = tables.get(table_index) else {
         return json!({ "error": format!("Table index {} not found ({} tables in doc)", table_index, tables.len()) });
     };
 
-    let start_index = table_elem.get("startIndex").and_then(|v| v.as_i64()).unwrap_or(0);
-    let end_index = table_elem.get("endIndex").and_then(|v| v.as_i64()).unwrap_or(0);
+    let start_index = table_elem
+        .get("startIndex")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let end_index = table_elem
+        .get("endIndex")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
 
     let Some(table) = table_elem.get("table") else {
         return json!({ "error": "Not a table element" });
@@ -1648,8 +1664,7 @@ pub fn read_table_from_doc(doc: &Value, table_index: usize) -> Value {
                                     elems
                                         .iter()
                                         .filter_map(|e| {
-                                            e.pointer("/textRun/content")
-                                                .and_then(|v| v.as_str())
+                                            e.pointer("/textRun/content").and_then(|v| v.as_str())
                                         })
                                         .collect::<String>()
                                 })
@@ -1679,11 +1694,11 @@ pub fn insert_table_tool_schema() -> Value {
         "name": "gws_docs_insert_table",
         "title": "Insert Table",
         "description": "PURPOSE: Insert a table into a Google Doc, optionally pre-filled with data. \
-WHEN TO USE: Use when you need a table in the document. Pass headers and rows as JSON arrays — \
-much easier than trying to write Markdown table syntax. \
-HOW TO USE: Set rows/columns for an empty table, OR pass headers + rows arrays to create a \
-pre-filled table with bold headers. \
-LIMITATIONS: Requires document_id. Maximum ~20 rows recommended for performance.",
+    WHEN TO USE: Use when you need a table in the document. Pass headers and rows as JSON arrays — \
+    much easier than trying to write Markdown table syntax. \
+    HOW TO USE: Set rows/columns for an empty table, OR pass headers + rows arrays to create a \
+    pre-filled table with bold headers. \
+    LIMITATIONS: Requires document_id. Maximum ~20 rows recommended for performance.",
         "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": true },
         "inputSchema": {
             "type": "object",
@@ -1725,9 +1740,9 @@ pub fn read_table_tool_schema() -> Value {
         "name": "gws_docs_read_table",
         "title": "Read Table from Google Doc",
         "description": "PURPOSE: Read a table's content from a Google Doc as a JSON array. \
-WHEN TO USE: Use when you need to inspect or extract table data from a document. \
-Returns rows as arrays of cell values, plus the table's character indexes. \
-HOW TO USE: Pass document_id and optionally table_index (0-based, default 0 for first table).",
+    WHEN TO USE: Use when you need to inspect or extract table data from a document. \
+    Returns rows as arrays of cell values, plus the table's character indexes. \
+    HOW TO USE: Pass document_id and optionally table_index (0-based, default 0 for first table).",
         "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true },
         "inputSchema": {
             "type": "object",
@@ -1751,14 +1766,14 @@ pub fn docs_write_tool_schema() -> Value {
         "name": "gws_docs_write",
         "title": "Write to Google Doc",
         "description": "PURPOSE: Write formatted content to a Google Doc. The server converts your content \
-to native Google Docs elements (headings, bold, italic, bullets, numbered lists, tables). \
-WHEN TO USE: Use this tool whenever you need to create or add content to a Google Doc. \
-This is the primary document writing tool — prefer it over lower-level tools. \
-HOW TO USE: Pass content as a Markdown string in the 'content' parameter. Use '\\n' for newlines. \
-To create a new doc, provide 'title' (and optionally 'folder_id'). \
-To write to an existing doc, provide 'document_id'. \
-LIMITATIONS: The 'content' parameter must be a string, not an object or array. \
-Requires either 'document_id' or 'title'. If neither is provided, the call will fail.",
+    to native Google Docs elements (headings, bold, italic, bullets, numbered lists, tables). \
+    WHEN TO USE: Use this tool whenever you need to create or add content to a Google Doc. \
+    This is the primary document writing tool — prefer it over lower-level tools. \
+    HOW TO USE: Pass content as a Markdown string in the 'content' parameter. Use '\\n' for newlines. \
+    To create a new doc, provide 'title' (and optionally 'folder_id'). \
+    To write to an existing doc, provide 'document_id'. \
+    LIMITATIONS: The 'content' parameter must be a string, not an object or array. \
+    Requires either 'document_id' or 'title'. If neither is provided, the call will fail.",
         "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": true },
         "inputSchema": {
             "type": "object",
@@ -1808,14 +1823,14 @@ pub fn docs_read_tool_schema() -> Value {
         "name": "gws_docs_read",
         "title": "Read Google Doc",
         "description": "PURPOSE: Read and inspect a Google Doc's content and structure. Returns a compact \
-representation that is much smaller than the raw Google Docs API response. \
-WHEN TO USE: Use this tool to inspect a document's structure before writing, to verify content \
-after writing, or to find text positions for formatting operations. \
-HOW TO USE: Pass the document_id and choose an output format. Use 'structure' (default) for a \
-compact outline with element types and indexes. Use 'markdown' to get the content as Markdown. \
-Use 'search' to find specific text and get its start/end character indexes. \
-LIMITATIONS: The 'full' output format returns the complete Google Docs JSON which can be very \
-large (60KB+). Prefer 'structure' or 'markdown' for token efficiency.",
+    representation that is much smaller than the raw Google Docs API response. \
+    WHEN TO USE: Use this tool to inspect a document's structure before writing, to verify content \
+    after writing, or to find text positions for formatting operations. \
+    HOW TO USE: Pass the document_id and choose an output format. Use 'structure' (default) for a \
+    compact outline with element types and indexes. Use 'markdown' to get the content as Markdown. \
+    Use 'search' to find specific text and get its start/end character indexes. \
+    LIMITATIONS: The 'full' output format returns the complete Google Docs JSON which can be very \
+    large (60KB+). Prefer 'structure' or 'markdown' for token efficiency.",
         "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true },
         "inputSchema": {
             "type": "object",

@@ -94,10 +94,7 @@ pub fn extract_layouts(presentation: &Value) -> Vec<TemplateLayout> {
 
         if let Some(elements) = layout.get("pageElements").and_then(|v| v.as_array()) {
             for elem in elements {
-                if let Some(ph) = elem
-                    .get("shape")
-                    .and_then(|s| s.get("placeholder"))
-                {
+                if let Some(ph) = elem.get("shape").and_then(|s| s.get("placeholder")) {
                     let ph_type = ph.get("type").and_then(|t| t.as_str()).unwrap_or("");
                     let ph_index = ph.get("index").and_then(|i| i.as_i64());
                     match ph_type {
@@ -250,7 +247,10 @@ pub fn marp_to_slide_requests(
                     }));
                 } else {
                     emit_manual_title(
-                        &title_id, &slide_id, title_text, has_body,
+                        &title_id,
+                        &slide_id,
+                        title_text,
+                        has_body,
                         &mut content_requests,
                     );
                 }
@@ -274,7 +274,10 @@ pub fn marp_to_slide_requests(
 
             if let Some(ref title_text) = slide.title {
                 emit_manual_title(
-                    &title_id, &slide_id, title_text, has_body,
+                    &title_id,
+                    &slide_id,
+                    title_text,
+                    has_body,
                     &mut content_requests,
                 );
             }
@@ -313,7 +316,16 @@ pub fn marp_to_slide_requests(
             }
         }
 
-        emit_backgrounds(slide, &slide_id, pres, &title_id, &body_id, has_title, has_body, &mut content_requests);
+        emit_backgrounds(
+            slide,
+            &slide_id,
+            pres,
+            &title_id,
+            &body_id,
+            has_title,
+            has_body,
+            &mut content_requests,
+        );
 
         if let Some(ref notes_text) = slide.speaker_notes {
             if let Some(ids) = notes_object_ids {
@@ -449,10 +461,7 @@ fn emit_images(slide: &MarpSlide, slide_id: &str, requests: &mut Vec<Value>) {
             } else {
                 let mut size = serde_json::Map::new();
                 if let Some(w) = width {
-                    size.insert(
-                        "width".to_string(),
-                        json!({ "magnitude": w, "unit": "PT" }),
-                    );
+                    size.insert("width".to_string(), json!({ "magnitude": w, "unit": "PT" }));
                 }
                 if let Some(h) = height {
                     size.insert(
@@ -475,12 +484,7 @@ fn emit_images(slide: &MarpSlide, slide_id: &str, requests: &mut Vec<Value>) {
     }
 }
 
-fn emit_tables(
-    slide: &MarpSlide,
-    slide_id: &str,
-    slide_idx: usize,
-    requests: &mut Vec<Value>,
-) {
+fn emit_tables(slide: &MarpSlide, slide_id: &str, slide_idx: usize, requests: &mut Vec<Value>) {
     let mut table_num = 0;
     for block in &slide.body_blocks {
         if let SlideBlock::Table { rows } = block {
@@ -636,14 +640,13 @@ fn needs_light_override(slide: &MarpSlide, has_template: bool) -> bool {
         return false;
     }
     let class = slide.directives.class.as_deref().unwrap_or("");
-    !matches!(class, "title" | "lead" | "section-divider" | "invert" | "closing")
-        && slide.directives.background_color.is_none()
+    !matches!(
+        class,
+        "title" | "lead" | "section-divider" | "invert" | "closing"
+    ) && slide.directives.background_color.is_none()
 }
 
-fn build_body_content(
-    blocks: &[SlideBlock],
-    target_id: &str,
-) -> (String, Vec<Value>, Vec<Value>) {
+fn build_body_content(blocks: &[SlideBlock], target_id: &str) -> (String, Vec<Value>, Vec<Value>) {
     let mut full_text = String::new();
     let mut char_count: usize = 0;
     let mut style_requests: Vec<Value> = Vec::new();
@@ -879,9 +882,11 @@ mod tests {
         let pres = parse_marp("# Hello\n\nWorld").unwrap();
         let (creates, contents) = marp_to_slide_requests(&pres, None, None);
         assert_eq!(creates.len(), 1);
-        assert!(creates[0]["createSlide"]
-            .get("slideLayoutReference")
-            .is_none());
+        assert!(
+            creates[0]["createSlide"]
+                .get("slideLayoutReference")
+                .is_none()
+        );
         assert_eq!(creates[0]["createSlide"]["objectId"], "slide_0");
 
         let title_shape = contents
@@ -907,8 +912,14 @@ mod tests {
             has_body: true,
             has_subtitle: false,
             placeholders: vec![
-                PlaceholderInfo { ph_type: "TITLE".to_string(), index: None },
-                PlaceholderInfo { ph_type: "BODY".to_string(), index: None },
+                PlaceholderInfo {
+                    ph_type: "TITLE".to_string(),
+                    index: None,
+                },
+                PlaceholderInfo {
+                    ph_type: "BODY".to_string(),
+                    index: None,
+                },
             ],
         }];
         let (creates, contents) = marp_to_slide_requests(&pres, None, Some(&layouts));
@@ -934,7 +945,10 @@ mod tests {
 
     #[test]
     fn test_title_slide_layout_selection() {
-        let pres = parse_marp("---\nmarp: true\n---\n\n<!-- _class: title -->\n\n# My Talk\n\nSubtitle here").unwrap();
+        let pres = parse_marp(
+            "---\nmarp: true\n---\n\n<!-- _class: title -->\n\n# My Talk\n\nSubtitle here",
+        )
+        .unwrap();
         let layouts = vec![
             TemplateLayout {
                 object_id: "layout_title".to_string(),
@@ -944,8 +958,14 @@ mod tests {
                 has_body: false,
                 has_subtitle: true,
                 placeholders: vec![
-                    PlaceholderInfo { ph_type: "TITLE".to_string(), index: None },
-                    PlaceholderInfo { ph_type: "SUBTITLE".to_string(), index: None },
+                    PlaceholderInfo {
+                        ph_type: "TITLE".to_string(),
+                        index: None,
+                    },
+                    PlaceholderInfo {
+                        ph_type: "SUBTITLE".to_string(),
+                        index: None,
+                    },
                 ],
             },
             TemplateLayout {
@@ -956,8 +976,14 @@ mod tests {
                 has_body: true,
                 has_subtitle: false,
                 placeholders: vec![
-                    PlaceholderInfo { ph_type: "TITLE".to_string(), index: None },
-                    PlaceholderInfo { ph_type: "BODY".to_string(), index: None },
+                    PlaceholderInfo {
+                        ph_type: "TITLE".to_string(),
+                        index: None,
+                    },
+                    PlaceholderInfo {
+                        ph_type: "BODY".to_string(),
+                        index: None,
+                    },
                 ],
             },
         ];
@@ -970,7 +996,9 @@ mod tests {
 
     #[test]
     fn test_divider_layout_selection() {
-        let pres = parse_marp("# First\n\nbody\n\n---\n\n<!-- _class: section-divider -->\n\n# Evidence").unwrap();
+        let pres =
+            parse_marp("# First\n\nbody\n\n---\n\n<!-- _class: section-divider -->\n\n# Evidence")
+                .unwrap();
         let layouts = vec![
             TemplateLayout {
                 object_id: "layout_body".to_string(),
@@ -980,8 +1008,14 @@ mod tests {
                 has_body: true,
                 has_subtitle: false,
                 placeholders: vec![
-                    PlaceholderInfo { ph_type: "TITLE".to_string(), index: None },
-                    PlaceholderInfo { ph_type: "BODY".to_string(), index: None },
+                    PlaceholderInfo {
+                        ph_type: "TITLE".to_string(),
+                        index: None,
+                    },
+                    PlaceholderInfo {
+                        ph_type: "BODY".to_string(),
+                        index: None,
+                    },
                 ],
             },
             TemplateLayout {
@@ -992,8 +1026,14 @@ mod tests {
                 has_body: false,
                 has_subtitle: true,
                 placeholders: vec![
-                    PlaceholderInfo { ph_type: "TITLE".to_string(), index: None },
-                    PlaceholderInfo { ph_type: "SUBTITLE".to_string(), index: None },
+                    PlaceholderInfo {
+                        ph_type: "TITLE".to_string(),
+                        index: None,
+                    },
+                    PlaceholderInfo {
+                        ph_type: "SUBTITLE".to_string(),
+                        index: None,
+                    },
                 ],
             },
         ];
@@ -1008,9 +1048,11 @@ mod tests {
     fn test_blank_slide_no_template() {
         let pres = parse_marp("Just some text, no heading").unwrap();
         let (creates, _) = marp_to_slide_requests(&pres, None, None);
-        assert!(creates[0]["createSlide"]
-            .get("slideLayoutReference")
-            .is_none());
+        assert!(
+            creates[0]["createSlide"]
+                .get("slideLayoutReference")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1095,8 +1137,7 @@ mod tests {
         let notes_ids = vec!["notes_shape_abc".to_string()];
         let (_, contents) = marp_to_slide_requests(&pres, Some(&notes_ids), None);
         let notes_req = contents.iter().find(|r| {
-            r.get("insertText").is_some()
-                && r["insertText"]["objectId"] == "notes_shape_abc"
+            r.get("insertText").is_some() && r["insertText"]["objectId"] == "notes_shape_abc"
         });
         assert!(notes_req.is_some());
     }

@@ -144,8 +144,7 @@ async fn handle_tool_call_inner_concurrent(
 
     if tool_name == "gws_generate_image" {
         let mut st = state.lock().await;
-        let result =
-            execute_generate_image(arguments, policy, meta, &mut st, dry_run).await?;
+        let result = execute_generate_image(arguments, policy, meta, &mut st, dry_run).await?;
         return Ok(result);
     }
 
@@ -394,8 +393,19 @@ fn format_tool_result(
 }
 
 fn build_list_summary(result: &Value) -> Option<String> {
-    for key in &["files", "messages", "threads", "items", "drafts", "labels",
-                  "permissions", "revisions", "comments", "drives", "events"] {
+    for key in &[
+        "files",
+        "messages",
+        "threads",
+        "items",
+        "drafts",
+        "labels",
+        "permissions",
+        "revisions",
+        "comments",
+        "drives",
+        "events",
+    ] {
         if let Some(arr) = result.get(*key).and_then(|v| v.as_array()) {
             let has_more = result.get("nextPageToken").is_some();
             let more_text = if has_more { " (more available)" } else { "" };
@@ -485,7 +495,10 @@ fn check_api_result(result: &Value) -> Result<(), GwsError> {
             s.to_string()
         } else {
             let code = err.get("code").and_then(|v| v.as_i64()).unwrap_or(0);
-            let message = err.get("message").and_then(|v| v.as_str()).unwrap_or("Unknown error");
+            let message = err
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown error");
             let status = err.get("status").and_then(|v| v.as_str()).unwrap_or("");
             if status.is_empty() {
                 format!("API error {code}: {message}")
@@ -567,22 +580,40 @@ async fn execute_docs_helper(
         .get("document_id")
         .or_else(|| arguments.get("documentId"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| GwsError::Validation(
-            format!("Missing 'document_id' in {tool_name}. Pass the Google Docs document ID.")
-        ))?;
+        .ok_or_else(|| {
+            GwsError::Validation(format!(
+                "Missing 'document_id' in {tool_name}. Pass the Google Docs document ID."
+            ))
+        })?;
 
     if tool_name == "gws_docs_read_table" {
         let doc_ref = state.get_doc("docs").await?;
         let resource = tools::find_resource(&doc_ref.resources, "documents")
             .ok_or_else(|| GwsError::Validation("documents resource not found".into()))?;
-        let get_method = resource.methods.get("get")
+        let get_method = resource
+            .methods
+            .get("get")
             .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
         let get_args = json!({"params": {"documentId": doc_id}});
         let doc_content = crate::execute::execute_tool(
-            &doc_ref, get_method, "documents", "get", &get_args,
-            "docs", policy, meta, None, None, false, &mut state.token_cache,
-        ).await?;
-        let table_index = arguments.get("table_index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            &doc_ref,
+            get_method,
+            "documents",
+            "get",
+            &get_args,
+            "docs",
+            policy,
+            meta,
+            None,
+            None,
+            false,
+            &mut state.token_cache,
+        )
+        .await?;
+        let table_index = arguments
+            .get("table_index")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
         let result = helpers::read_table_from_doc(&doc_content, table_index);
         return Ok(json!({
             "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
@@ -591,20 +622,39 @@ async fn execute_docs_helper(
         }));
     }
 
-    if tool_name == "gws_docs_read" || tool_name == "gws_docs_structure" || tool_name == "gws_docs_find_text" {
+    if tool_name == "gws_docs_read"
+        || tool_name == "gws_docs_structure"
+        || tool_name == "gws_docs_find_text"
+    {
         let doc_ref = state.get_doc("docs").await?;
         let resource = tools::find_resource(&doc_ref.resources, "documents")
             .ok_or_else(|| GwsError::Validation("documents resource not found".into()))?;
-        let get_method = resource.methods.get("get")
+        let get_method = resource
+            .methods
+            .get("get")
             .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
         let get_args = json!({"params": {"documentId": doc_id}});
         let doc_content = crate::execute::execute_tool(
-            &doc_ref, get_method, "documents", "get", &get_args,
-            "docs", policy, meta, None, None, false, &mut state.token_cache,
-        ).await?;
+            &doc_ref,
+            get_method,
+            "documents",
+            "get",
+            &get_args,
+            "docs",
+            policy,
+            meta,
+            None,
+            None,
+            false,
+            &mut state.token_cache,
+        )
+        .await?;
 
         if let Some(search) = arguments.get("search").and_then(|v| v.as_str()) {
-            let occurrence = arguments.get("occurrence").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+            let occurrence = arguments
+                .get("occurrence")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1) as usize;
             let result = helpers::find_text_in_doc(&doc_content, search, occurrence);
             return Ok(json!({
                 "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
@@ -614,9 +664,14 @@ async fn execute_docs_helper(
         }
 
         if tool_name == "gws_docs_find_text" {
-            let needle = arguments.get("text").and_then(|v| v.as_str())
+            let needle = arguments
+                .get("text")
+                .and_then(|v| v.as_str())
                 .ok_or_else(|| GwsError::Validation("Missing 'text'".into()))?;
-            let occurrence = arguments.get("occurrence").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+            let occurrence = arguments
+                .get("occurrence")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1) as usize;
             let result = helpers::find_text_in_doc(&doc_content, needle, occurrence);
             return Ok(json!({
                 "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
@@ -625,7 +680,10 @@ async fn execute_docs_helper(
             }));
         }
 
-        let output = arguments.get("output").and_then(|v| v.as_str()).unwrap_or("structure");
+        let output = arguments
+            .get("output")
+            .and_then(|v| v.as_str())
+            .unwrap_or("structure");
         return match output {
             "markdown" => {
                 let md = crate::format::doc_to_markdown(&doc_content);
@@ -722,7 +780,9 @@ async fn execute_docs_helper(
                 let mut all_requests = Vec::new();
                 for section in sections {
                     let text = section.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                    if text.is_empty() { continue; }
+                    if text.is_empty() {
+                        continue;
+                    }
                     let style = parse_text_style(section);
                     let has_style = style.bold.is_some()
                         || style.foreground_color.is_some()
@@ -730,7 +790,8 @@ async fn execute_docs_helper(
                         || style.font_size_pt.is_some();
                     let para = section.get("paragraph_style").and_then(|v| v.as_str());
                     all_requests.extend(helpers::build_insert_text_requests(
-                        text, Position::End,
+                        text,
+                        Position::End,
                         if has_style { Some(style) } else { None },
                         para,
                     ));
@@ -762,21 +823,41 @@ async fn execute_docs_helper(
             }
         }
         "gws_docs_insert_table" => {
-            let headers: Option<Vec<String>> = arguments.get("headers")
+            let headers: Option<Vec<String>> = arguments
+                .get("headers")
                 .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect());
-            let data_rows: Option<Vec<Vec<String>>> = arguments.get("rows")
-                .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|row| {
-                    row.as_array().map(|cells| cells.iter().filter_map(|c| c.as_str().map(String::from)).collect())
-                }).collect());
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                });
+            let data_rows: Option<Vec<Vec<String>>> =
+                arguments.get("rows").and_then(|v| v.as_array()).map(|arr| {
+                    arr.iter()
+                        .filter_map(|row| {
+                            row.as_array().map(|cells| {
+                                cells
+                                    .iter()
+                                    .filter_map(|c| c.as_str().map(String::from))
+                                    .collect()
+                            })
+                        })
+                        .collect()
+                });
 
             if headers.is_some() || data_rows.is_some() {
-                let num_cols = headers.as_ref().map(|h| h.len())
-                    .or_else(|| data_rows.as_ref().and_then(|r| r.first().map(|row| row.len())))
+                let num_cols = headers
+                    .as_ref()
+                    .map(|h| h.len())
+                    .or_else(|| {
+                        data_rows
+                            .as_ref()
+                            .and_then(|r| r.first().map(|row| row.len()))
+                    })
                     .unwrap_or(1) as u32;
                 let num_rows = (if headers.is_some() { 1 } else { 0 }
-                    + data_rows.as_ref().map(|r| r.len()).unwrap_or(0)) as u32;
+                    + data_rows.as_ref().map(|r| r.len()).unwrap_or(0))
+                    as u32;
 
                 let position = parse_position(arguments);
                 let insert_req = helpers::build_insert_table_request(num_rows, num_cols, position);
@@ -784,7 +865,9 @@ async fn execute_docs_helper(
                 let doc_ref = state.get_doc("docs").await?;
                 let resource = tools::find_resource(&doc_ref.resources, "documents")
                     .ok_or_else(|| GwsError::Validation("documents resource not found".into()))?;
-                let batch_method = resource.methods.get("batchUpdate")
+                let batch_method = resource
+                    .methods
+                    .get("batchUpdate")
                     .ok_or_else(|| GwsError::Validation("batchUpdate not found".into()))?;
 
                 let create_args = json!({
@@ -792,17 +875,41 @@ async fn execute_docs_helper(
                     "body": { "requests": [insert_req] }
                 });
                 crate::execute::execute_tool(
-                    &doc_ref, batch_method, "documents", "batchUpdate", &create_args,
-                    "docs", policy, meta, None, None, dry_run, &mut state.token_cache,
-                ).await?;
+                    &doc_ref,
+                    batch_method,
+                    "documents",
+                    "batchUpdate",
+                    &create_args,
+                    "docs",
+                    policy,
+                    meta,
+                    None,
+                    None,
+                    dry_run,
+                    &mut state.token_cache,
+                )
+                .await?;
 
-                let get_method = resource.methods.get("get")
+                let get_method = resource
+                    .methods
+                    .get("get")
                     .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
                 let get_args = json!({"params": {"documentId": doc_id}});
                 let doc_content = crate::execute::execute_tool(
-                    &doc_ref, get_method, "documents", "get", &get_args,
-                    "docs", policy, meta, None, None, false, &mut state.token_cache,
-                ).await?;
+                    &doc_ref,
+                    get_method,
+                    "documents",
+                    "get",
+                    &get_args,
+                    "docs",
+                    policy,
+                    meta,
+                    None,
+                    None,
+                    false,
+                    &mut state.token_cache,
+                )
+                .await?;
 
                 let empty_rows: Vec<Vec<String>> = Vec::new();
                 let populate_reqs = helpers::build_table_populate_requests(
@@ -823,9 +930,20 @@ async fn execute_docs_helper(
                     "body": { "requests": populate_reqs }
                 });
                 let result = crate::execute::execute_tool(
-                    &doc_ref, batch_method, "documents", "batchUpdate", &populate_args,
-                    "docs", policy, meta, None, None, dry_run, &mut state.token_cache,
-                ).await?;
+                    &doc_ref,
+                    batch_method,
+                    "documents",
+                    "batchUpdate",
+                    &populate_args,
+                    "docs",
+                    policy,
+                    meta,
+                    None,
+                    None,
+                    dry_run,
+                    &mut state.token_cache,
+                )
+                .await?;
                 return Ok(json!({
                     "content": [{ "type": "text", "text": format!("Table created and populated ({} rows, {} columns)", num_rows, num_cols) }],
                     "structuredContent": result,
@@ -833,12 +951,18 @@ async fn execute_docs_helper(
                 }));
             }
 
-            let rows = arguments.get("rows").and_then(|v| v.as_u64())
+            let rows = arguments
+                .get("rows")
+                .and_then(|v| v.as_u64())
                 .or_else(|| arguments.get("row_count").and_then(|v| v.as_u64()))
-                .ok_or_else(|| GwsError::Validation("Missing 'rows' or 'headers'".into()))? as u32;
-            let columns = arguments.get("columns").and_then(|v| v.as_u64())
+                .ok_or_else(|| GwsError::Validation("Missing 'rows' or 'headers'".into()))?
+                as u32;
+            let columns = arguments
+                .get("columns")
+                .and_then(|v| v.as_u64())
                 .or_else(|| arguments.get("column_count").and_then(|v| v.as_u64()))
-                .ok_or_else(|| GwsError::Validation("Missing 'columns' or 'headers'".into()))? as u32;
+                .ok_or_else(|| GwsError::Validation("Missing 'columns' or 'headers'".into()))?
+                as u32;
             let position = parse_position(arguments);
             vec![helpers::build_insert_table_request(rows, columns, position)]
         }
@@ -875,30 +999,57 @@ async fn execute_docs_helper(
             reqs
         }
         "gws_docs_format_text" => {
-            let (start, end) = if let Some(text_match) = arguments.get("text").and_then(|v| v.as_str()) {
+            let (start, end) = if let Some(text_match) =
+                arguments.get("text").and_then(|v| v.as_str())
+            {
                 let doc_ref = state.get_doc("docs").await?;
                 let resource = tools::find_resource(&doc_ref.resources, "documents")
                     .ok_or_else(|| GwsError::Validation("documents resource not found".into()))?;
-                let get_method = resource.methods.get("get")
+                let get_method = resource
+                    .methods
+                    .get("get")
                     .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
                 let get_args = json!({"params": {"documentId": doc_id}});
                 let doc_content = crate::execute::execute_tool(
-                    &doc_ref, get_method, "documents", "get", &get_args,
-                    "docs", policy, meta, None, None, false, &mut state.token_cache,
-                ).await?;
-                let occurrence = arguments.get("occurrence").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+                    &doc_ref,
+                    get_method,
+                    "documents",
+                    "get",
+                    &get_args,
+                    "docs",
+                    policy,
+                    meta,
+                    None,
+                    None,
+                    false,
+                    &mut state.token_cache,
+                )
+                .await?;
+                let occurrence = arguments
+                    .get("occurrence")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1) as usize;
                 let result = helpers::find_text_in_doc(&doc_content, text_match, occurrence);
                 if result.get("found") != Some(&json!(true)) {
-                    return Err(GwsError::Validation(format!("Text '{}' not found in document", text_match)));
+                    return Err(GwsError::Validation(format!(
+                        "Text '{}' not found in document",
+                        text_match
+                    )));
                 }
                 let s = result["startIndex"].as_i64().unwrap() as i32;
                 let e = result["endIndex"].as_i64().unwrap() as i32;
                 (s, e)
             } else {
-                let s = arguments.get("start_index").and_then(|v| v.as_i64())
-                    .ok_or_else(|| GwsError::Validation("Missing 'start_index' or 'text'".into()))? as i32;
-                let e = arguments.get("end_index").and_then(|v| v.as_i64())
-                    .ok_or_else(|| GwsError::Validation("Missing 'end_index'".into()))? as i32;
+                let s = arguments
+                    .get("start_index")
+                    .and_then(|v| v.as_i64())
+                    .ok_or_else(|| GwsError::Validation("Missing 'start_index' or 'text'".into()))?
+                    as i32;
+                let e = arguments
+                    .get("end_index")
+                    .and_then(|v| v.as_i64())
+                    .ok_or_else(|| GwsError::Validation("Missing 'end_index'".into()))?
+                    as i32;
                 (s, e)
             };
             let style = parse_text_style(arguments);
@@ -938,17 +1089,25 @@ async fn execute_docs_helper(
         }
         "gws_docs_append_section" => {
             let heading = arguments.get("heading").and_then(|v| v.as_str());
-            let level = arguments.get("heading_level").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+            let level = arguments
+                .get("heading_level")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1) as u32;
             let body = arguments.get("body").and_then(|v| v.as_str());
-            let items: Option<Vec<String>> = arguments.get("items")
-                .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect());
-            let preset = arguments.get("bullet_preset").and_then(|v| v.as_str())
+            let items: Option<Vec<String>> =
+                arguments
+                    .get("items")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    });
+            let preset = arguments
+                .get("bullet_preset")
+                .and_then(|v| v.as_str())
                 .unwrap_or("BULLET_DISC_CIRCLE_SQUARE");
-            helpers::build_append_section_requests(
-                heading, level, body,
-                items.as_deref(), preset,
-            )
+            helpers::build_append_section_requests(heading, level, body, items.as_deref(), preset)
         }
         _ => {
             return Err(GwsError::Validation(format!(
@@ -985,12 +1144,16 @@ async fn execute_docs_helper(
         &mut state.token_cache,
     )
     .await
-    .map_err(|e| GwsError::Other(anyhow::anyhow!(
-        "{tool_name}: batchUpdate failed for document '{doc_id}': {e}"
-    )))?;
-    check_api_result(&result).map_err(|e| GwsError::Other(anyhow::anyhow!(
-        "{tool_name}: Google Docs API error on document '{doc_id}': {e}"
-    )))?;
+    .map_err(|e| {
+        GwsError::Other(anyhow::anyhow!(
+            "{tool_name}: batchUpdate failed for document '{doc_id}': {e}"
+        ))
+    })?;
+    check_api_result(&result).map_err(|e| {
+        GwsError::Other(anyhow::anyhow!(
+            "{tool_name}: Google Docs API error on document '{doc_id}': {e}"
+        ))
+    })?;
     Ok(result)
 }
 
@@ -1062,11 +1225,14 @@ async fn execute_docs_write(
         .get("content")
         .or_else(|| arguments.get("markdown"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| GwsError::Validation(
-            "Missing 'content' parameter (must be a string). Pass the content to write.".into()
-        ))?;
+        .ok_or_else(|| {
+            GwsError::Validation(
+                "Missing 'content' parameter (must be a string). Pass the content to write.".into(),
+            )
+        })?;
 
-    let doc_id_arg = arguments.get("document_id")
+    let doc_id_arg = arguments
+        .get("document_id")
         .or_else(|| arguments.get("documentId"))
         .and_then(|v| v.as_str());
     let title = arguments.get("title").and_then(|v| v.as_str());
@@ -1079,10 +1245,17 @@ async fn execute_docs_write(
         (id.to_string(), false)
     } else if title.is_some() || folder_id.is_some() {
         let doc_title = title.unwrap_or("Untitled");
-        let drive_doc = state.get_doc("drive").await
-            .map_err(|e| GwsError::Other(anyhow::anyhow!("gws_docs_import_markdown: failed to load Drive API: {e}")))?;
-        let drive_resource = tools::find_resource(&drive_doc.resources, "files")
-            .ok_or_else(|| GwsError::Validation("gws_docs_import_markdown: files resource not found in drive API".into()))?;
+        let drive_doc = state.get_doc("drive").await.map_err(|e| {
+            GwsError::Other(anyhow::anyhow!(
+                "gws_docs_import_markdown: failed to load Drive API: {e}"
+            ))
+        })?;
+        let drive_resource =
+            tools::find_resource(&drive_doc.resources, "files").ok_or_else(|| {
+                GwsError::Validation(
+                    "gws_docs_import_markdown: files resource not found in drive API".into(),
+                )
+            })?;
 
         {
             let mut body = json!({
@@ -1125,7 +1298,8 @@ async fn execute_docs_write(
     } else {
         return Err(GwsError::Validation(
             "Either 'document_id' (existing doc) or 'title' (create new doc) is required. \
-             Pass document_id to import into an existing document, or title to create a new one.".into(),
+             Pass document_id to import into an existing document, or title to create a new one."
+                .into(),
         ));
     };
 
@@ -1311,7 +1485,11 @@ async fn execute_docs_write(
     if let Some(delete_req) = section_delete {
         content_requests.push(delete_req);
     }
-    content_requests.extend(crate::format::content_to_batch_requests(content, format, insert_index));
+    content_requests.extend(crate::format::content_to_batch_requests(
+        content,
+        format,
+        insert_index,
+    ));
 
     let content_args = json!({
         "params": { "documentId": doc_id },
@@ -1345,9 +1523,20 @@ async fn execute_docs_write(
                 if let Some(delete_method) = resource.methods.get("delete") {
                     let args = json!({"params": {"fileId": &doc_id}});
                     let _ = crate::execute::execute_tool(
-                        &drive_doc, delete_method, "files", "delete", &args,
-                        "drive", policy, meta, None, None, false, &mut state.token_cache,
-                    ).await;
+                        &drive_doc,
+                        delete_method,
+                        "files",
+                        "delete",
+                        &args,
+                        "drive",
+                        policy,
+                        meta,
+                        None,
+                        None,
+                        false,
+                        &mut state.token_cache,
+                    )
+                    .await;
                     tracing::info!(doc_id = %doc_id, "Cleaned up empty doc after failed write");
                 }
             }
@@ -1408,18 +1597,31 @@ async fn execute_list_templates(
             entry["description"] = json!(desc);
         }
         if let Ok(slides_doc) = state.get_doc("slides").await {
-            if let Some(pres_resource) = tools::find_resource(&slides_doc.resources, "presentations") {
+            if let Some(pres_resource) =
+                tools::find_resource(&slides_doc.resources, "presentations")
+            {
                 if let Some(get_method) = pres_resource.methods.get("get") {
                     let args = json!({ "params": { "presentationId": &t.id } });
                     let mut tc = state.token_cache.take();
                     if let Ok(pres_data) = crate::execute::execute_tool(
-                        &slides_doc, get_method, "presentations", "get", &args,
-                        "slides", policy, meta, None, None, false, &mut tc,
-                    ).await {
+                        &slides_doc,
+                        get_method,
+                        "presentations",
+                        "get",
+                        &args,
+                        "slides",
+                        policy,
+                        meta,
+                        None,
+                        None,
+                        false,
+                        &mut tc,
+                    )
+                    .await
+                    {
                         let layouts = crate::slides_helpers::extract_layouts(&pres_data);
-                        let layout_names: Vec<&str> = layouts.iter()
-                            .map(|l| l.display_name.as_str())
-                            .collect();
+                        let layout_names: Vec<&str> =
+                            layouts.iter().map(|l| l.display_name.as_str()).collect();
                         entry["layouts"] = json!(layout_names);
                     }
                     state.token_cache = tc;
@@ -1471,9 +1673,8 @@ async fn execute_slides_import_marp(
         .get("template")
         .or_else(|| arguments.get("template_id"))
         .and_then(|v| v.as_str());
-    let template_id = template_arg.and_then(|t| {
-        policy.find_template(t).map(|e| e.id.as_str()).or(Some(t))
-    });
+    let template_id =
+        template_arg.and_then(|t| policy.find_template(t).map(|e| e.id.as_str()).or(Some(t)));
 
     let pres = crate::marp::parse_marp(marp_source)
         .map_err(|e| GwsError::Validation(format!("Marp parse error: {e}")))?;
@@ -1489,9 +1690,8 @@ async fn execute_slides_import_marp(
         presentation_id = pid.to_string();
     } else if let Some(tmpl_id) = template_id {
         // Copy template presentation via Drive
-        let files_resource =
-            tools::find_resource(&drive_doc.resources, "files")
-                .ok_or_else(|| GwsError::Validation("Drive files resource not found".into()))?;
+        let files_resource = tools::find_resource(&drive_doc.resources, "files")
+            .ok_or_else(|| GwsError::Validation("Drive files resource not found".into()))?;
         let copy_method = files_resource
             .methods
             .get("copy")
@@ -1512,8 +1712,18 @@ async fn execute_slides_import_marp(
 
         let mut tc = state.token_cache.take();
         let copy_result = crate::execute::execute_tool(
-            &drive_doc, copy_method, "files", "copy", &copy_args,
-            "drive", policy, meta, None, None, dry_run, &mut tc,
+            &drive_doc,
+            copy_method,
+            "files",
+            "copy",
+            &copy_args,
+            "drive",
+            policy,
+            meta,
+            None,
+            None,
+            dry_run,
+            &mut tc,
         )
         .await?;
         state.token_cache = tc;
@@ -1526,9 +1736,8 @@ async fn execute_slides_import_marp(
         created_new = true;
     } else if let Some(t) = title {
         // Search for existing presentation or create new one
-        let files_resource =
-            tools::find_resource(&drive_doc.resources, "files")
-                .ok_or_else(|| GwsError::Validation("Drive files resource not found".into()))?;
+        let files_resource = tools::find_resource(&drive_doc.resources, "files")
+            .ok_or_else(|| GwsError::Validation("Drive files resource not found".into()))?;
 
         let mut query = format!(
             "name = '{}' and mimeType = 'application/vnd.google-apps.presentation' and trashed = false",
@@ -1546,8 +1755,18 @@ async fn execute_slides_import_marp(
         let list_args = json!({ "params": { "q": query } });
         let mut tc = state.token_cache.take();
         let list_result = crate::execute::execute_tool(
-            &drive_doc, list_method, "files", "list", &list_args,
-            "drive", policy, meta, None, None, dry_run, &mut tc,
+            &drive_doc,
+            list_method,
+            "files",
+            "list",
+            &list_args,
+            "drive",
+            policy,
+            meta,
+            None,
+            None,
+            dry_run,
+            &mut tc,
         )
         .await?;
         state.token_cache = tc;
@@ -1567,12 +1786,15 @@ async fn execute_slides_import_marp(
         } else {
             // Create new presentation
             let presentations_resource =
-                tools::find_resource(&slides_doc.resources, "presentations")
-                    .ok_or_else(|| GwsError::Validation("Slides presentations resource not found".into()))?;
+                tools::find_resource(&slides_doc.resources, "presentations").ok_or_else(|| {
+                    GwsError::Validation("Slides presentations resource not found".into())
+                })?;
             let create_method = presentations_resource
                 .methods
                 .get("create")
-                .ok_or_else(|| GwsError::Validation("Slides presentations.create not found".into()))?;
+                .ok_or_else(|| {
+                    GwsError::Validation("Slides presentations.create not found".into())
+                })?;
 
             let create_args = json!({
                 "body": { "title": t }
@@ -1580,8 +1802,18 @@ async fn execute_slides_import_marp(
 
             let mut tc = state.token_cache.take();
             let create_result = crate::execute::execute_tool(
-                &slides_doc, create_method, "presentations", "create", &create_args,
-                "slides", policy, meta, None, None, dry_run, &mut tc,
+                &slides_doc,
+                create_method,
+                "presentations",
+                "create",
+                &create_args,
+                "slides",
+                policy,
+                meta,
+                None,
+                None,
+                dry_run,
+                &mut tc,
             )
             .await?;
             state.token_cache = tc;
@@ -1609,9 +1841,10 @@ async fn execute_slides_import_marp(
 
     // Step B: Fetch presentation, extract layouts, collect existing slide IDs
     let (template_layouts, existing_slide_ids) = {
-        let presentations_resource =
-            tools::find_resource(&slides_doc.resources, "presentations")
-                .ok_or_else(|| GwsError::Validation("Slides presentations resource not found".into()))?;
+        let presentations_resource = tools::find_resource(&slides_doc.resources, "presentations")
+            .ok_or_else(|| {
+            GwsError::Validation("Slides presentations resource not found".into())
+        })?;
         let get_method = presentations_resource
             .methods
             .get("get")
@@ -1620,8 +1853,18 @@ async fn execute_slides_import_marp(
         let get_args = json!({ "params": { "presentationId": &presentation_id } });
         let mut tc = state.token_cache.take();
         let get_result = crate::execute::execute_tool(
-            &slides_doc, get_method, "presentations", "get", &get_args,
-            "slides", policy, meta, None, None, false, &mut tc,
+            &slides_doc,
+            get_method,
+            "presentations",
+            "get",
+            &get_args,
+            "slides",
+            policy,
+            meta,
+            None,
+            None,
+            false,
+            &mut tc,
         )
         .await?;
         state.token_cache = tc;
@@ -1638,7 +1881,11 @@ async fn execute_slides_import_marp(
             .and_then(|v| v.as_array())
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|s| s.get("objectId").and_then(|id| id.as_str()).map(String::from))
+                    .filter_map(|s| {
+                        s.get("objectId")
+                            .and_then(|id| id.as_str())
+                            .map(String::from)
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -1655,9 +1902,8 @@ async fn execute_slides_import_marp(
     let (create_reqs, mut content_reqs) =
         crate::slides_helpers::marp_to_slide_requests(&pres, None, layouts_ref);
 
-    let presentations_resource =
-        tools::find_resource(&slides_doc.resources, "presentations")
-            .ok_or_else(|| GwsError::Validation("Slides presentations resource not found".into()))?;
+    let presentations_resource = tools::find_resource(&slides_doc.resources, "presentations")
+        .ok_or_else(|| GwsError::Validation("Slides presentations resource not found".into()))?;
     let batch_method = presentations_resource
         .methods
         .get("batchUpdate")
@@ -1677,8 +1923,18 @@ async fn execute_slides_import_marp(
         });
         let mut tc = state.token_cache.take();
         let cleanup_result = crate::execute::execute_tool(
-            &slides_doc, batch_method, "presentations", "batchUpdate", &batch_args,
-            "slides", policy, meta, None, None, false, &mut tc,
+            &slides_doc,
+            batch_method,
+            "presentations",
+            "batchUpdate",
+            &batch_args,
+            "slides",
+            policy,
+            meta,
+            None,
+            None,
+            false,
+            &mut tc,
         )
         .await?;
         state.token_cache = tc;
@@ -1700,8 +1956,18 @@ async fn execute_slides_import_marp(
         });
         let mut tc = state.token_cache.take();
         let create_result = crate::execute::execute_tool(
-            &slides_doc, batch_method, "presentations", "batchUpdate", &batch_args,
-            "slides", policy, meta, None, None, false, &mut tc,
+            &slides_doc,
+            batch_method,
+            "presentations",
+            "batchUpdate",
+            &batch_args,
+            "slides",
+            policy,
+            meta,
+            None,
+            None,
+            false,
+            &mut tc,
         )
         .await?;
         state.token_cache = tc;
@@ -1711,9 +1977,10 @@ async fn execute_slides_import_marp(
     // Step D: Fetch presentation to get speaker notes object IDs
     let has_notes = pres.slides.iter().any(|s| s.speaker_notes.is_some());
     if has_notes {
-        let presentations_resource =
-            tools::find_resource(&slides_doc.resources, "presentations")
-                .ok_or_else(|| GwsError::Validation("Slides presentations resource not found".into()))?;
+        let presentations_resource = tools::find_resource(&slides_doc.resources, "presentations")
+            .ok_or_else(|| {
+            GwsError::Validation("Slides presentations resource not found".into())
+        })?;
         let get_method = presentations_resource
             .methods
             .get("get")
@@ -1722,8 +1989,18 @@ async fn execute_slides_import_marp(
         let get_args = json!({ "params": { "presentationId": &presentation_id } });
         let mut tc = state.token_cache.take();
         let get_result = crate::execute::execute_tool(
-            &slides_doc, get_method, "presentations", "get", &get_args,
-            "slides", policy, meta, None, None, false, &mut tc,
+            &slides_doc,
+            get_method,
+            "presentations",
+            "get",
+            &get_args,
+            "slides",
+            policy,
+            meta,
+            None,
+            None,
+            false,
+            &mut tc,
         )
         .await?;
         state.token_cache = tc;
@@ -1762,9 +2039,10 @@ async fn execute_slides_import_marp(
 
     // Step E: Execute pass 2 — content, styling, backgrounds, notes
     if !content_reqs.is_empty() {
-        let presentations_resource =
-            tools::find_resource(&slides_doc.resources, "presentations")
-                .ok_or_else(|| GwsError::Validation("Slides presentations resource not found".into()))?;
+        let presentations_resource = tools::find_resource(&slides_doc.resources, "presentations")
+            .ok_or_else(|| {
+            GwsError::Validation("Slides presentations resource not found".into())
+        })?;
         let batch_method = presentations_resource
             .methods
             .get("batchUpdate")
@@ -1776,8 +2054,18 @@ async fn execute_slides_import_marp(
         });
         let mut tc = state.token_cache.take();
         let result = crate::execute::execute_tool(
-            &slides_doc, batch_method, "presentations", "batchUpdate", &batch_args,
-            "slides", policy, meta, None, None, false, &mut tc,
+            &slides_doc,
+            batch_method,
+            "presentations",
+            "batchUpdate",
+            &batch_args,
+            "slides",
+            policy,
+            meta,
+            None,
+            None,
+            false,
+            &mut tc,
         )
         .await?;
         state.token_cache = tc;
@@ -1821,8 +2109,14 @@ async fn execute_generate_image(
 
     let aspect_ratio = arguments.get("aspect_ratio").and_then(|v| v.as_str());
     let image_size = arguments.get("image_size").and_then(|v| v.as_str());
-    let document_id = arguments.get("document_id").or_else(|| arguments.get("documentId")).and_then(|v| v.as_str());
-    let presentation_id = arguments.get("presentation_id").or_else(|| arguments.get("presentationId")).and_then(|v| v.as_str());
+    let document_id = arguments
+        .get("document_id")
+        .or_else(|| arguments.get("documentId"))
+        .and_then(|v| v.as_str());
+    let presentation_id = arguments
+        .get("presentation_id")
+        .or_else(|| arguments.get("presentationId"))
+        .and_then(|v| v.as_str());
     let folder_id = arguments.get("folder_id").and_then(|v| v.as_str());
 
     if dry_run {
@@ -1927,9 +2221,8 @@ async fn upload_image_to_drive(
     state: &mut ServerState,
 ) -> Result<String, GwsError> {
     let drive_doc = state.get_doc("drive").await?;
-    let files_resource =
-        tools::find_resource(&drive_doc.resources, "files")
-            .ok_or_else(|| GwsError::Validation("Drive files resource not found".into()))?;
+    let files_resource = tools::find_resource(&drive_doc.resources, "files")
+        .ok_or_else(|| GwsError::Validation("Drive files resource not found".into()))?;
     let create_method = files_resource
         .methods
         .get("create")
@@ -1950,8 +2243,18 @@ async fn upload_image_to_drive(
     });
     let mut tc = state.token_cache.take();
     let upload_result = crate::execute::execute_tool(
-        &drive_doc, create_method, "files", "create", &upload_args,
-        "drive", policy, meta, None, None, false, &mut tc,
+        &drive_doc,
+        create_method,
+        "files",
+        "create",
+        &upload_args,
+        "drive",
+        policy,
+        meta,
+        None,
+        None,
+        false,
+        &mut tc,
     )
     .await?;
     state.token_cache = tc;
@@ -1963,8 +2266,6 @@ async fn upload_image_to_drive(
         .map(String::from)
         .ok_or_else(|| GwsError::Validation("Drive upload did not return file ID".into()))
 }
-
-
 
 fn chrono_free_timestamp() -> u64 {
     std::time::SystemTime::now()
@@ -2151,7 +2452,6 @@ fn is_policy_denial(msg: &str) -> bool {
         || msg.contains("is read-only;")
         || msg.contains("Write denied")
 }
-
 
 fn explain_request(
     service: &str,
@@ -2441,7 +2741,6 @@ pub(crate) fn server_instructions() -> &'static str {
      Each enabled Google service is exposed as a tool."
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2505,7 +2804,6 @@ mod tests {
         let args = json!({ "download_chunk_offset": 0 });
         assert!(handle_task_chunk("t1", &args, &mut state).await.is_err());
     }
-
 
     #[test]
     fn test_chunk_response_shape() {

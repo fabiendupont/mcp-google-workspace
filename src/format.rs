@@ -79,16 +79,24 @@ fn plain_to_batch_requests(content: &str, start_index: i32) -> Vec<Value> {
 
 fn strip_plain_prefix(line: &str) -> (&str, Option<&'static str>) {
     if let Some(rest) = line.strip_prefix("#### ") {
-        if !rest.is_empty() { return (rest, Some("HEADING_3")); }
+        if !rest.is_empty() {
+            return (rest, Some("HEADING_3"));
+        }
     }
     if let Some(rest) = line.strip_prefix("### ") {
-        if !rest.is_empty() { return (rest, Some("HEADING_2")); }
+        if !rest.is_empty() {
+            return (rest, Some("HEADING_2"));
+        }
     }
     if let Some(rest) = line.strip_prefix("## ") {
-        if !rest.is_empty() { return (rest, Some("HEADING_1")); }
+        if !rest.is_empty() {
+            return (rest, Some("HEADING_1"));
+        }
     }
     if let Some(rest) = line.strip_prefix("# ") {
-        if !rest.is_empty() { return (rest, Some("TITLE")); }
+        if !rest.is_empty() {
+            return (rest, Some("TITLE"));
+        }
     }
     (line, None)
 }
@@ -117,10 +125,7 @@ pub fn doc_to_markdown(doc: &Value) -> String {
             if let Some(elements) = paragraph.get("elements").and_then(|v| v.as_array()) {
                 for pe in elements {
                     if let Some(tr) = pe.get("textRun") {
-                        let content = tr
-                            .get("content")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
+                        let content = tr.get("content").and_then(|v| v.as_str()).unwrap_or("");
                         let raw = content.trim_end_matches('\n');
                         if raw.is_empty() {
                             continue;
@@ -255,17 +260,21 @@ mod tests {
         let reqs = plain_to_batch_requests("# Title\nBody text\n", 1);
         assert!(reqs.len() >= 3);
         assert_eq!(reqs[0]["insertText"]["text"], "Title\n");
-        let has_title_style = reqs.iter().any(|r|
+        let has_title_style = reqs.iter().any(|r| {
             r.pointer("/updateParagraphStyle/paragraphStyle/namedStyleType")
-                .and_then(|v| v.as_str()) == Some("TITLE")
-        );
+                .and_then(|v| v.as_str())
+                == Some("TITLE")
+        });
         assert!(has_title_style);
     }
 
     #[test]
     fn test_detect_plain_style() {
         assert_eq!(strip_plain_prefix("# Title"), ("Title", Some("TITLE")));
-        assert_eq!(strip_plain_prefix("## Heading"), ("Heading", Some("HEADING_1")));
+        assert_eq!(
+            strip_plain_prefix("## Heading"),
+            ("Heading", Some("HEADING_1"))
+        );
         assert_eq!(strip_plain_prefix("### Sub"), ("Sub", Some("HEADING_2")));
         assert_eq!(strip_plain_prefix("Normal text"), ("Normal text", None));
     }

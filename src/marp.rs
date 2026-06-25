@@ -116,7 +116,9 @@ fn split_slides(input: &str) -> Vec<&str> {
                 let sep_end = i + 3;
                 let is_sep = sep_end >= len
                     || bytes[sep_end] == b'\n'
-                    || (bytes[sep_end] == b'\r' && sep_end + 1 < len && bytes[sep_end + 1] == b'\n');
+                    || (bytes[sep_end] == b'\r'
+                        && sep_end + 1 < len
+                        && bytes[sep_end + 1] == b'\n');
                 if is_sep {
                     let section_end = if i > 0 { i - 1 } else { i };
                     sections.push(&input[start..section_end]);
@@ -154,9 +156,9 @@ fn extract_frontmatter(first_section: &str) -> (MarpFrontmatter, &str) {
     }
 
     let after_first = &trimmed[3..];
-    let after_first = after_first.strip_prefix('\n').unwrap_or(
-        after_first.strip_prefix("\r\n").unwrap_or(after_first),
-    );
+    let after_first = after_first
+        .strip_prefix('\n')
+        .unwrap_or(after_first.strip_prefix("\r\n").unwrap_or(after_first));
 
     if let Some(end_pos) = after_first.find("\n---") {
         let yaml = &after_first[..end_pos];
@@ -539,8 +541,7 @@ fn parse_slide_body(content: &str) -> (Option<String>, Vec<SlideBlock>) {
                 para_char_count += s.chars().count();
                 let range_end = para_char_count;
 
-                let has_style =
-                    bold_depth > 0 || italic_depth > 0 || !link_url_stack.is_empty();
+                let has_style = bold_depth > 0 || italic_depth > 0 || !link_url_stack.is_empty();
 
                 if has_style && range_start < range_end {
                     para_styles.push(MarpInlineStyle {
@@ -680,9 +681,7 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         match &blocks[0] {
             SlideBlock::Image {
-                url,
-                is_background,
-                ..
+                url, is_background, ..
             } => {
                 assert_eq!(url, "https://example.com/bg.jpg");
                 assert!(is_background);
@@ -848,10 +847,12 @@ Remember to explain the architecture diagram
         assert_eq!(pres.slides.len(), 2);
 
         assert_eq!(pres.slides[0].title.as_deref(), Some("Welcome"));
-        assert!(pres.slides[0]
-            .body_blocks
-            .iter()
-            .any(|b| matches!(b, SlideBlock::BulletList { .. })));
+        assert!(
+            pres.slides[0]
+                .body_blocks
+                .iter()
+                .any(|b| matches!(b, SlideBlock::BulletList { .. }))
+        );
 
         assert_eq!(pres.slides[1].title.as_deref(), Some("Architecture"));
         assert_eq!(

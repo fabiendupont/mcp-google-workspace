@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use rmcp::model::{ArgumentInfo, CompletionInfo, Reference};
 use google_workspace::discovery::RestDescription;
+use rmcp::model::{ArgumentInfo, CompletionInfo, Reference};
 
 use crate::policy::Policy;
 
@@ -19,11 +19,7 @@ pub fn complete_request(
     }
 }
 
-fn complete_resource_uri(
-    _uri: &str,
-    argument: &ArgumentInfo,
-    policy: &Policy,
-) -> CompletionInfo {
+fn complete_resource_uri(_uri: &str, argument: &ArgumentInfo, policy: &Policy) -> CompletionInfo {
     if argument.name == "uri" {
         let prefix = &argument.value;
         let services = policy.allowed_services();
@@ -68,8 +64,15 @@ fn complete_prompt_arg(
         (_, "paragraph_style") => prefix_filter(
             &argument.value,
             &[
-                "TITLE", "SUBTITLE", "HEADING_1", "HEADING_2", "HEADING_3",
-                "HEADING_4", "HEADING_5", "HEADING_6", "NORMAL_TEXT",
+                "TITLE",
+                "SUBTITLE",
+                "HEADING_1",
+                "HEADING_2",
+                "HEADING_3",
+                "HEADING_4",
+                "HEADING_5",
+                "HEADING_6",
+                "NORMAL_TEXT",
             ],
         ),
         _ => CompletionInfo::default(),
@@ -114,8 +117,12 @@ mod tests {
 
     #[test]
     fn test_complete_resource_uri_empty() {
-        let policy = crate::policy::Policy::from_services(&["drive".to_string(), "docs".to_string()]);
-        let arg = ArgumentInfo { name: "uri".to_string(), value: "".to_string() };
+        let policy =
+            crate::policy::Policy::from_services(&["drive".to_string(), "docs".to_string()]);
+        let arg = ArgumentInfo {
+            name: "uri".to_string(),
+            value: "".to_string(),
+        };
         let result = complete_resource_uri("", &arg, &policy);
         assert!(result.values.iter().any(|v| v.contains("drive")));
         assert!(result.values.iter().any(|v| v.contains("docs")));
@@ -123,8 +130,12 @@ mod tests {
 
     #[test]
     fn test_complete_resource_uri_partial() {
-        let policy = crate::policy::Policy::from_services(&["drive".to_string(), "docs".to_string()]);
-        let arg = ArgumentInfo { name: "uri".to_string(), value: "gws://dr".to_string() };
+        let policy =
+            crate::policy::Policy::from_services(&["drive".to_string(), "docs".to_string()]);
+        let arg = ArgumentInfo {
+            name: "uri".to_string(),
+            value: "gws://dr".to_string(),
+        };
         let result = complete_resource_uri("", &arg, &policy);
         assert_eq!(result.values, vec!["gws://drive/"]);
     }

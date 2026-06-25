@@ -60,10 +60,7 @@ pub struct TemplateSelection {
 }
 rmcp::elicit_safe!(TemplateSelection);
 
-pub async fn ask_template(
-    peer: &Peer<RoleServer>,
-    template_names: &[String],
-) -> Option<String> {
+pub async fn ask_template(peer: &Peer<RoleServer>, template_names: &[String]) -> Option<String> {
     if !supports_form(peer) || template_names.is_empty() {
         return None;
     }
@@ -74,9 +71,7 @@ pub async fn ask_template(
         ))
         .await
     {
-        Ok(Some(selection)) if !selection.template_name.is_empty() => {
-            Some(selection.template_name)
-        }
+        Ok(Some(selection)) if !selection.template_name.is_empty() => Some(selection.template_name),
         _ => None,
     }
 }

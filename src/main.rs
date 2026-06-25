@@ -15,8 +15,8 @@ mod policy;
 mod prompts;
 mod resources;
 mod server;
-mod subscriptions;
 mod slides_helpers;
+mod subscriptions;
 mod tasks;
 mod tools;
 
@@ -24,8 +24,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use google_workspace::error::GwsError;
-use rmcp::ServiceExt;
 use opentelemetry::trace::TracerProvider;
+use rmcp::ServiceExt;
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -283,7 +283,10 @@ const KNOWN_SERVICES: &[(&str, &str)] = &[
     ("slides", "Google Slides — presentations, pages"),
     ("admin", "Admin SDK — users, groups, org units"),
     ("chat", "Google Chat — spaces, messages"),
-    ("generativelanguage", "Google Generative AI — models, content generation"),
+    (
+        "generativelanguage",
+        "Google Generative AI — models, content generation",
+    ),
 ];
 
 fn generate_policy(services: &[String]) -> serde_json::Value {
@@ -1308,7 +1311,8 @@ async fn main() {
             let mut state = server::ServerState::new();
             state.prompts = prompts;
             state.audit = audit;
-            state.webhook_url = external_url.clone()
+            state.webhook_url = external_url
+                .clone()
                 .or_else(|| Some(format!("http://{addr}")));
             let state = Arc::new(tokio::sync::Mutex::new(state));
             let policy = Arc::new(tokio::sync::RwLock::new(policy));

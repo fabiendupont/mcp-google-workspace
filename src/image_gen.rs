@@ -149,9 +149,10 @@ pub async fn generate_image(
     })?;
 
     let status = resp.status();
-    let resp_body: Value = resp.json().await.map_err(|_| {
-        api_err("Failed to parse Gemini API response".to_string())
-    })?;
+    let resp_body: Value = resp
+        .json()
+        .await
+        .map_err(|_| api_err("Failed to parse Gemini API response".to_string()))?;
 
     if !status.is_success() {
         let msg = resp_body
@@ -159,9 +160,7 @@ pub async fn generate_image(
             .and_then(|e| e.get("message"))
             .and_then(|m| m.as_str())
             .unwrap_or("Unknown error");
-        return Err(api_err(format!(
-            "Gemini API returned {status}: {msg}"
-        )));
+        return Err(api_err(format!("Gemini API returned {status}: {msg}")));
     }
 
     parse_gemini_response(&resp_body)
@@ -274,10 +273,7 @@ mod tests {
             body["generationConfig"]["imageConfig"]["aspectRatio"],
             "16:9"
         );
-        assert_eq!(
-            body["generationConfig"]["imageConfig"]["imageSize"],
-            "2K"
-        );
+        assert_eq!(body["generationConfig"]["imageConfig"]["imageSize"], "2K");
     }
 
     #[test]

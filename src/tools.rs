@@ -12,12 +12,22 @@ use crate::policy::Policy;
 
 fn method_hints(service: &str) -> Option<&'static str> {
     match service {
-        "drive" => Some("resource=files method=list, resource=files method=get params={fileId: ID}, resource=files method=create body={name: NAME, mimeType: TYPE, parents: [FOLDER_ID]}"),
-        "docs" => Some("resource=documents method=get params={documentId: ID}, resource=documents method=create body={title: TITLE}"),
-        "gmail" => Some("resource=messages method=list, resource=messages method=get params={userId: me, id: MSG_ID}"),
-        "calendar" => Some("resource=events method=list params={calendarId: primary}, resource=events method=get params={calendarId: primary, eventId: ID}"),
+        "drive" => Some(
+            "resource=files method=list, resource=files method=get params={fileId: ID}, resource=files method=create body={name: NAME, mimeType: TYPE, parents: [FOLDER_ID]}",
+        ),
+        "docs" => Some(
+            "resource=documents method=get params={documentId: ID}, resource=documents method=create body={title: TITLE}",
+        ),
+        "gmail" => Some(
+            "resource=messages method=list, resource=messages method=get params={userId: me, id: MSG_ID}",
+        ),
+        "calendar" => Some(
+            "resource=events method=list params={calendarId: primary}, resource=events method=get params={calendarId: primary, eventId: ID}",
+        ),
         "sheets" => Some("resource=spreadsheets method=get params={spreadsheetId: ID}"),
-        "slides" => Some("resource=presentations method=get params={presentationId: ID}, resource=presentations method=create body={title: TITLE}"),
+        "slides" => Some(
+            "resource=presentations method=get params={presentationId: ID}, resource=presentations method=create body={title: TITLE}",
+        ),
         _ => None,
     }
 }
@@ -26,8 +36,15 @@ fn tool_from_json(schema: Value) -> Tool {
     serde_json::from_value(schema).expect("tool schema must be valid")
 }
 
-fn make_tool(name: impl Into<String>, title: impl Into<String>, description: impl Into<String>, annotations: ToolAnnotations, input_schema: Value) -> Tool {
-    let schema: rmcp::model::JsonObject = serde_json::from_value(input_schema).expect("input schema must be an object");
+fn make_tool(
+    name: impl Into<String>,
+    title: impl Into<String>,
+    description: impl Into<String>,
+    annotations: ToolAnnotations,
+    input_schema: Value,
+) -> Tool {
+    let schema: rmcp::model::JsonObject =
+        serde_json::from_value(input_schema).expect("input schema must be an object");
     Tool::new(name.into(), description.into(), Arc::new(schema))
         .with_title(title.into())
         .with_annotations(annotations)
@@ -143,7 +160,13 @@ pub async fn build_tools_list(
             })
         };
 
-        tools.push(make_tool(svc_name, &title, &description, annotations, schema));
+        tools.push(make_tool(
+            svc_name,
+            &title,
+            &description,
+            annotations,
+            schema,
+        ));
     }
 
     tools.push(make_tool(
@@ -207,7 +230,9 @@ pub async fn build_tools_list(
         tools.push(tool_from_json(crate::helpers::append_section_tool_schema()));
     }
     tools.push(tool_from_json(crate::slides_helpers::marp_tool_schema()));
-    tools.push(tool_from_json(crate::slides_helpers::templates_tool_schema()));
+    tools.push(tool_from_json(
+        crate::slides_helpers::templates_tool_schema(),
+    ));
     tools.push(tool_from_json(crate::image_gen::image_gen_tool_schema()));
 
     Ok(tools)

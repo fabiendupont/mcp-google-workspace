@@ -1,11 +1,11 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::Router;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
-use axum::Router;
 use serde_json::json;
 use tokio::sync::{Mutex, RwLock};
 
@@ -16,8 +16,7 @@ use crate::policy::Policy;
 use crate::server::ServerState;
 
 use rmcp::transport::streamable_http_server::{
-    StreamableHttpServerConfig, StreamableHttpService,
-    session::local::LocalSessionManager,
+    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
 
 #[derive(Clone)]
@@ -33,14 +32,18 @@ pub async fn serve(
 ) -> Result<(), GwsError> {
     let ct = tokio_util::sync::CancellationToken::new();
 
-    let config = StreamableHttpServerConfig::default()
-        .with_cancellation_token(ct.child_token());
+    let config = StreamableHttpServerConfig::default().with_cancellation_token(ct.child_token());
 
     let shared_state = state.clone();
     let shared_policy = policy.clone();
 
     let mcp_service = StreamableHttpService::new(
-        move || Ok(GwsHandler::from_shared(shared_state.clone(), shared_policy.clone())),
+        move || {
+            Ok(GwsHandler::from_shared(
+                shared_state.clone(),
+                shared_policy.clone(),
+            ))
+        },
         Arc::new(LocalSessionManager::default()),
         config,
     );
@@ -96,9 +99,8 @@ pub async fn serve(
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(async move {
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("failed to register SIGTERM handler");
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to register SIGTERM handler");
         tokio::select! {
             _ = sigterm.recv() => {
                 tracing::info!("Received SIGTERM, shutting down HTTP server");

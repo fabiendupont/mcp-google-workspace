@@ -148,8 +148,7 @@ impl Policy {
             .collect();
 
         if !file.templates.is_empty() {
-            let template_ids: Vec<String> =
-                file.templates.iter().map(|t| t.id.clone()).collect();
+            let template_ids: Vec<String> = file.templates.iter().map(|t| t.id.clone()).collect();
             let protect_params = [
                 ("drive", "fileId"),
                 ("slides", "presentationId"),
@@ -355,7 +354,11 @@ impl Policy {
             } else {
                 if !restrict_group.is_empty() {
                     self.enforce_param_constraint(
-                        param, &all_values, &rw_values, is_write, params,
+                        param,
+                        &all_values,
+                        &rw_values,
+                        is_write,
+                        params,
                     )?;
                 }
                 if is_write && !protect_ro_values.is_empty() {

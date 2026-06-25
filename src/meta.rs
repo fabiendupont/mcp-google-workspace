@@ -8,9 +8,21 @@ pub struct RequestMeta {
 impl RequestMeta {
     pub fn from_rmcp_meta(meta: &rmcp::model::Meta) -> Self {
         Self {
-            trace_parent: meta.0.get("traceparent").and_then(|v| v.as_str()).map(String::from),
-            trace_state: meta.0.get("tracestate").and_then(|v| v.as_str()).map(String::from),
-            baggage: meta.0.get("baggage").and_then(|v| v.as_str()).map(String::from),
+            trace_parent: meta
+                .0
+                .get("traceparent")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            trace_state: meta
+                .0
+                .get("tracestate")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            baggage: meta
+                .0
+                .get("baggage")
+                .and_then(|v| v.as_str())
+                .map(String::from),
         }
     }
 }
