@@ -10,6 +10,18 @@ use google_workspace::services;
 
 use crate::policy::Policy;
 
+fn method_hints(service: &str) -> Option<&'static str> {
+    match service {
+        "drive" => Some("resource=files method=list, resource=files method=get params={fileId: ID}, resource=files method=create body={name: NAME, mimeType: TYPE, parents: [FOLDER_ID]}"),
+        "docs" => Some("resource=documents method=get params={documentId: ID}, resource=documents method=create body={title: TITLE}"),
+        "gmail" => Some("resource=messages method=list, resource=messages method=get params={userId: me, id: MSG_ID}"),
+        "calendar" => Some("resource=events method=list params={calendarId: primary}, resource=events method=get params={calendarId: primary, eventId: ID}"),
+        "sheets" => Some("resource=spreadsheets method=get params={spreadsheetId: ID}"),
+        "slides" => Some("resource=presentations method=get params={presentationId: ID}, resource=presentations method=create body={title: TITLE}"),
+        _ => None,
+    }
+}
+
 fn tool_from_json(schema: Value) -> Tool {
     serde_json::from_value(schema).expect("tool schema must be valid")
 }
@@ -72,7 +84,7 @@ pub async fn build_tools_list(
         let is_read_only = policy.is_read_only(svc_name);
         let read_only_note = if is_read_only { " [READ-ONLY]" } else { "" };
 
-        let description = if resource_names.is_empty() {
+        let mut description = if resource_names.is_empty() {
             format!("{desc}{read_only_note}")
         } else {
             format!(
@@ -81,78 +93,57 @@ pub async fn build_tools_list(
             )
         };
 
+        if policy.compact_schemas {
+            if let Some(hints) = method_hints(svc_name) {
+                description.push_str(&format!(". Common: {hints}"));
+            }
+        }
+
         let annotations = ToolAnnotations::new()
             .read_only(is_read_only)
             .destructive(false)
             .idempotent(false)
             .open_world(true);
 
-        tools.push(make_tool(svc_name, &title, &description, annotations, json!({
-            "type": "object",
-            "properties": {
-                "resource": {
-                    "type": "string",
-                    "description": "Resource name (e.g., files, permissions)"
+        let schema = if policy.compact_schemas {
+            json!({
+                "type": "object",
+                "properties": {
+                    "resource": { "type": "string", "description": "Resource name" },
+                    "method": { "type": "string", "description": "Method name" },
+                    "params": { "type": "object", "description": "Query/path parameters" },
+                    "body": { "type": "object", "description": "Request body" },
+                    "fields": { "type": "string", "description": "Response field mask" },
+                    "page_all": { "type": "boolean", "description": "Auto-paginate" }
                 },
-                "method": {
-                    "type": "string",
-                    "description": "Method name (e.g., list, get, create)"
+                "required": ["resource", "method"]
+            })
+        } else {
+            json!({
+                "type": "object",
+                "properties": {
+                    "resource": { "type": "string", "description": "Resource name (e.g., files, permissions)" },
+                    "method": { "type": "string", "description": "Method name (e.g., list, get, create)" },
+                    "params": { "type": "object", "description": "Query or path parameters" },
+                    "body": { "type": "object", "description": "Request body" },
+                    "fields": { "type": "string", "description": "Response field mask (e.g., id,name,mimeType)" },
+                    "page_all": { "type": "boolean", "description": "Auto-paginate, returning all pages" },
+                    "media_data": { "type": "string", "description": "Base64-encoded file content for media upload" },
+                    "media_content_type": { "type": "string", "description": "MIME type of the media content" },
+                    "media_upload_init": { "type": "boolean", "description": "Start a resumable upload session for large files (>10MB)" },
+                    "media_total_size": { "type": "integer", "description": "Total file size in bytes (for resumable uploads)" },
+                    "upload_handle": { "type": "string", "description": "Handle from a previous media_upload_init call" },
+                    "media_chunk": { "type": "string", "description": "Base64-encoded chunk data (for resumable uploads)" },
+                    "media_chunk_offset": { "type": "integer", "description": "Byte offset of this chunk (0-based)" },
+                    "download_handle": { "type": "string", "description": "Handle from a large file download" },
+                    "download_chunk_offset": { "type": "integer", "description": "Base64 char offset for next download chunk" },
+                    "dry_run": { "type": "boolean", "description": "Preview the HTTP request without executing" }
                 },
-                "params": {
-                    "type": "object",
-                    "description": "Query or path parameters"
-                },
-                "body": {
-                    "type": "object",
-                    "description": "Request body"
-                },
-                "page_all": {
-                    "type": "boolean",
-                    "description": "Auto-paginate, returning all pages"
-                },
-                "media_data": {
-                    "type": "string",
-                    "description": "Base64-encoded file content for media upload"
-                },
-                "media_content_type": {
-                    "type": "string",
-                    "description": "MIME type of the media content (e.g., application/pdf, image/png)"
-                },
-                "media_upload_init": {
-                    "type": "boolean",
-                    "description": "Start a resumable upload session for large files (>10MB)"
-                },
-                "media_total_size": {
-                    "type": "integer",
-                    "description": "Total file size in bytes (for resumable uploads)"
-                },
-                "upload_handle": {
-                    "type": "string",
-                    "description": "Handle from a previous media_upload_init call"
-                },
-                "media_chunk": {
-                    "type": "string",
-                    "description": "Base64-encoded chunk data (for resumable uploads)"
-                },
-                "media_chunk_offset": {
-                    "type": "integer",
-                    "description": "Byte offset of this chunk (0-based, for resumable uploads)"
-                },
-                "download_handle": {
-                    "type": "string",
-                    "description": "Handle from a large file download to retrieve chunks"
-                },
-                "download_chunk_offset": {
-                    "type": "integer",
-                    "description": "Base64 char offset for the next download chunk (0-based)"
-                },
-                "dry_run": {
-                    "type": "boolean",
-                    "description": "If true, returns the HTTP request that would be sent without executing it. Shows URL, method, scopes, and body."
-                }
-            },
-            "required": ["resource", "method"]
-        })));
+                "required": ["resource", "method"]
+            })
+        };
+
+        tools.push(make_tool(svc_name, &title, &description, annotations, schema));
     }
 
     tools.push(make_tool(
@@ -204,6 +195,9 @@ pub async fn build_tools_list(
         tools.push(tool_from_json(v));
     }
     tools.push(tool_from_json(crate::helpers::markdown_tool_schema()));
+    tools.push(tool_from_json(crate::helpers::structure_tool_schema()));
+    tools.push(tool_from_json(crate::helpers::find_text_tool_schema()));
+    tools.push(tool_from_json(crate::helpers::append_section_tool_schema()));
     tools.push(tool_from_json(crate::slides_helpers::marp_tool_schema()));
     tools.push(tool_from_json(crate::slides_helpers::templates_tool_schema()));
     tools.push(tool_from_json(crate::image_gen::image_gen_tool_schema()));

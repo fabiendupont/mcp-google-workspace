@@ -370,8 +370,18 @@ fn format_tool_result(
         });
     }
 
-    let text = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
-    let mut structured = result;
+    let mut cleaned = result;
+    crate::execute::strip_google_metadata(&mut cleaned);
+
+    let summary = build_list_summary(&cleaned);
+    let text = if let Some(ref summary) = summary {
+        let json_str = serde_json::to_string_pretty(&cleaned).unwrap_or_else(|_| "{}".to_string());
+        format!("{summary}\n\n{json_str}")
+    } else {
+        serde_json::to_string_pretty(&cleaned).unwrap_or_else(|_| "{}".to_string())
+    };
+
+    let mut structured = cleaned;
     if method.http_method != "GET" {
         let explanation = explain_request(service, resource_path, method_name, method, arguments);
         structured["_explanation"] = json!(explanation);
@@ -381,6 +391,18 @@ fn format_tool_result(
         "structuredContent": structured,
         "isError": false
     })
+}
+
+fn build_list_summary(result: &Value) -> Option<String> {
+    for key in &["files", "messages", "threads", "items", "drafts", "labels",
+                  "permissions", "revisions", "comments", "drives", "events"] {
+        if let Some(arr) = result.get(*key).and_then(|v| v.as_array()) {
+            let has_more = result.get("nextPageToken").is_some();
+            let more_text = if has_more { " (more available)" } else { "" };
+            return Some(format!("Found {} {}{more_text}.", arr.len(), key));
+        }
+    }
+    None
 }
 
 fn extract_session_uri(init_result: &Value) -> Result<String, GwsError> {
@@ -458,8 +480,20 @@ fn strip_key(value: &Value, key: &str) -> Value {
 }
 
 fn check_api_result(result: &Value) -> Result<(), GwsError> {
-    if let Some(err) = result.get("error").and_then(|v| v.as_str()) {
-        return Err(GwsError::Validation(err.to_string()));
+    if let Some(err) = result.get("error") {
+        let msg = if let Some(s) = err.as_str() {
+            s.to_string()
+        } else {
+            let code = err.get("code").and_then(|v| v.as_i64()).unwrap_or(0);
+            let message = err.get("message").and_then(|v| v.as_str()).unwrap_or("Unknown error");
+            let status = err.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            if status.is_empty() {
+                format!("API error {code}: {message}")
+            } else {
+                format!("API error {code} ({status}): {message}")
+            }
+        };
+        return Err(GwsError::Validation(msg));
     }
     if result.get("validation_error").is_some() {
         let msg = result["errors"]
@@ -516,8 +550,43 @@ async fn execute_docs_helper(
 
     let doc_id = arguments
         .get("document_id")
+        .or_else(|| arguments.get("documentId"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| GwsError::Validation("Missing 'document_id'".into()))?;
+        .ok_or_else(|| GwsError::Validation(
+            format!("Missing 'document_id' in {tool_name}. Pass the Google Docs document ID.")
+        ))?;
+
+    if tool_name == "gws_docs_structure" || tool_name == "gws_docs_find_text" {
+        let doc_ref = state.get_doc("docs").await?;
+        let resource = tools::find_resource(&doc_ref.resources, "documents")
+            .ok_or_else(|| GwsError::Validation("documents resource not found".into()))?;
+        let get_method = resource.methods.get("get")
+            .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
+        let get_args = json!({"params": {"documentId": doc_id}});
+        let doc_content = crate::execute::execute_tool(
+            &doc_ref, get_method, "documents", "get", &get_args,
+            "docs", policy, meta, None, None, false, &mut state.token_cache,
+        ).await?;
+
+        return if tool_name == "gws_docs_structure" {
+            let structure = helpers::parse_doc_structure(&doc_content);
+            Ok(json!({
+                "content": [{ "type": "text", "text": serde_json::to_string_pretty(&structure).unwrap_or_default() }],
+                "structuredContent": structure,
+                "isError": false
+            }))
+        } else {
+            let needle = arguments.get("text").and_then(|v| v.as_str())
+                .ok_or_else(|| GwsError::Validation("Missing 'text'".into()))?;
+            let occurrence = arguments.get("occurrence").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+            let result = helpers::find_text_in_doc(&doc_content, needle, occurrence);
+            Ok(json!({
+                "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
+                "structuredContent": result,
+                "isError": false
+            }))
+        };
+    }
 
     let needs_end_index = |tool: &str, args: &Value| -> bool {
         match tool {
@@ -578,28 +647,48 @@ async fn execute_docs_helper(
 
     let requests: Vec<Value> = match tool_name {
         "gws_docs_insert_text" => {
-            let text = arguments
-                .get("text")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| GwsError::Validation("Missing 'text'".into()))?;
-            let position = resolve_end_position(parse_position(arguments), end_index);
-            let style = parse_text_style(arguments);
-            let has_style = style.bold.is_some()
-                || style.italic.is_some()
-                || style.font_size_pt.is_some()
-                || style.font_family.is_some()
-                || style.foreground_color.is_some()
-                || style.background_color.is_some();
-            let para = arguments
-                .get("paragraph_style")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            helpers::build_insert_text_requests(
-                text,
-                position,
-                if has_style { Some(style) } else { None },
-                para.as_deref(),
-            )
+            if let Some(sections) = arguments.get("sections").and_then(|v| v.as_array()) {
+                let mut all_requests = Vec::new();
+                for section in sections {
+                    let text = section.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                    if text.is_empty() { continue; }
+                    let style = parse_text_style(section);
+                    let has_style = style.bold.is_some()
+                        || style.foreground_color.is_some()
+                        || style.italic.is_some()
+                        || style.font_size_pt.is_some();
+                    let para = section.get("paragraph_style").and_then(|v| v.as_str());
+                    all_requests.extend(helpers::build_insert_text_requests(
+                        text, Position::End,
+                        if has_style { Some(style) } else { None },
+                        para,
+                    ));
+                }
+                all_requests
+            } else {
+                let text = arguments
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| GwsError::Validation("Missing 'text' or 'sections'".into()))?;
+                let position = resolve_end_position(parse_position(arguments), end_index);
+                let style = parse_text_style(arguments);
+                let has_style = style.bold.is_some()
+                    || style.italic.is_some()
+                    || style.font_size_pt.is_some()
+                    || style.font_family.is_some()
+                    || style.foreground_color.is_some()
+                    || style.background_color.is_some();
+                let para = arguments
+                    .get("paragraph_style")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                helpers::build_insert_text_requests(
+                    text,
+                    position,
+                    if has_style { Some(style) } else { None },
+                    para.as_deref(),
+                )
+            }
         }
         "gws_docs_insert_table" => {
             let rows = arguments
@@ -648,16 +737,32 @@ async fn execute_docs_helper(
             reqs
         }
         "gws_docs_format_text" => {
-            let start = arguments
-                .get("start_index")
-                .and_then(|v| v.as_i64())
-                .ok_or_else(|| GwsError::Validation("Missing 'start_index'".into()))?
-                as i32;
-            let end = arguments
-                .get("end_index")
-                .and_then(|v| v.as_i64())
-                .ok_or_else(|| GwsError::Validation("Missing 'end_index'".into()))?
-                as i32;
+            let (start, end) = if let Some(text_match) = arguments.get("text").and_then(|v| v.as_str()) {
+                let doc_ref = state.get_doc("docs").await?;
+                let resource = tools::find_resource(&doc_ref.resources, "documents")
+                    .ok_or_else(|| GwsError::Validation("documents resource not found".into()))?;
+                let get_method = resource.methods.get("get")
+                    .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
+                let get_args = json!({"params": {"documentId": doc_id}});
+                let doc_content = crate::execute::execute_tool(
+                    &doc_ref, get_method, "documents", "get", &get_args,
+                    "docs", policy, meta, None, None, false, &mut state.token_cache,
+                ).await?;
+                let occurrence = arguments.get("occurrence").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+                let result = helpers::find_text_in_doc(&doc_content, text_match, occurrence);
+                if result.get("found") != Some(&json!(true)) {
+                    return Err(GwsError::Validation(format!("Text '{}' not found in document", text_match)));
+                }
+                let s = result["startIndex"].as_i64().unwrap() as i32;
+                let e = result["endIndex"].as_i64().unwrap() as i32;
+                (s, e)
+            } else {
+                let s = arguments.get("start_index").and_then(|v| v.as_i64())
+                    .ok_or_else(|| GwsError::Validation("Missing 'start_index' or 'text'".into()))? as i32;
+                let e = arguments.get("end_index").and_then(|v| v.as_i64())
+                    .ok_or_else(|| GwsError::Validation("Missing 'end_index'".into()))? as i32;
+                (s, e)
+            };
             let style = parse_text_style(arguments);
             let para =
                 if arguments.get("named_style").is_some() || arguments.get("alignment").is_some() {
@@ -693,6 +798,20 @@ async fn execute_docs_helper(
                 .unwrap_or("BULLET_DISC_CIRCLE_SQUARE");
             vec![helpers::build_add_bullets_request(start, end, preset)]
         }
+        "gws_docs_append_section" => {
+            let heading = arguments.get("heading").and_then(|v| v.as_str());
+            let level = arguments.get("heading_level").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+            let body = arguments.get("body").and_then(|v| v.as_str());
+            let items: Option<Vec<String>> = arguments.get("items")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect());
+            let preset = arguments.get("bullet_preset").and_then(|v| v.as_str())
+                .unwrap_or("BULLET_DISC_CIRCLE_SQUARE");
+            helpers::build_append_section_requests(
+                heading, level, body,
+                items.as_deref(), preset,
+            )
+        }
         _ => {
             return Err(GwsError::Validation(format!(
                 "Unknown helper tool: {tool_name}"
@@ -727,8 +846,13 @@ async fn execute_docs_helper(
         dry_run,
         &mut state.token_cache,
     )
-    .await?;
-    check_api_result(&result)?;
+    .await
+    .map_err(|e| GwsError::Other(anyhow::anyhow!(
+        "{tool_name}: batchUpdate failed for document '{doc_id}': {e}"
+    )))?;
+    check_api_result(&result).map_err(|e| GwsError::Other(anyhow::anyhow!(
+        "{tool_name}: Google Docs API error on document '{doc_id}': {e}"
+    )))?;
     Ok(result)
 }
 
@@ -798,9 +922,13 @@ async fn execute_docs_import_markdown(
     let markdown = arguments
         .get("markdown")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| GwsError::Validation("Missing 'markdown'".into()))?;
+        .ok_or_else(|| GwsError::Validation(
+            "Missing 'markdown' parameter (must be a string). Pass the Markdown content to import.".into()
+        ))?;
 
-    let doc_id_arg = arguments.get("document_id").and_then(|v| v.as_str());
+    let doc_id_arg = arguments.get("document_id")
+        .or_else(|| arguments.get("documentId"))
+        .and_then(|v| v.as_str());
     let title = arguments.get("title").and_then(|v| v.as_str());
     let folder_id = arguments.get("folder_id").and_then(|v| v.as_str());
     let section = arguments.get("section").and_then(|v| v.as_str());
@@ -811,9 +939,10 @@ async fn execute_docs_import_markdown(
         (id.to_string(), false)
     } else if title.is_some() || folder_id.is_some() {
         let doc_title = title.unwrap_or("Untitled");
-        let drive_doc = state.get_doc("drive").await?;
+        let drive_doc = state.get_doc("drive").await
+            .map_err(|e| GwsError::Other(anyhow::anyhow!("gws_docs_import_markdown: failed to load Drive API: {e}")))?;
         let drive_resource = tools::find_resource(&drive_doc.resources, "files")
-            .ok_or_else(|| GwsError::Validation("files resource not found in drive API".into()))?;
+            .ok_or_else(|| GwsError::Validation("gws_docs_import_markdown: files resource not found in drive API".into()))?;
 
         // Check if a doc with this title already exists in the folder
         let existing_id = if let Some(fid) = folder_id {
@@ -948,7 +1077,8 @@ async fn execute_docs_import_markdown(
         }
     } else {
         return Err(GwsError::Validation(
-            "Either 'document_id' or 'title' is required".into(),
+            "Either 'document_id' (existing doc) or 'title' (create new doc) is required. \
+             Pass document_id to import into an existing document, or title to create a new one.".into(),
         ));
     };
 
@@ -1153,8 +1283,15 @@ async fn execute_docs_import_markdown(
         dry_run,
         &mut state.token_cache,
     )
-    .await?;
-    check_api_result(&result)?;
+    .await
+    .map_err(|e| GwsError::Other(anyhow::anyhow!(
+        "gws_docs_import_markdown: batchUpdate failed for document '{}': {e}. \
+         Check that document_id is valid and you have write access.", doc_id
+    )))?;
+    check_api_result(&result).map_err(|e| GwsError::Other(anyhow::anyhow!(
+        "gws_docs_import_markdown: Google Docs API rejected the batch request for '{}': {e}. \
+         This may be caused by invalid indexes or malformed Markdown.", doc_id
+    )))?;
 
     // Step E: include doc ID in result (especially useful when a new doc was created)
     if created_new_doc {
@@ -1594,8 +1731,8 @@ async fn execute_generate_image(
 
     let aspect_ratio = arguments.get("aspect_ratio").and_then(|v| v.as_str());
     let image_size = arguments.get("image_size").and_then(|v| v.as_str());
-    let document_id = arguments.get("document_id").and_then(|v| v.as_str());
-    let presentation_id = arguments.get("presentation_id").and_then(|v| v.as_str());
+    let document_id = arguments.get("document_id").or_else(|| arguments.get("documentId")).and_then(|v| v.as_str());
+    let presentation_id = arguments.get("presentation_id").or_else(|| arguments.get("presentationId")).and_then(|v| v.as_str());
     let folder_id = arguments.get("folder_id").and_then(|v| v.as_str());
 
     if dry_run {

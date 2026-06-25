@@ -14,25 +14,30 @@ use crate::policy::Policy;
 
 static FIELD_DEFAULTS: LazyLock<HashMap<(&str, &str, &str), &str>> = LazyLock::new(|| {
     let mut m = HashMap::new();
-    m.insert(
-        ("drive", "files", "list"),
-        "files(id,name,mimeType,modifiedTime,size,parents),nextPageToken",
-    );
-    m.insert(
-        ("drive", "files", "get"),
-        "id,name,mimeType,modifiedTime,size,parents,webViewLink",
-    );
-    m.insert(
-        ("gmail", "messages", "list"),
-        "messages(id,threadId),nextPageToken,resultSizeEstimate",
-    );
+    // Drive
+    m.insert(("drive", "files", "list"), "files(id,name,mimeType,modifiedTime,size,parents),nextPageToken");
+    m.insert(("drive", "files", "get"), "id,name,mimeType,modifiedTime,size,parents,webViewLink");
+    m.insert(("drive", "files", "create"), "id,name,mimeType,parents,webViewLink");
+    m.insert(("drive", "files", "copy"), "id,name,mimeType,parents,webViewLink");
+    m.insert(("drive", "permissions", "list"), "permissions(id,role,type,emailAddress)");
+    m.insert(("drive", "permissions", "create"), "id,role,type,emailAddress");
+    // Docs
+    m.insert(("docs", "documents", "get"), "documentId,title,body");
+    m.insert(("docs", "documents", "create"), "documentId,title");
+    // Slides
+    m.insert(("slides", "presentations", "get"), "presentationId,title,slides(objectId,pageElements(objectId,size,transform,shape))");
+    m.insert(("slides", "presentations", "create"), "presentationId,title");
+    // Gmail
+    m.insert(("gmail", "messages", "list"), "messages(id,threadId),nextPageToken,resultSizeEstimate");
     m.insert(("gmail", "messages", "get"), "id,threadId,labelIds,snippet,payload(headers(name,value),mimeType,body),sizeEstimate,internalDate");
-    m.insert(
-        ("gmail", "threads", "list"),
-        "threads(id,snippet),nextPageToken",
-    );
+    m.insert(("gmail", "threads", "list"), "threads(id,snippet),nextPageToken");
+    m.insert(("gmail", "drafts", "list"), "drafts(id,message(id,snippet)),nextPageToken");
+    m.insert(("gmail", "drafts", "create"), "id,message(id,threadId)");
+    m.insert(("gmail", "labels", "list"), "labels(id,name,type)");
+    // Calendar
     m.insert(("calendar", "events", "list"), "items(id,summary,start,end,status,organizer,attendees(email,responseStatus)),nextPageToken");
     m.insert(("calendar", "events", "get"), "id,summary,description,start,end,status,location,organizer,attendees,conferenceData,htmlLink");
+    // Sheets
     m.insert(("sheets", "spreadsheets", "get"), "spreadsheetId,properties(title),sheets(properties(sheetId,title,index),data(rowData(values(formattedValue))))");
     m
 });
@@ -45,6 +50,38 @@ fn b64_decode(input: &str) -> Result<Vec<u8>, GwsError> {
     base64::engine::general_purpose::STANDARD
         .decode(input)
         .map_err(|_| GwsError::Validation("Invalid base64 data".to_string()))
+}
+
+const STRIP_KEYS: &[&str] = &[
+    "kind", "etag", "selfLink", "iconLink", "thumbnailLink", "hasThumbnail",
+    "exportLinks", "capabilities", "permissionIds", "spaces", "shared",
+    "ownedByMe", "isAppAuthorized", "linkShareMetadata", "labelInfo",
+    "sha256Checksum", "md5Checksum", "originalFilename", "fullFileExtension",
+    "fileExtension", "headRevisionId", "imageMediaMetadata", "videoMediaMetadata",
+    "shortcutDetails", "resourceKey", "driveId", "teamDriveId",
+    "copyRequiresWriterPermission", "writersCanShare", "viewersCanCopyContent",
+];
+
+pub(crate) fn strip_google_metadata(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for key in STRIP_KEYS {
+                map.remove(*key);
+            }
+            if let Some(Value::Bool(false)) = map.get("trashed") {
+                map.remove("trashed");
+            }
+            for v in map.values_mut() {
+                strip_google_metadata(v);
+            }
+        }
+        Value::Array(arr) => {
+            for item in arr {
+                strip_google_metadata(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn gws_err(msg: impl std::fmt::Display) -> GwsError {

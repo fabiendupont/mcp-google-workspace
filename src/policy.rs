@@ -111,6 +111,7 @@ pub struct Policy {
     pub allowed_origins: Vec<String>,
     pub credentials_file: Option<String>,
     pub project_id: Option<String>,
+    pub compact_schemas: bool,
     services: HashMap<String, ServicePolicy>,
     templates: Vec<TemplateEntry>,
 }
@@ -187,6 +188,7 @@ impl Policy {
             allowed_origins: file.server.allowed_origins,
             credentials_file: file.server.credentials_file,
             project_id: file.server.project_id,
+            compact_schemas: false,
             services,
             templates: file.templates,
         }

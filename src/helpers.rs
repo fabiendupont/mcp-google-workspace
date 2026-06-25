@@ -390,10 +390,17 @@ fn parse_markdown_to_blocks(markdown: &str) -> Vec<Block> {
 
     let mut current_heading: Option<String> = None;
     let mut in_list_item = false;
+    let mut seen_first_h1 = false;
     for event in parser {
         match event {
             Event::Start(Tag::Heading { level, .. }) => {
-                current_heading = Some(heading_level_to_style(level).to_string());
+                let style = if level == HeadingLevel::H1 && !seen_first_h1 {
+                    seen_first_h1 = true;
+                    "TITLE"
+                } else {
+                    heading_level_to_style(level)
+                };
+                current_heading = Some(style.to_string());
                 para_text.clear();
                 para_styles.clear();
                 para_char_count = 0;
@@ -1010,8 +1017,10 @@ pub fn helper_tool_schemas() -> Vec<Value> {
     vec![
         json!({
             "name": "gws_docs_insert_text",
-            "description": "Insert text into a Google Doc with optional styling and paragraph style. \
-                            Returns batchUpdate requests to send via docs.documents.batchUpdate.",
+            "description": "Insert text into a Google Doc. IMPORTANT: set paragraph_style on EVERY call \
+                            (TITLE, SUBTITLE, HEADING_1, NORMAL_TEXT etc). Use 'sections' array to insert \
+                            multiple styled blocks in one call. For full sections with bullets, prefer \
+                            gws_docs_append_section instead.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1042,9 +1051,23 @@ pub fn helper_tool_schemas() -> Vec<Value> {
                         "type": "string",
                         "enum": ["NORMAL_TEXT", "HEADING_1", "HEADING_2", "HEADING_3", "HEADING_4", "HEADING_5", "HEADING_6", "TITLE", "SUBTITLE"],
                         "description": "Named paragraph style to apply"
+                    },
+                    "sections": {
+                        "type": "array",
+                        "description": "Multiple text blocks to insert in sequence (alternative to single text). Each can have its own style.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "text": { "type": "string" },
+                                "paragraph_style": { "type": "string" },
+                                "bold": { "type": "boolean" },
+                                "foreground_color": { "type": "string" }
+                            },
+                            "required": ["text"]
+                        }
                     }
                 },
-                "required": ["document_id", "text"]
+                "required": ["document_id"]
             }
         }),
         json!({
@@ -1128,7 +1151,7 @@ pub fn helper_tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "gws_docs_format_text",
-            "description": "Apply text and paragraph styling to an existing range in a Google Doc.",
+            "description": "Apply text and paragraph styling to a range in a Google Doc. Use start_index/end_index OR text (finds the text automatically).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1138,11 +1161,19 @@ pub fn helper_tool_schemas() -> Vec<Value> {
                     },
                     "start_index": {
                         "type": "integer",
-                        "description": "Start of the range (1-based, inclusive)"
+                        "description": "Start of the range (1-based, inclusive). Not needed if 'text' is provided."
                     },
                     "end_index": {
                         "type": "integer",
-                        "description": "End of the range (exclusive)"
+                        "description": "End of the range (exclusive). Not needed if 'text' is provided."
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "Text to find and format (alternative to start_index/end_index)"
+                    },
+                    "occurrence": {
+                        "type": "integer",
+                        "description": "Which occurrence to format (1-based, default 1)"
                     },
                     "bold": { "type": "boolean" },
                     "italic": { "type": "boolean" },
@@ -1161,7 +1192,7 @@ pub fn helper_tool_schemas() -> Vec<Value> {
                         "description": "Paragraph alignment"
                     }
                 },
-                "required": ["document_id", "start_index", "end_index"]
+                "required": ["document_id"]
             }
         }),
         json!({
@@ -1206,6 +1237,287 @@ pub fn helper_tool_schemas() -> Vec<Value> {
             }
         }),
     ]
+}
+
+pub fn heading_level(style: &str) -> Option<u32> {
+    match style {
+        "HEADING_1" => Some(1),
+        "HEADING_2" => Some(2),
+        "HEADING_3" => Some(3),
+        "HEADING_4" => Some(4),
+        "HEADING_5" => Some(5),
+        "HEADING_6" => Some(6),
+        _ => None,
+    }
+}
+
+pub fn parse_doc_structure(doc: &Value) -> Value {
+    let title = doc
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let mut elements = Vec::new();
+    let mut last_end = 0i64;
+
+    if let Some(content) = doc.pointer("/body/content").and_then(|v| v.as_array()) {
+        for elem in content {
+            let start = elem.get("startIndex").and_then(|v| v.as_i64()).unwrap_or(0);
+            let end = elem.get("endIndex").and_then(|v| v.as_i64()).unwrap_or(0);
+            last_end = end;
+
+            if let Some(paragraph) = elem.get("paragraph") {
+                let style = paragraph
+                    .pointer("/paragraphStyle/namedStyleType")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("NORMAL_TEXT");
+
+                let text: String = paragraph
+                    .get("elements")
+                    .and_then(|v| v.as_array())
+                    .map(|elems| {
+                        elems
+                            .iter()
+                            .filter_map(|e| e.pointer("/textRun/content").and_then(|v| v.as_str()))
+                            .collect::<String>()
+                    })
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+
+                if style == "TITLE" {
+                    elements.push(json!({
+                        "type": "title",
+                        "text": text,
+                        "startIndex": start,
+                        "endIndex": end
+                    }));
+                } else if style == "SUBTITLE" {
+                    elements.push(json!({
+                        "type": "subtitle",
+                        "text": text,
+                        "startIndex": start,
+                        "endIndex": end
+                    }));
+                } else if let Some(level) = heading_level(style) {
+                    elements.push(json!({
+                        "type": "heading",
+                        "level": level,
+                        "text": text,
+                        "startIndex": start,
+                        "endIndex": end
+                    }));
+                } else if paragraph.get("bullet").is_some() {
+                    elements.push(json!({
+                        "type": "list_item",
+                        "text": text,
+                        "startIndex": start,
+                        "endIndex": end
+                    }));
+                } else if !text.is_empty() {
+                    elements.push(json!({
+                        "type": "paragraph",
+                        "preview": if text.len() > 80 { format!("{}...", &text[..77]) } else { text },
+                        "startIndex": start,
+                        "endIndex": end
+                    }));
+                }
+            } else if let Some(table) = elem.get("table") {
+                let rows = table.get("rows").and_then(|v| v.as_u64()).unwrap_or(0);
+                let columns = table.get("columns").and_then(|v| v.as_u64()).unwrap_or(0);
+                elements.push(json!({
+                    "type": "table",
+                    "rows": rows,
+                    "columns": columns,
+                    "startIndex": start,
+                    "endIndex": end
+                }));
+            }
+
+            if let Some(inline_objs) = elem.get("paragraph").and_then(|p| p.get("elements")).and_then(|v| v.as_array()) {
+                for ie in inline_objs {
+                    if ie.get("inlineObjectElement").is_some() {
+                        elements.push(json!({
+                            "type": "image",
+                            "startIndex": ie.get("startIndex").and_then(|v| v.as_i64()).unwrap_or(start),
+                            "endIndex": ie.get("endIndex").and_then(|v| v.as_i64()).unwrap_or(end)
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
+    json!({
+        "title": title,
+        "elements": elements,
+        "endIndex": last_end
+    })
+}
+
+pub fn find_text_in_doc(doc: &Value, needle: &str, occurrence: usize) -> Value {
+    let mut found_count = 0usize;
+
+    if let Some(content) = doc.pointer("/body/content").and_then(|v| v.as_array()) {
+        for elem in content {
+            if let Some(paragraph) = elem.get("paragraph") {
+                if let Some(elements) = paragraph.get("elements").and_then(|v| v.as_array()) {
+                    for pe in elements {
+                        if let Some(text_run) = pe.get("textRun") {
+                            let text = text_run
+                                .get("content")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let element_start = pe
+                                .get("startIndex")
+                                .and_then(|v| v.as_i64())
+                                .unwrap_or(0);
+
+                            let mut search_from = 0;
+                            while let Some(pos) = text[search_from..].find(needle) {
+                                found_count += 1;
+                                if found_count == occurrence {
+                                    let abs_start = element_start + (search_from + pos) as i64;
+                                    let abs_end = abs_start + needle.len() as i64;
+                                    return json!({
+                                        "found": true,
+                                        "startIndex": abs_start,
+                                        "endIndex": abs_end,
+                                        "occurrence": found_count
+                                    });
+                                }
+                                search_from += pos + 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    json!({ "found": false, "occurrences_found": found_count })
+}
+
+pub fn build_append_section_requests(
+    heading: Option<&str>,
+    heading_level: u32,
+    body: Option<&str>,
+    items: Option<&[String]>,
+    bullet_preset: &str,
+) -> Vec<Value> {
+    let mut requests = Vec::new();
+    let named_style = format!("HEADING_{}", heading_level.clamp(1, 6));
+
+    if let Some(h) = heading {
+        let text = format!("{h}\n");
+        requests.push(json!({
+            "insertText": {
+                "text": text,
+                "endOfSegmentLocation": { "segmentId": "" }
+            }
+        }));
+        requests.push(json!({
+            "updateParagraphStyle": {
+                "paragraphStyle": { "namedStyleType": named_style },
+                "fields": "namedStyleType",
+                "range": { "startIndex": null, "endIndex": null }
+            }
+        }));
+    }
+
+    if let Some(b) = body {
+        let text = if b.ends_with('\n') {
+            b.to_string()
+        } else {
+            format!("{b}\n")
+        };
+        requests.push(json!({
+            "insertText": {
+                "text": text,
+                "endOfSegmentLocation": { "segmentId": "" }
+            }
+        }));
+    }
+
+    if let Some(items) = items {
+        if !items.is_empty() {
+            let bullet_text: String = items.iter().map(|i| format!("{i}\n")).collect();
+            requests.push(json!({
+                "insertText": {
+                    "text": bullet_text,
+                    "endOfSegmentLocation": { "segmentId": "" }
+                }
+            }));
+            requests.push(json!({
+                "createParagraphBullets": {
+                    "range": { "startIndex": null, "endIndex": null },
+                    "bulletPreset": bullet_preset
+                }
+            }));
+        }
+    }
+
+    requests
+}
+
+pub fn structure_tool_schema() -> Value {
+    json!({
+        "name": "gws_docs_structure",
+        "title": "Document Structure",
+        "description": "Get a compact outline of a Google Doc: headings, tables, images with start/end indexes. Much smaller than fetching the full document.",
+        "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true },
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "document_id": { "type": "string", "description": "Document ID" }
+            },
+            "required": ["document_id"]
+        }
+    })
+}
+
+pub fn find_text_tool_schema() -> Value {
+    json!({
+        "name": "gws_docs_find_text",
+        "title": "Find Text in Document",
+        "description": "Find text in a Google Doc and return its start/end indexes. Use before gws_docs_format_text or gws_docs_add_bullets.",
+        "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true },
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "document_id": { "type": "string", "description": "Document ID" },
+                "text": { "type": "string", "description": "Text to search for (exact substring match)" },
+                "occurrence": { "type": "integer", "description": "Which occurrence (1-based, default 1)" }
+            },
+            "required": ["document_id", "text"]
+        }
+    })
+}
+
+pub fn append_section_tool_schema() -> Value {
+    json!({
+        "name": "gws_docs_append_section",
+        "title": "Append Section",
+        "description": "PREFERRED for document building. Append a complete section: heading + body text + optional bullet list. All in one call, no index math needed. Use this instead of multiple gws_docs_insert_text calls.",
+        "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": true },
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "document_id": { "type": "string", "description": "Document ID" },
+                "heading": { "type": "string", "description": "Section heading text" },
+                "heading_level": { "type": "integer", "description": "Heading level 1-6 (default 1)" },
+                "body": { "type": "string", "description": "Body text (newlines become paragraphs)" },
+                "items": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Bullet list items"
+                },
+                "bullet_preset": { "type": "string", "description": "Bullet style (default BULLET_DISC_CIRCLE_SQUARE)" }
+            },
+            "required": ["document_id"]
+        }
+    })
 }
 
 #[cfg(test)]
@@ -1428,7 +1740,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             para["updateParagraphStyle"]["paragraphStyle"]["namedStyleType"],
-            "HEADING_1"
+            "TITLE"
         );
         assert_eq!(para["updateParagraphStyle"]["range"]["startIndex"], 1);
         assert_eq!(para["updateParagraphStyle"]["range"]["endIndex"], 7);
@@ -1517,14 +1829,14 @@ mod tests {
 
         assert!(requests[0].get("insertText").is_some());
 
-        let has_heading = requests.iter().any(|r| {
+        let has_title = requests.iter().any(|r| {
             r.get("updateParagraphStyle")
                 .and_then(|u| u.get("paragraphStyle"))
                 .and_then(|p| p.get("namedStyleType"))
                 .and_then(|n| n.as_str())
-                == Some("HEADING_1")
+                == Some("TITLE")
         });
-        assert!(has_heading);
+        assert!(has_title);
 
         let has_bold = requests.iter().any(|r| {
             r.get("updateTextStyle")

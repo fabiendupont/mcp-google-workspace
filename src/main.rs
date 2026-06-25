@@ -61,6 +61,7 @@ struct ParsedArgs {
     services_str: Option<String>,
     http_addr: Option<String>,
     external_url: Option<String>,
+    compact_schemas: bool,
     audit_log: Option<PathBuf>,
     prompts_dir: Option<PathBuf>,
 }
@@ -102,6 +103,7 @@ fn parse_args_from(args: &[String]) -> Result<Command, GwsError> {
     let mut services_str: Option<String> = None;
     let mut http_addr: Option<String> = None;
     let mut external_url: Option<String> = None;
+    let mut compact_schemas = false;
     let mut init_policy = false;
     let mut check_policy_path: Option<PathBuf> = None;
     let mut verify = false;
@@ -154,6 +156,9 @@ fn parse_args_from(args: &[String]) -> Result<Command, GwsError> {
                     ));
                 }
                 external_url = Some(args[i].clone());
+            }
+            "--compact-schemas" => {
+                compact_schemas = true;
             }
             "--init-policy" => {
                 init_policy = true;
@@ -242,6 +247,7 @@ fn parse_args_from(args: &[String]) -> Result<Command, GwsError> {
         services_str,
         http_addr,
         external_url,
+        compact_schemas,
         audit_log,
         prompts_dir,
     }))
@@ -1229,8 +1235,9 @@ async fn main() {
     let policy_file_path = parsed.policy_path.clone();
     let prompts_dir_flag = parsed.prompts_dir.clone();
     let external_url = parsed.external_url.clone();
+    let compact_schemas = parsed.compact_schemas;
 
-    let (policy, transport) = match resolve_config(parsed) {
+    let (mut policy, transport) = match resolve_config(parsed) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -1238,6 +1245,7 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    policy.compact_schemas = compact_schemas;
 
     print_effective_policy(&policy);
 
@@ -1409,6 +1417,7 @@ mod tests {
             services_str: Some("drive,gmail".to_string()),
             http_addr: None,
             external_url: None,
+            compact_schemas: false,
             audit_log: None,
             prompts_dir: None,
         };
@@ -1425,6 +1434,7 @@ mod tests {
             services_str: None,
             http_addr: None,
             external_url: None,
+            compact_schemas: false,
             audit_log: None,
             prompts_dir: None,
         };
@@ -1438,6 +1448,7 @@ mod tests {
             services_str: Some("drive".to_string()),
             http_addr: Some("0.0.0.0:8080".to_string()),
             external_url: None,
+            compact_schemas: false,
             audit_log: None,
             prompts_dir: None,
         };
@@ -1452,6 +1463,7 @@ mod tests {
             services_str: Some("drive".to_string()),
             http_addr: None,
             external_url: None,
+            compact_schemas: false,
             audit_log: None,
             prompts_dir: None,
         };
@@ -1466,6 +1478,7 @@ mod tests {
             services_str: None,
             http_addr: None,
             external_url: None,
+            compact_schemas: false,
             audit_log: None,
             prompts_dir: None,
         };
