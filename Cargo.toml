@@ -26,9 +26,9 @@ tracing-opentelemetry = "0.33"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 yup-oauth2 = "12"
 dialoguer = "0.12.0"
-tower-http = { version = "0.6", features = ["cors"] }
-pulldown-cmark = "0.12"
-rmcp = { version = "1.8", features = ["server", "transport-io", "transport-streamable-http-server", "macros", "elicitation", "schemars"] }
+tower-http = { version = "0.7", features = ["cors"] }
+pulldown-cmark = "0.13"
+rmcp = { version = "2.0", features = ["server", "transport-io", "transport-streamable-http-server", "macros", "elicitation", "schemars"] }
 tokio-util = "0.7"
 
 [profile.release]
