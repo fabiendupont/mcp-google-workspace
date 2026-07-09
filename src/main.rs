@@ -1,6 +1,7 @@
 mod audit;
 mod auth;
 mod completions;
+mod drive_helpers;
 mod elicitation;
 mod execute;
 mod format;

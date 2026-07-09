@@ -169,8 +169,8 @@ pub async fn generate_image(
 pub fn image_gen_tool_schema() -> Value {
     json!({
         "name": "gws_generate_image",
-        "title": "Generate Image (Gemini)",
-        "description": "Generate an image from a text prompt using Google Gemini, optionally inserting it into a Google Doc or Slides presentation. When inserting into Docs/Slides, the image is uploaded to Google Drive and shared within the domain. Note: image generation calls the Gemini API directly and is not governed by service-level policy constraints; control access by including or excluding this tool.",
+        "title": "Generate and Insert Image",
+        "description": "Generate an image with Gemini and insert it into a Google Doc or Slides presentation.",
         "annotations": {
             "readOnlyHint": false,
             "destructiveHint": false,
@@ -184,53 +184,24 @@ pub fn image_gen_tool_schema() -> Value {
                     "type": "string",
                     "description": "Text description of the image to generate"
                 },
-                "model": {
-                    "type": "string",
-                    "description": "Gemini model to use (default: gemini-2.5-flash-image)",
-                    "default": "gemini-2.5-flash-image"
-                },
-                "aspect_ratio": {
-                    "type": "string",
-                    "description": "Aspect ratio: 1:1, 3:4, 4:3, 9:16, 16:9",
-                    "enum": ["1:1", "3:4", "4:3", "9:16", "16:9"]
-                },
-                "image_size": {
-                    "type": "string",
-                    "description": "Output size: 1K or 2K",
-                    "enum": ["1K", "2K"]
-                },
-                "folder_id": {
-                    "type": "string",
-                    "description": "Google Drive folder ID to store the generated image in"
-                },
                 "document_id": {
                     "type": "string",
-                    "description": "Google Doc ID to insert the generated image into"
+                    "description": "Google Doc to insert the image into"
                 },
                 "presentation_id": {
                     "type": "string",
-                    "description": "Google Slides presentation ID to insert the image into"
-                },
-                "slide_object_id": {
-                    "type": "string",
-                    "description": "Slide object ID to place the image on (for presentations)"
+                    "description": "Google Slides presentation to insert the image into"
                 },
                 "position": {
                     "type": "string",
-                    "description": "Insert position in doc: start, end, or index",
+                    "enum": ["start", "end"],
                     "default": "end"
                 },
-                "index": {
-                    "type": "integer",
-                    "description": "Character index for insertion (when position is index)"
-                },
-                "width_pt": {
-                    "type": "number",
-                    "description": "Image width in points"
-                },
-                "height_pt": {
-                    "type": "number",
-                    "description": "Image height in points"
+                "width_pt": { "type": "number", "description": "Image width in points" },
+                "height_pt": { "type": "number", "description": "Image height in points" },
+                "aspect_ratio": {
+                    "type": "string",
+                    "enum": ["1:1", "3:4", "4:3", "9:16", "16:9"]
                 }
             },
             "required": ["prompt"]
@@ -351,9 +322,8 @@ mod tests {
         assert!(required.contains(&json!("prompt")));
         let props = schema["inputSchema"]["properties"].as_object().unwrap();
         assert!(props.contains_key("prompt"));
-        assert!(props.contains_key("model"));
-        assert!(props.contains_key("aspect_ratio"));
         assert!(props.contains_key("document_id"));
         assert!(props.contains_key("presentation_id"));
+        assert!(props.contains_key("aspect_ratio"));
     }
 }

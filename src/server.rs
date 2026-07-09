@@ -122,6 +122,12 @@ async fn handle_tool_call_inner_concurrent(
         return Ok(result);
     }
 
+    if tool_name.starts_with("gws_drive_") {
+        let mut st = state.lock().await;
+        let result = execute_drive_helper(tool_name, arguments, policy, meta, &mut st).await?;
+        return Ok(result);
+    }
+
     if tool_name.starts_with("gws_docs_") {
         let mut st = state.lock().await;
         let result =
@@ -549,6 +555,424 @@ fn parse_text_style(arguments: &Value) -> TextStyle {
     }
 }
 
+fn extract_file_id<'a>(arguments: &'a Value, param: &str) -> Result<&'a str, GwsError> {
+    let id = arguments
+        .get(param)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| GwsError::Validation(format!("Missing '{param}'")))?;
+    crate::drive_helpers::validate_file_id(id).map_err(GwsError::Validation)?;
+    Ok(id)
+}
+
+async fn execute_drive_helper(
+    tool_name: &str,
+    arguments: &Value,
+    policy: &Policy,
+    meta: &RequestMeta,
+    state: &mut ServerState,
+) -> Result<Value, GwsError> {
+    let drive_doc = state.get_doc("drive").await?;
+    let files_resource = tools::find_resource(&drive_doc.resources, "files")
+        .ok_or_else(|| GwsError::Validation("files resource not found in drive API".into()))?;
+
+    match tool_name {
+        "gws_drive_list" => {
+            let folder_id = arguments.get("folder_id").and_then(|v| v.as_str());
+            let query = arguments.get("query").and_then(|v| v.as_str());
+            let file_type = arguments.get("type").and_then(|v| v.as_str());
+            let max_results = arguments
+                .get("max_results")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(20);
+            let q = crate::drive_helpers::build_drive_query(folder_id, query, file_type);
+            let list_method = files_resource
+                .methods
+                .get("list")
+                .ok_or_else(|| GwsError::Validation("list method not found".into()))?;
+            let args = json!({
+                "params": { "q": q, "pageSize": max_results, "orderBy": "modifiedTime desc" },
+                "fields": "files(id,name,mimeType,modifiedTime,size,parents)"
+            });
+            let result = crate::execute::execute_tool(
+                &drive_doc,
+                list_method,
+                "files",
+                "list",
+                &args,
+                "drive",
+                policy,
+                meta,
+                None,
+                None,
+                false,
+                &mut state.token_cache,
+            )
+            .await?;
+            Ok(json!({
+                "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
+                "structuredContent": result,
+                "isError": false
+            }))
+        }
+
+        "gws_drive_find_folder" => {
+            let name = arguments
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| GwsError::Validation("Missing 'name'".into()))?;
+            let parent_id = arguments.get("parent_id").and_then(|v| v.as_str());
+            let list_method = files_resource
+                .methods
+                .get("list")
+                .ok_or_else(|| GwsError::Validation("list method not found".into()))?;
+            let mut q = format!(
+                "name = '{}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
+                name.replace('\'', "\\'")
+            );
+            if let Some(pid) = parent_id {
+                q.push_str(&format!(" and '{}' in parents", pid));
+            }
+            let args =
+                json!({ "params": { "q": q, "pageSize": 5 }, "fields": "files(id,name,parents)" });
+            let result = crate::execute::execute_tool(
+                &drive_doc,
+                list_method,
+                "files",
+                "list",
+                &args,
+                "drive",
+                policy,
+                meta,
+                None,
+                None,
+                false,
+                &mut state.token_cache,
+            )
+            .await?;
+            if result["files"].as_array().is_none_or(|a| a.is_empty()) {
+                return Ok(json!({
+                    "content": [{ "type": "text", "text": format!("No folder named '{}' found", name) }],
+                    "isError": true
+                }));
+            }
+            Ok(json!({
+                "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
+                "structuredContent": result,
+                "isError": false
+            }))
+        }
+
+        "gws_drive_info" => {
+            let file_id = extract_file_id(arguments, "file_id")?;
+            let get_method = files_resource
+                .methods
+                .get("get")
+                .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
+            let args = json!({
+                "params": { "fileId": file_id },
+                "fields": "id,name,mimeType,modifiedTime,createdTime,size,owners,sharingUser,shared,trashed,webViewLink,parents,permissions(emailAddress,role,type,domain)"
+            });
+            let result = crate::execute::execute_tool(
+                &drive_doc,
+                get_method,
+                "files",
+                "get",
+                &args,
+                "drive",
+                policy,
+                meta,
+                None,
+                None,
+                false,
+                &mut state.token_cache,
+            )
+            .await?;
+            Ok(json!({
+                "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
+                "structuredContent": result,
+                "isError": false
+            }))
+        }
+
+        "gws_drive_create_folder" => {
+            let name = arguments
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| GwsError::Validation("Missing 'name'".into()))?;
+            let parent_id = arguments.get("parent_id").and_then(|v| v.as_str());
+            let create_method = files_resource
+                .methods
+                .get("create")
+                .ok_or_else(|| GwsError::Validation("create method not found".into()))?;
+            let mut body =
+                json!({ "name": name, "mimeType": "application/vnd.google-apps.folder" });
+            if let Some(pid) = parent_id {
+                body["parents"] = json!([pid]);
+            }
+            let result = crate::execute::execute_tool(
+                &drive_doc,
+                create_method,
+                "files",
+                "create",
+                &json!({ "body": body }),
+                "drive",
+                policy,
+                meta,
+                None,
+                None,
+                false,
+                &mut state.token_cache,
+            )
+            .await?;
+            let folder_id = result["id"].as_str().unwrap_or("");
+            Ok(json!({
+                "content": [{ "type": "text", "text": format!("Folder '{}' created.\nfolder_id: {}", name, folder_id) }],
+                "structuredContent": { "folder_id": folder_id, "name": name },
+                "isError": false
+            }))
+        }
+
+        "gws_drive_move" => {
+            let file_id = extract_file_id(arguments, "file_id")?;
+            let to_folder = arguments
+                .get("to_folder_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| GwsError::Validation("Missing 'to_folder_id'".into()))?;
+            let get_method = files_resource
+                .methods
+                .get("get")
+                .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
+            let file_meta = crate::execute::execute_tool(
+                &drive_doc,
+                get_method,
+                "files",
+                "get",
+                &json!({"params": {"fileId": file_id}, "fields": "parents"}),
+                "drive",
+                policy,
+                meta,
+                None,
+                None,
+                false,
+                &mut state.token_cache,
+            )
+            .await?;
+            let remove_parents = file_meta["parents"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .unwrap_or_default();
+            let update_method = files_resource
+                .methods
+                .get("update")
+                .ok_or_else(|| GwsError::Validation("update method not found".into()))?;
+            crate::execute::execute_tool(
+                &drive_doc, update_method, "files", "update",
+                &json!({"params": {"fileId": file_id, "addParents": to_folder, "removeParents": remove_parents}}),
+                "drive", policy, meta, None, None, false, &mut state.token_cache,
+            ).await?;
+            let verify = crate::execute::execute_tool(
+                &drive_doc,
+                get_method,
+                "files",
+                "get",
+                &json!({"params": {"fileId": file_id}, "fields": "parents"}),
+                "drive",
+                policy,
+                meta,
+                None,
+                None,
+                false,
+                &mut state.token_cache,
+            )
+            .await?;
+            let in_target = verify["parents"]
+                .as_array()
+                .is_some_and(|arr| arr.iter().any(|v| v.as_str() == Some(to_folder)));
+            if !in_target {
+                return Ok(json!({
+                    "content": [{ "type": "text", "text": format!("Failed to move file to folder {}", to_folder) }],
+                    "isError": true
+                }));
+            }
+            Ok(json!({
+                "content": [{ "type": "text", "text": format!("File moved to folder {}", to_folder) }],
+                "isError": false
+            }))
+        }
+
+        "gws_drive_share" => {
+            let file_id = extract_file_id(arguments, "file_id")?;
+            let email = arguments.get("email").and_then(|v| v.as_str());
+            let domain = arguments.get("domain").and_then(|v| v.as_str());
+            let role = arguments
+                .get("role")
+                .and_then(|v| v.as_str())
+                .unwrap_or("reader");
+            let perm_resource = tools::find_resource(&drive_doc.resources, "permissions")
+                .ok_or_else(|| GwsError::Validation("permissions resource not found".into()))?;
+            let create_method = perm_resource
+                .methods
+                .get("create")
+                .ok_or_else(|| GwsError::Validation("create method not found".into()))?;
+            let body = if let Some(e) = email {
+                json!({ "role": role, "type": "user", "emailAddress": e })
+            } else if let Some(d) = domain {
+                json!({ "role": role, "type": "domain", "domain": d })
+            } else {
+                return Err(GwsError::Validation(
+                    "Either 'email' or 'domain' is required".into(),
+                ));
+            };
+            let result = crate::execute::execute_tool(
+                &drive_doc,
+                create_method,
+                "permissions",
+                "create",
+                &json!({"params": {"fileId": file_id}, "body": body}),
+                "drive",
+                policy,
+                meta,
+                None,
+                None,
+                false,
+                &mut state.token_cache,
+            )
+            .await?;
+            let target = email.unwrap_or_else(|| domain.unwrap_or("unknown"));
+            if result.get("error").is_some() {
+                let msg = result["error"].as_str().unwrap_or("unknown error");
+                return Ok(json!({
+                    "content": [{ "type": "text", "text": format!("Failed to share with {target}: {msg}") }],
+                    "isError": true
+                }));
+            }
+            if result.get("id").is_none() {
+                return Ok(json!({
+                    "content": [{ "type": "text", "text": format!("Failed to share with {target}: no permission ID returned") }],
+                    "isError": true
+                }));
+            }
+            Ok(json!({
+                "content": [{ "type": "text", "text": format!("Shared with {} as {}", target, role) }],
+                "structuredContent": result,
+                "isError": false
+            }))
+        }
+
+        "gws_drive_trash" => {
+            let file_id = extract_file_id(arguments, "file_id")?;
+            let update_method = files_resource
+                .methods
+                .get("update")
+                .ok_or_else(|| GwsError::Validation("update method not found".into()))?;
+            let result = crate::execute::execute_tool(
+                &drive_doc,
+                update_method,
+                "files",
+                "update",
+                &json!({"params": {"fileId": file_id}, "body": {"trashed": true}}),
+                "drive",
+                policy,
+                meta,
+                None,
+                None,
+                false,
+                &mut state.token_cache,
+            )
+            .await?;
+            if result.get("error").is_some() {
+                let msg = result["error"].as_str().unwrap_or("unknown error");
+                return Ok(json!({
+                    "content": [{ "type": "text", "text": format!("Failed to move file to trash: {msg}") }],
+                    "isError": true
+                }));
+            }
+            Ok(json!({
+                "content": [{ "type": "text", "text": format!("File {} moved to trash", file_id) }],
+                "isError": false
+            }))
+        }
+
+        "gws_drive_copy" => {
+            let file_id = extract_file_id(arguments, "file_id")?;
+            let name = arguments.get("name").and_then(|v| v.as_str());
+            let folder_id = arguments.get("folder_id").and_then(|v| v.as_str());
+            let copy_method = files_resource
+                .methods
+                .get("copy")
+                .ok_or_else(|| GwsError::Validation("copy method not found".into()))?;
+            let mut body = json!({});
+            if let Some(n) = name {
+                body["name"] = json!(n);
+            }
+            if let Some(fid) = folder_id {
+                body["parents"] = json!([fid]);
+            }
+            let result = crate::execute::execute_tool(
+                &drive_doc,
+                copy_method,
+                "files",
+                "copy",
+                &json!({"params": {"fileId": file_id}, "body": body}),
+                "drive",
+                policy,
+                meta,
+                None,
+                None,
+                false,
+                &mut state.token_cache,
+            )
+            .await?;
+            let new_id = result["id"].as_str().unwrap_or("");
+            Ok(json!({
+                "content": [{ "type": "text", "text": format!("File copied.\nfile_id: {}", new_id) }],
+                "structuredContent": result,
+                "isError": false
+            }))
+        }
+
+        "gws_drive_rename" => {
+            let file_id = extract_file_id(arguments, "file_id")?;
+            let name = arguments
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| GwsError::Validation("Missing 'name'".into()))?;
+            let update_method = files_resource
+                .methods
+                .get("update")
+                .ok_or_else(|| GwsError::Validation("update method not found".into()))?;
+            crate::execute::execute_tool(
+                &drive_doc,
+                update_method,
+                "files",
+                "update",
+                &json!({"params": {"fileId": file_id}, "body": {"name": name}}),
+                "drive",
+                policy,
+                meta,
+                None,
+                None,
+                false,
+                &mut state.token_cache,
+            )
+            .await?;
+            Ok(json!({
+                "content": [{ "type": "text", "text": format!("File renamed to '{}'", name) }],
+                "isError": false
+            }))
+        }
+
+        _ => Err(GwsError::Validation(format!(
+            "Unknown drive helper tool: {tool_name}"
+        ))),
+    }
+}
+
 async fn execute_docs_helper(
     tool_name: &str,
     arguments: &Value,
@@ -557,22 +981,17 @@ async fn execute_docs_helper(
     state: &mut ServerState,
     dry_run: bool,
 ) -> Result<Value, GwsError> {
-    if tool_name == "gws_docs_import_markdown" || tool_name == "gws_docs_write" {
+    if tool_name == "gws_docs_write" {
         tracing::info!(
             tool = tool_name,
             has_content = arguments.get("content").is_some(),
-            has_markdown = arguments.get("markdown").is_some(),
             has_document_id = arguments.get("document_id").is_some() || arguments.get("documentId").is_some(),
             has_title = arguments.get("title").is_some(),
             content_type = ?arguments.get("content").map(|v| v.is_string()),
             arg_keys = ?arguments.as_object().map(|m| m.keys().collect::<Vec<_>>()),
             "docs_write dispatch"
         );
-        let format = if tool_name == "gws_docs_write" {
-            crate::format::parse_format(arguments.get("format").and_then(|v| v.as_str()))
-        } else {
-            crate::format::ContentFormat::Markdown
-        };
+        let format = crate::format::parse_format(arguments.get("format").and_then(|v| v.as_str()));
         return execute_docs_write(arguments, policy, meta, state, dry_run, format).await;
     }
 
@@ -623,8 +1042,8 @@ async fn execute_docs_helper(
     }
 
     if tool_name == "gws_docs_read"
-        || tool_name == "gws_docs_structure"
-        || tool_name == "gws_docs_find_text"
+        || tool_name == "gws_docs_outline"
+        || tool_name == "gws_docs_find"
     {
         let doc_ref = state.get_doc("docs").await?;
         let resource = tools::find_resource(&doc_ref.resources, "documents")
@@ -650,20 +1069,7 @@ async fn execute_docs_helper(
         )
         .await?;
 
-        if let Some(search) = arguments.get("search").and_then(|v| v.as_str()) {
-            let occurrence = arguments
-                .get("occurrence")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(1) as usize;
-            let result = helpers::find_text_in_doc(&doc_content, search, occurrence);
-            return Ok(json!({
-                "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
-                "structuredContent": result,
-                "isError": false
-            }));
-        }
-
-        if tool_name == "gws_docs_find_text" {
+        if tool_name == "gws_docs_find" {
             let needle = arguments
                 .get("text")
                 .and_then(|v| v.as_str())
@@ -680,37 +1086,46 @@ async fn execute_docs_helper(
             }));
         }
 
-        let output = arguments
-            .get("output")
+        if tool_name == "gws_docs_outline" {
+            let structure = helpers::parse_doc_structure(&doc_content);
+            return Ok(json!({
+                "content": [{ "type": "text", "text": serde_json::to_string_pretty(&structure).unwrap_or_default() }],
+                "structuredContent": structure,
+                "isError": false
+            }));
+        }
+
+        // gws_docs_read: section-level or full doc
+        let section = arguments.get("section").and_then(|v| v.as_str());
+        let format = arguments
+            .get("format")
             .and_then(|v| v.as_str())
-            .unwrap_or("structure");
-        return match output {
-            "markdown" => {
-                let md = crate::format::doc_to_markdown(&doc_content);
-                Ok(json!({
-                    "content": [{ "type": "text", "text": md }],
-                    "isError": false
-                }))
+            .unwrap_or("markdown");
+
+        let content_to_convert = if let Some(heading) = section {
+            if let Some((start, end)) = find_section_range(&doc_content, heading) {
+                extract_section_doc(&doc_content, start, end)
+            } else {
+                return Err(GwsError::Validation(format!(
+                    "Section '{heading}' not found. Use gws_docs_outline to see available headings."
+                )));
             }
+        } else {
+            doc_content.clone()
+        };
+
+        return match format {
             "plain" => {
-                let plain = crate::format::doc_to_plain(&doc_content);
+                let plain = crate::format::doc_to_plain(&content_to_convert);
                 Ok(json!({
                     "content": [{ "type": "text", "text": plain }],
                     "isError": false
                 }))
             }
-            "full" => {
-                let text = serde_json::to_string_pretty(&doc_content).unwrap_or_default();
-                Ok(json!({
-                    "content": [{ "type": "text", "text": text }],
-                    "isError": false
-                }))
-            }
             _ => {
-                let structure = helpers::parse_doc_structure(&doc_content);
+                let md = crate::format::doc_to_markdown(&content_to_convert);
                 Ok(json!({
-                    "content": [{ "type": "text", "text": serde_json::to_string_pretty(&structure).unwrap_or_default() }],
-                    "structuredContent": structure,
+                    "content": [{ "type": "text", "text": md }],
                     "isError": false
                 }))
             }
@@ -971,15 +1386,17 @@ async fn execute_docs_helper(
             let drive_file_id = arguments.get("drive_file_id").and_then(|v| v.as_str());
             let image_data = arguments.get("image_data").and_then(|v| v.as_str());
 
+            let content_type = arguments
+                .get("image_content_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("image/png");
             let uri = if let Some(url) = image_url {
                 url.to_string()
-            } else if drive_file_id.is_some() || image_data.is_some() {
-                return Err(GwsError::Validation(
-                    "Google Docs insertInlineImage requires a publicly accessible URL \
-                     (2KB URI limit prevents data URIs). Use 'image_url' with a public \
-                     URL, or insert images via the Google Docs UI from Drive."
-                        .into(),
-                ));
+            } else if let Some(fid) = drive_file_id {
+                let (url, _perm_id) = make_image_insertable(fid, policy, meta, state).await?;
+                url
+            } else if let Some(data) = image_data {
+                format!("data:{content_type};base64,{data}")
             } else {
                 return Err(GwsError::Validation(
                     "One of 'image_url', 'drive_file_id', or 'image_data' is required".into(),
@@ -998,7 +1415,7 @@ async fn execute_docs_helper(
             }));
             reqs
         }
-        "gws_docs_format_text" => {
+        "gws_docs_format" | "gws_docs_format_text" => {
             let (start, end) = if let Some(text_match) =
                 arguments.get("text").and_then(|v| v.as_str())
             {
@@ -1208,9 +1625,138 @@ fn find_section_range(doc: &Value, section: &str) -> Option<(i32, i32)> {
     if let Some(start) = section_start {
         let last = content.last()?;
         let end = last["endIndex"].as_i64().unwrap_or(start as i64) as i32;
-        return Some((start, end));
+        return Some((start, end - 1));
     }
     None
+}
+
+async fn make_image_insertable(
+    file_id: &str,
+    policy: &Policy,
+    meta: &RequestMeta,
+    state: &mut ServerState,
+) -> Result<(String, Option<String>), GwsError> {
+    let drive_doc = state.get_doc("drive").await?;
+    let resource = tools::find_resource(&drive_doc.resources, "permissions")
+        .ok_or_else(|| GwsError::Validation("permissions resource not found".into()))?;
+    let create_method = resource
+        .methods
+        .get("create")
+        .ok_or_else(|| GwsError::Validation("create method not found".into()))?;
+    let perm_args = json!({
+        "params": { "fileId": file_id },
+        "body": { "role": "reader", "type": "anyone" }
+    });
+    let perm_result = crate::execute::execute_tool(
+        &drive_doc,
+        create_method,
+        "permissions",
+        "create",
+        &perm_args,
+        "drive",
+        policy,
+        meta,
+        None,
+        None,
+        false,
+        &mut state.token_cache,
+    )
+    .await?;
+    if let Some(err) = perm_result.get("error") {
+        let msg = err.as_str().unwrap_or("unknown error");
+        return Err(GwsError::Api {
+            code: perm_result["status"].as_u64().unwrap_or(403) as u16,
+            message: format!(
+                "Cannot make image publicly accessible for Docs insertion: {msg}. \
+                 The image is in Drive (file ID: {file_id}). Insert via Docs UI: Insert > Image > Drive."
+            ),
+            reason: "sharingBlocked".into(),
+            enable_url: None,
+        });
+    }
+    let perm_id = perm_result["id"]
+        .as_str()
+        .unwrap_or("anyoneWithLink")
+        .to_string();
+    let url = format!("https://drive.google.com/uc?export=download&id={file_id}");
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    Ok((url, Some(perm_id)))
+}
+
+async fn revoke_image_sharing(
+    file_id: &str,
+    permission_id: &str,
+    policy: &Policy,
+    meta: &RequestMeta,
+    state: &mut ServerState,
+) {
+    if let Ok(drive_doc) = state.get_doc("drive").await {
+        if let Some(resource) = tools::find_resource(&drive_doc.resources, "permissions") {
+            if let Some(delete_method) = resource.methods.get("delete") {
+                let _ = crate::execute::execute_tool(
+                    &drive_doc,
+                    delete_method,
+                    "permissions",
+                    "delete",
+                    &json!({"params": {"fileId": file_id, "permissionId": permission_id}}),
+                    "drive",
+                    policy,
+                    meta,
+                    None,
+                    None,
+                    false,
+                    &mut state.token_cache,
+                )
+                .await;
+            }
+        }
+    }
+}
+
+fn shift_request_indexes(requests: &[Value], shift: i32) -> Vec<Value> {
+    if shift == 0 {
+        return requests.to_vec();
+    }
+    requests
+        .iter()
+        .map(|req| {
+            let mut r = req.clone();
+            for path in &[
+                "/insertText/location/index",
+                "/insertTable/location/index",
+                "/updateParagraphStyle/range/startIndex",
+                "/updateParagraphStyle/range/endIndex",
+                "/updateTextStyle/range/startIndex",
+                "/updateTextStyle/range/endIndex",
+                "/createParagraphBullets/range/startIndex",
+                "/createParagraphBullets/range/endIndex",
+            ] {
+                if let Some(idx) = r.pointer_mut(path) {
+                    if let Some(v) = idx.as_i64() {
+                        *idx = json!(v + shift as i64);
+                    }
+                }
+            }
+            r
+        })
+        .collect()
+}
+
+fn extract_section_doc(doc: &Value, start: i32, end: i32) -> Value {
+    let mut section_doc = doc.clone();
+    if let Some(content) = doc["body"]["content"].as_array() {
+        let filtered: Vec<Value> = content
+            .iter()
+            .filter(|elem| {
+                let elem_start = elem["startIndex"].as_i64().unwrap_or(0) as i32;
+                let elem_end = elem["endIndex"].as_i64().unwrap_or(0) as i32;
+                elem_start >= start && elem_end <= end
+            })
+            .cloned()
+            .collect();
+        section_doc["body"]["content"] = json!(filtered);
+    }
+    section_doc
 }
 
 async fn execute_docs_write(
@@ -1236,9 +1782,68 @@ async fn execute_docs_write(
         .or_else(|| arguments.get("documentId"))
         .and_then(|v| v.as_str());
     let title = arguments.get("title").and_then(|v| v.as_str());
-    let folder_id = arguments.get("folder_id").and_then(|v| v.as_str());
+    let mut folder_id = arguments
+        .get("folder_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     let section = arguments.get("section").and_then(|v| v.as_str());
     let template_id = arguments.get("template_id").and_then(|v| v.as_str());
+
+    // If document_id looks like a folder (title also provided), treat it as folder_id.
+    let doc_id_arg = if let (Some(id), Some(_)) = (doc_id_arg, title) {
+        if folder_id.is_none() {
+            if let Ok(drive_doc) = state.get_doc("drive").await {
+                if let Some(resource) = tools::find_resource(&drive_doc.resources, "files") {
+                    if let Some(gm) = resource.methods.get("get") {
+                        let args = json!({"params": {"fileId": id}, "fields": "mimeType"});
+                        if let Ok(file_meta) = crate::execute::execute_tool(
+                            &drive_doc,
+                            gm,
+                            "files",
+                            "get",
+                            &args,
+                            "drive",
+                            policy,
+                            meta,
+                            None,
+                            None,
+                            false,
+                            &mut state.token_cache,
+                        )
+                        .await
+                        {
+                            if file_meta["mimeType"].as_str()
+                                == Some("application/vnd.google-apps.folder")
+                            {
+                                tracing::info!(
+                                    provided_id = id,
+                                    "document_id is a folder — treating as folder_id"
+                                );
+                                folder_id = Some(id.to_string());
+                                None
+                            } else {
+                                Some(id)
+                            }
+                        } else {
+                            Some(id)
+                        }
+                    } else {
+                        Some(id)
+                    }
+                } else {
+                    Some(id)
+                }
+            } else {
+                Some(id)
+            }
+        } else {
+            Some(id)
+        }
+    } else {
+        doc_id_arg
+    };
+
+    let folder_id = folder_id.as_deref();
 
     // Step A: resolve, find existing, or create the document
     let (doc_id, created_new_doc) = if let Some(id) = doc_id_arg {
@@ -1453,6 +2058,10 @@ async fn execute_docs_write(
     let docs_doc = state.get_doc("docs").await?;
     let resource = tools::find_resource(&docs_doc.resources, "documents")
         .ok_or_else(|| GwsError::Validation("documents resource not found in docs API".into()))?;
+    let get_method = resource
+        .methods
+        .get("get")
+        .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
     let batch_method = resource
         .methods
         .get("batchUpdate")
@@ -1491,26 +2100,140 @@ async fn execute_docs_write(
         insert_index,
     ));
 
-    let content_args = json!({
-        "params": { "documentId": doc_id },
-        "body": { "requests": content_requests }
-    });
+    // Split at table boundaries: insertTable changes the doc's index space,
+    // so subsequent inserts at pre-calculated offsets fail. Split into
+    // separate batches, re-derive indexes from the doc after each table.
+    let mut batches: Vec<(Vec<Value>, Option<Value>)> = Vec::new();
+    let mut current_batch: Vec<Value> = Vec::new();
+    for req in &content_requests {
+        if let Some(mut it) = req.get("insertTable").cloned() {
+            let table_data = it.as_object_mut().and_then(|m| m.remove("_tableData"));
+            current_batch.push(json!({ "insertTable": it }));
+            batches.push((current_batch, table_data));
+            current_batch = Vec::new();
+        } else {
+            current_batch.push(req.clone());
+        }
+    }
+    if !current_batch.is_empty() {
+        batches.push((current_batch, None));
+    }
 
-    let mut result = crate::execute::execute_tool(
-        &docs_doc,
-        batch_method,
-        "documents",
-        "batchUpdate",
-        &content_args,
-        "docs",
-        policy,
-        meta,
-        None,
-        None,
-        dry_run,
-        &mut state.token_cache,
-    )
-    .await;
+    let mut result: Result<Value, GwsError> = Ok(json!({}));
+    for (batch_idx, (batch_reqs, table_data)) in batches.iter().enumerate() {
+        let final_reqs = if batch_idx > 0 && !batch_reqs.is_empty() {
+            let doc_now = crate::execute::execute_tool(
+                &docs_doc,
+                get_method,
+                "documents",
+                "get",
+                &json!({"params": {"documentId": &doc_id}}),
+                "docs",
+                policy,
+                meta,
+                None,
+                None,
+                false,
+                &mut state.token_cache,
+            )
+            .await?;
+            let end_index = doc_now
+                .pointer("/body/content")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.last())
+                .and_then(|el| el["endIndex"].as_i64())
+                .unwrap_or(1) as i32;
+            let first_idx = batch_reqs
+                .iter()
+                .find_map(|r| {
+                    r.pointer("/insertText/location/index")
+                        .and_then(|v| v.as_i64())
+                        .map(|i| i as i32)
+                })
+                .unwrap_or(end_index);
+            let shift = (end_index - 1) - first_idx;
+            shift_request_indexes(batch_reqs, shift)
+        } else {
+            batch_reqs.clone()
+        };
+
+        if !final_reqs.is_empty() {
+            let batch_args = json!({
+                "params": { "documentId": doc_id },
+                "body": { "requests": final_reqs }
+            });
+            result = crate::execute::execute_tool(
+                &docs_doc,
+                batch_method,
+                "documents",
+                "batchUpdate",
+                &batch_args,
+                "docs",
+                policy,
+                meta,
+                None,
+                None,
+                dry_run,
+                &mut state.token_cache,
+            )
+            .await;
+            if let Ok(ref r) = result {
+                if check_api_result(r).is_err() {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        // Populate table cells after inserting the table
+        if let Some(data) = table_data {
+            if !dry_run {
+                let doc_now = crate::execute::execute_tool(
+                    &docs_doc,
+                    get_method,
+                    "documents",
+                    "get",
+                    &json!({"params": {"documentId": &doc_id}}),
+                    "docs",
+                    policy,
+                    meta,
+                    None,
+                    None,
+                    false,
+                    &mut state.token_cache,
+                )
+                .await?;
+                let rows: Vec<Vec<String>> = data
+                    .get("rows")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+                let is_header = data
+                    .get("header")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if !rows.is_empty() {
+                    let (headers, data_rows) = if is_header && rows.len() > 1 {
+                        (Some(rows[0].clone()), rows[1..].to_vec())
+                    } else {
+                        (None, rows)
+                    };
+                    let populate_reqs = helpers::build_table_populate_requests(
+                        &doc_now,
+                        headers.as_deref(),
+                        &data_rows,
+                    );
+                    if !populate_reqs.is_empty() {
+                        let _ = crate::execute::execute_tool(
+                            &docs_doc, batch_method, "documents", "batchUpdate",
+                            &json!({"params": {"documentId": doc_id}, "body": {"requests": populate_reqs}}),
+                            "docs", policy, meta, None, None, false, &mut state.token_cache,
+                        ).await;
+                    }
+                }
+            }
+        }
+    }
 
     let failed = match &result {
         Ok(r) => check_api_result(r).is_err(),
@@ -1569,9 +2292,9 @@ async fn execute_docs_write(
     };
 
     let text = if created_new_doc {
-        format!("Content written to new document. document_id: {doc_id}")
+        format!("Content written to new document.\ndocument_id: {doc_id}")
     } else {
-        format!("Content written to document. document_id: {doc_id}")
+        format!("Content written to document.\ndocument_id: {doc_id}")
     };
 
     Ok(json!({
@@ -2143,51 +2866,76 @@ async fn execute_generate_image(
     .await?;
     state.token_cache = tc;
 
-    // If targeting a document, upload to Drive and return the file ID.
-    // Google Docs insertInlineImage requires a publicly accessible URL, which
-    // enterprise orgs may block. The image is uploaded to Drive for the user
-    // to insert via the Docs UI or gws_docs_insert_image with image_url.
     if let Some(doc_id) = document_id {
+        let position = parse_position(arguments);
+        let w = arguments.get("width_pt").and_then(|v| v.as_f64());
+        let h = arguments.get("height_pt").and_then(|v| v.as_f64());
+
         let file_id = upload_image_to_drive(&generated, folder_id, policy, meta, state).await?;
-        return Ok(json!({
-            "document_id": doc_id,
-            "drive_file_id": file_id,
-            "drive_url": format!("https://drive.google.com/file/d/{}/view", file_id),
-            "mime_type": generated.mime_type,
-            "note": "Image generated and uploaded to Drive. Google Docs API requires \
-                    a publicly accessible URL for inline image insertion. Insert the \
-                    image from Drive using the Google Docs UI (Insert > Image > By URL \
-                    or Drive), or use gws_docs_insert_image with a public image_url.",
-            "_mcp_content": [{
-                "type": "image",
-                "data": generated.base64_data,
-                "mimeType": generated.mime_type
-            }, {
-                "type": "text",
-                "text": format!("Generated image uploaded to Drive: https://drive.google.com/file/d/{}/view", file_id)
-            }]
-        }));
+        let (public_url, perm_id) = make_image_insertable(&file_id, policy, meta, state).await?;
+
+        let mut reqs = vec![helpers::build_insert_image_request(
+            &public_url,
+            position,
+            w,
+            h,
+        )];
+        reqs.push(
+            json!({ "insertText": { "text": "\n", "endOfSegmentLocation": { "segmentId": "" } } }),
+        );
+
+        let docs_doc = state.get_doc("docs").await?;
+        let resource = tools::find_resource(&docs_doc.resources, "documents")
+            .ok_or_else(|| GwsError::Validation("documents resource not found".into()))?;
+        let batch_method = resource
+            .methods
+            .get("batchUpdate")
+            .ok_or_else(|| GwsError::Validation("batchUpdate method not found".into()))?;
+
+        let result = crate::execute::execute_tool(
+            &docs_doc,
+            batch_method,
+            "documents",
+            "batchUpdate",
+            &json!({"params": {"documentId": doc_id}, "body": {"requests": reqs}}),
+            "docs",
+            policy,
+            meta,
+            None,
+            None,
+            dry_run,
+            &mut state.token_cache,
+        )
+        .await;
+
+        if let Some(pid) = &perm_id {
+            revoke_image_sharing(&file_id, pid, policy, meta, state).await;
+        }
+
+        return match result {
+            Ok(ref r) if check_api_result(r).is_ok() => Ok(json!({
+                "content": [{ "type": "text", "text": format!("Image generated and inserted into document {doc_id}") }],
+                "isError": false
+            })),
+            _ => Ok(json!({
+                "content": [{ "type": "text", "text": format!(
+                    "Image generated and uploaded to Drive (file: {file_id}) but insertion failed. \
+                     Enterprise orgs may block public sharing required by the Docs API. \
+                     Insert via Docs UI: Insert > Image > Drive."
+                )}],
+                "isError": true
+            })),
+        };
     }
 
-    // Same limitation applies to Slides — createImage requires a publicly accessible URL
     if let Some(pres_id) = presentation_id {
         let file_id = upload_image_to_drive(&generated, folder_id, policy, meta, state).await?;
         return Ok(json!({
-            "presentation_id": pres_id,
-            "drive_file_id": file_id,
-            "drive_url": format!("https://drive.google.com/file/d/{}/view", file_id),
-            "mime_type": generated.mime_type,
-            "note": "Image generated and uploaded to Drive. Google Slides API requires \
-                    a publicly accessible URL for image insertion. Insert the image from \
-                    Drive using the Slides UI (Insert > Image > By URL or Drive).",
-            "_mcp_content": [{
-                "type": "image",
-                "data": generated.base64_data,
-                "mimeType": generated.mime_type
-            }, {
-                "type": "text",
-                "text": format!("Generated image uploaded to Drive: https://drive.google.com/file/d/{}/view", file_id)
-            }]
+            "content": [{ "type": "text", "text": format!(
+                "Image generated and uploaded to Drive (file: {file_id}). \
+                 Insert into presentation {pres_id} via Slides UI."
+            )}],
+            "isError": false
         }));
     }
 
@@ -2928,7 +3676,7 @@ mod tests {
             }
         });
         let range = find_section_range(&doc, "Only Section");
-        assert_eq!(range, Some((1, 50)));
+        assert_eq!(range, Some((1, 49)));
     }
 
     #[test]

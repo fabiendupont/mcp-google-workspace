@@ -171,17 +171,17 @@ pub async fn build_tools_list(
 
     tools.push(make_tool(
         "gws_discover",
-        "API Schema Discovery",
-        "Query available resources, methods, and parameter schemas for any enabled service. Call with service only to list resources; add resource to list methods; add method to get full parameter schema.",
+        "API & Tool Discovery",
+        "Discover API schemas or get full tool documentation. Use tool= for helper tool details, or service= for API resources/methods.",
         ToolAnnotations::new().read_only(true).destructive(false).idempotent(true).open_world(false),
         json!({
             "type": "object",
             "properties": {
-                "service": { "type": "string", "description": "Service name (e.g., drive, gmail)" },
-                "resource": { "type": "string", "description": "Resource name to list methods for" },
-                "method": { "type": "string", "description": "Method name to get full parameter schema" }
-            },
-            "required": ["service"]
+                "tool": { "type": "string", "description": "Helper tool name for full schema and usage (e.g., gws_docs_write)" },
+                "service": { "type": "string", "description": "Service name for API discovery (e.g., drive, gmail)" },
+                "resource": { "type": "string", "description": "Resource name to list methods" },
+                "method": { "type": "string", "description": "Method name for full parameter schema" }
+            }
         }),
     ));
 
@@ -214,21 +214,48 @@ pub async fn build_tools_list(
         }),
     ));
 
-    if !policy.compact_schemas {
-        for v in crate::helpers::helper_tool_schemas() {
-            tools.push(tool_from_json(v));
-        }
-        tools.push(tool_from_json(crate::helpers::markdown_tool_schema()));
-    }
+    // Drive helper tools
+    tools.push(tool_from_json(
+        crate::drive_helpers::drive_list_tool_schema(),
+    ));
+    tools.push(tool_from_json(
+        crate::drive_helpers::drive_find_folder_tool_schema(),
+    ));
+    tools.push(tool_from_json(
+        crate::drive_helpers::drive_info_tool_schema(),
+    ));
+    tools.push(tool_from_json(
+        crate::drive_helpers::drive_create_folder_tool_schema(),
+    ));
+    tools.push(tool_from_json(
+        crate::drive_helpers::drive_copy_tool_schema(),
+    ));
+    tools.push(tool_from_json(
+        crate::drive_helpers::drive_rename_tool_schema(),
+    ));
+    tools.push(tool_from_json(
+        crate::drive_helpers::drive_move_tool_schema(),
+    ));
+    tools.push(tool_from_json(
+        crate::drive_helpers::drive_share_tool_schema(),
+    ));
+    tools.push(tool_from_json(
+        crate::drive_helpers::drive_delete_tool_schema(),
+    ));
+
+    // Docs helper tools
     tools.push(tool_from_json(crate::helpers::docs_write_tool_schema()));
     tools.push(tool_from_json(crate::helpers::docs_read_tool_schema()));
+    tools.push(tool_from_json(crate::helpers::outline_tool_schema()));
+    tools.push(tool_from_json(crate::helpers::find_tool_schema()));
     tools.push(tool_from_json(crate::helpers::insert_table_tool_schema()));
-    tools.push(tool_from_json(crate::helpers::read_table_tool_schema()));
+    tools.push(tool_from_json(crate::helpers::insert_image_tool_schema()));
     if !policy.compact_schemas {
-        tools.push(tool_from_json(crate::helpers::structure_tool_schema()));
-        tools.push(tool_from_json(crate::helpers::find_text_tool_schema()));
-        tools.push(tool_from_json(crate::helpers::append_section_tool_schema()));
+        tools.push(tool_from_json(crate::helpers::read_table_tool_schema()));
+        tools.push(tool_from_json(crate::helpers::format_tool_schema()));
     }
+
+    // Slides & image tools
     tools.push(tool_from_json(crate::slides_helpers::marp_tool_schema()));
     tools.push(tool_from_json(
         crate::slides_helpers::templates_tool_schema(),
@@ -238,15 +265,86 @@ pub async fn build_tools_list(
     Ok(tools)
 }
 
+fn tool_full_schema(name: &str) -> Option<Value> {
+    let schema = match name {
+        "gws_drive_list" => crate::drive_helpers::drive_list_tool_schema(),
+        "gws_drive_find_folder" => crate::drive_helpers::drive_find_folder_tool_schema(),
+        "gws_drive_info" => crate::drive_helpers::drive_info_tool_schema(),
+        "gws_drive_create_folder" => crate::drive_helpers::drive_create_folder_tool_schema(),
+        "gws_drive_move" => crate::drive_helpers::drive_move_tool_schema(),
+        "gws_drive_share" => crate::drive_helpers::drive_share_tool_schema(),
+        "gws_drive_trash" => crate::drive_helpers::drive_delete_tool_schema(),
+        "gws_drive_copy" => crate::drive_helpers::drive_copy_tool_schema(),
+        "gws_drive_rename" => crate::drive_helpers::drive_rename_tool_schema(),
+        "gws_docs_write" => crate::helpers::docs_write_tool_schema(),
+        "gws_docs_read" => crate::helpers::docs_read_tool_schema(),
+        "gws_docs_outline" => crate::helpers::outline_tool_schema(),
+        "gws_docs_find" => crate::helpers::find_tool_schema(),
+        "gws_docs_insert_table" => crate::helpers::insert_table_tool_schema(),
+        "gws_docs_read_table" => crate::helpers::read_table_tool_schema(),
+        "gws_docs_insert_image" => crate::helpers::insert_image_tool_schema(),
+        "gws_docs_format" => crate::helpers::format_tool_schema(),
+        _ => return None,
+    };
+    let mut info = json!({
+        "tool": name,
+        "title": schema.get("title"),
+        "description": schema.get("description"),
+        "inputSchema": schema.get("inputSchema"),
+        "annotations": schema.get("annotations"),
+    });
+    if let Some(extras) = tool_extra_info(name) {
+        info["usage"] = json!(extras);
+    }
+    Some(info)
+}
+
+fn tool_extra_info(name: &str) -> Option<&'static str> {
+    match name {
+        "gws_docs_write" => Some(
+            "Also accepts: template_id (doc ID to copy named styles from), \
+            index (character position, overrides position).",
+        ),
+        "gws_docs_read" => {
+            Some("format=plain returns raw text. Use gws_docs_outline for structure with indexes.")
+        }
+        "gws_docs_format" => Some(
+            "Target by text (auto-finds position) or start_index/end_index. \
+            Use gws_docs_find to get indexes first.",
+        ),
+        "gws_docs_insert_image" => Some(
+            "For Drive images, use drive_file_id (downloaded and embedded, no sharing needed). \
+            For generated images, call gws_generate_image first.",
+        ),
+        _ => None,
+    }
+}
+
 pub async fn handle_discover(
     arguments: &Value,
     policy: &Policy,
     docs: &mut HashMap<String, Arc<RestDescription>>,
 ) -> Result<Value, GwsError> {
+    if let Some(tool_name) = arguments.get("tool").and_then(|v| v.as_str()) {
+        let result = tool_full_schema(tool_name).ok_or_else(|| {
+            GwsError::Validation(format!(
+                "Unknown tool '{tool_name}'. Helper tools: gws_docs_write, gws_docs_read, \
+                gws_docs_outline, gws_docs_find, gws_docs_insert_table, gws_docs_read_table, \
+                gws_docs_insert_image, gws_docs_format."
+            ))
+        })?;
+        return Ok(json!({
+            "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
+            "isError": false
+        }));
+    }
+
     let service = arguments
         .get("service")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| GwsError::Validation("Missing 'service' in gws_discover".to_string()))?;
+        .ok_or_else(|| {
+            GwsError::Validation("Missing 'service' or 'tool' in gws_discover".to_string())
+        })?;
 
     if !policy.is_service_allowed(service) {
         return Err(GwsError::Validation(format!(
@@ -488,5 +586,40 @@ mod tests {
     fn test_find_resource_empty_path() {
         let resources = make_resources();
         assert!(find_resource(&resources, "").is_none());
+    }
+
+    #[test]
+    fn test_tool_full_schema_known() {
+        let result = tool_full_schema("gws_docs_write");
+        assert!(result.is_some());
+        let info = result.unwrap();
+        assert_eq!(info["tool"], "gws_docs_write");
+        assert!(info["inputSchema"].is_object());
+        assert!(info["usage"].is_string());
+    }
+
+    #[test]
+    fn test_tool_full_schema_unknown() {
+        assert!(tool_full_schema("nonexistent_tool").is_none());
+    }
+
+    #[test]
+    fn test_tool_full_schema_all_tools() {
+        let names = [
+            "gws_docs_write",
+            "gws_docs_read",
+            "gws_docs_outline",
+            "gws_docs_find",
+            "gws_docs_insert_table",
+            "gws_docs_read_table",
+            "gws_docs_insert_image",
+            "gws_docs_format",
+        ];
+        for name in &names {
+            assert!(
+                tool_full_schema(name).is_some(),
+                "Missing schema for {name}"
+            );
+        }
     }
 }

@@ -1,7 +1,7 @@
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use serde_json::{Value, json};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum Position {
     End,
     Start,
@@ -818,53 +818,24 @@ fn generate_requests_from_blocks(blocks: &[Block], start_index: i32) -> Vec<Valu
                     continue;
                 }
 
+                // Only emit insertTable — cell population happens in a
+                // separate batchUpdate after fetching the doc to get real
+                // cell indexes (Google Docs internal table structure can't
+                // be reliably pre-calculated).
                 requests.push(json!({
                     "insertTable": {
                         "rows": num_rows,
                         "columns": num_cols,
-                        "location": { "index": current_index }
+                        "location": { "index": current_index },
+                        "_tableData": {
+                            "rows": rows,
+                            "header": header
+                        }
                     }
                 }));
 
-                for r in (0..num_rows).rev() {
-                    let row = &rows[r as usize];
-                    for c in (0..num_cols).rev() {
-                        let cell_text = row.get(c as usize).map(|s| s.as_str()).unwrap_or("");
-                        if cell_text.is_empty() {
-                            continue;
-                        }
-                        let cell_idx = current_index + 3 + r * (2 * num_cols + 1) + c * 2;
-                        requests.push(json!({
-                            "insertText": {
-                                "text": cell_text,
-                                "location": { "index": cell_idx }
-                            }
-                        }));
-                    }
-                }
-
-                if *header && num_rows > 0 {
-                    let header_start = current_index + 3;
-                    let header_end = current_index + 3 + 2 * num_cols;
-                    requests.push(json!({
-                        "updateTextStyle": {
-                            "textStyle": { "bold": true },
-                            "fields": "bold",
-                            "range": {
-                                "startIndex": header_start,
-                                "endIndex": header_end
-                            }
-                        }
-                    }));
-                }
-
-                let cell_text_len: i32 = rows
-                    .iter()
-                    .flat_map(|r| r.iter())
-                    .map(|s| s.chars().count() as i32)
-                    .sum();
-                // table structural footprint + cell text content
-                current_index += 2 + num_rows * (2 * num_cols + 1) + cell_text_len;
+                // Empty table: 1 (table) + N*(1 (row) + M*2 (cell + newline)) + 1 (trailing paragraph)
+                current_index += 2 + num_rows * (2 * num_cols + 1);
             }
             Block::Image { url } => {
                 flush_bullets(
@@ -972,279 +943,91 @@ fn flush_bullets(
     *ordered = None;
 }
 
-pub fn markdown_tool_schema() -> Value {
+pub fn insert_image_tool_schema() -> Value {
     json!({
-        "name": "gws_docs_import_markdown",
-        "description": "Import Markdown content into a Google Doc with proper formatting. Converts headings, bold, italic, lists, links, code, and images to native Google Docs elements. Can insert at a position or replace a section.",
+        "name": "gws_docs_insert_image",
+        "title": "Insert Image in Doc",
+        "description": "Insert an image into a Google Doc from Drive, URL, or base64 data.",
+        "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": true },
         "inputSchema": {
             "type": "object",
             "properties": {
                 "document_id": {
                     "type": "string",
-                    "description": "Target Google Doc ID. Omit to create a new doc."
+                    "description": "Google Docs document ID"
                 },
-                "markdown": {
+                "drive_file_id": {
                     "type": "string",
-                    "description": "Markdown content to import"
+                    "description": "Drive file ID of the image (downloaded and embedded, no sharing needed)"
                 },
-                "section": {
+                "image_url": {
                     "type": "string",
-                    "description": "Heading text to find and replace (e.g., 'Executive Summary'). Content from this heading to the next same-level heading is replaced."
+                    "description": "Public URL of the image"
+                },
+                "image_data": {
+                    "type": "string",
+                    "description": "Base64-encoded image data"
+                },
+                "image_content_type": {
+                    "type": "string",
+                    "enum": ["image/png", "image/jpeg", "image/gif"],
+                    "default": "image/png"
                 },
                 "position": {
                     "type": "string",
-                    "enum": ["start", "end"],
-                    "description": "Where to insert (ignored if section is provided)"
+                    "enum": ["end", "start"],
+                    "default": "end"
                 },
                 "index": {
                     "type": "integer",
-                    "description": "Specific character index (overrides position)"
+                    "description": "Character index (overrides position)"
                 },
-                "template_id": {
-                    "type": "string",
-                    "description": "Google Doc ID to copy named styles from"
-                },
-                "title": {
-                    "type": "string",
-                    "description": "Doc title (when creating new doc without document_id)"
-                },
-                "folder_id": {
-                    "type": "string",
-                    "description": "Drive folder ID (when creating new doc)"
-                }
+                "width_pt": { "type": "number", "description": "Width in points" },
+                "height_pt": { "type": "number", "description": "Height in points" }
             },
-            "required": ["markdown"]
+            "required": ["document_id"]
         }
     })
 }
 
-pub fn helper_tool_schemas() -> Vec<Value> {
-    vec![
-        json!({
-            "name": "gws_docs_insert_text",
-            "description": "PURPOSE: Insert a single text block into a Google Doc with optional styling. \
-        WHEN TO USE: Only when you need precise control over position and styling for a single text block. \
-        For writing document content, prefer gws_docs_write which handles Markdown conversion automatically. \
-        HOW TO USE: Set 'paragraph_style' on EVERY call (TITLE, SUBTITLE, HEADING_1, NORMAL_TEXT). \
-        Without paragraph_style, text renders as unstyled default. Use 'sections' array to insert multiple \
-        styled blocks in one call. \
-        LIMITATIONS: Requires 'document_id'. Does not support Markdown — text is inserted literally.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "document_id": {
-                        "type": "string",
-                        "description": "The Google Docs document ID"
-                    },
-                    "text": {
-                        "type": "string",
-                        "description": "The text to insert"
-                    },
-                    "position": {
-                        "type": "string",
-                        "enum": ["end", "start"],
-                        "description": "Where to insert: 'end' or 'start'. Use 'index' property for specific position."
-                    },
-                    "index": {
-                        "type": "integer",
-                        "description": "Specific character index to insert at (1-based). Overrides 'position'."
-                    },
-                    "bold": { "type": "boolean", "description": "Make text bold" },
-                    "italic": { "type": "boolean", "description": "Make text italic" },
-                    "font_size_pt": { "type": "number", "description": "Font size in points" },
-                    "font_family": { "type": "string", "description": "Font family name" },
-                    "foreground_color": { "type": "string", "description": "Text color as hex (e.g. '#CC0000')" },
-                    "background_color": { "type": "string", "description": "Highlight color as hex" },
-                    "paragraph_style": {
-                        "type": "string",
-                        "enum": ["NORMAL_TEXT", "HEADING_1", "HEADING_2", "HEADING_3", "HEADING_4", "HEADING_5", "HEADING_6", "TITLE", "SUBTITLE"],
-                        "description": "Named paragraph style to apply"
-                    },
-                    "sections": {
-                        "type": "array",
-                        "description": "Multiple text blocks to insert in sequence (alternative to single text). Each can have its own style.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "text": { "type": "string" },
-                                "paragraph_style": { "type": "string" },
-                                "bold": { "type": "boolean" },
-                                "foreground_color": { "type": "string" }
-                            },
-                            "required": ["text"]
-                        }
-                    }
+pub fn format_tool_schema() -> Value {
+    json!({
+        "name": "gws_docs_format",
+        "title": "Format Text in Doc",
+        "description": "Apply text or paragraph styling to a range. Target by start_index/end_index or by text search.",
+        "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": true },
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "document_id": {
+                    "type": "string",
+                    "description": "Google Docs document ID"
                 },
-                "required": ["document_id"]
-            }
-        }),
-        json!({
-            "name": "gws_docs_insert_table",
-            "description": "Insert a table into a Google Doc. Returns a batchUpdate request.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "document_id": {
-                        "type": "string",
-                        "description": "The Google Docs document ID"
-                    },
-                    "rows": {
-                        "type": "integer",
-                        "description": "Number of rows"
-                    },
-                    "columns": {
-                        "type": "integer",
-                        "description": "Number of columns"
-                    },
-                    "position": {
-                        "type": "string",
-                        "enum": ["end", "start"],
-                        "description": "Where to insert: 'end' or 'start'"
-                    },
-                    "index": {
-                        "type": "integer",
-                        "description": "Specific character index (overrides position)"
-                    }
+                "text": {
+                    "type": "string",
+                    "description": "Text to find and format (alternative to index range)"
                 },
-                "required": ["document_id", "rows", "columns"]
-            }
-        }),
-        json!({
-            "name": "gws_docs_insert_image",
-            "description": "Insert an inline image into a Google Doc. Requires a publicly accessible image URL (Google Docs API limitation). Use gws_generate_image to create images — it uploads to Drive and returns a drive_file_id for manual insertion via the Docs UI.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "document_id": {
-                        "type": "string",
-                        "description": "The Google Docs document ID"
-                    },
-                    "image_url": {
-                        "type": "string",
-                        "description": "Public URL of the image to insert"
-                    },
-                    "drive_file_id": {
-                        "type": "string",
-                        "description": "Google Drive file ID of the image. The image is downloaded and embedded directly — no public sharing needed."
-                    },
-                    "image_data": {
-                        "type": "string",
-                        "description": "Base64-encoded image data to embed directly"
-                    },
-                    "image_content_type": {
-                        "type": "string",
-                        "description": "MIME type when using image_data (default: image/png)",
-                        "enum": ["image/png", "image/jpeg", "image/gif"]
-                    },
-                    "position": {
-                        "type": "string",
-                        "enum": ["end", "start"],
-                        "description": "Where to insert"
-                    },
-                    "index": {
-                        "type": "integer",
-                        "description": "Specific character index (overrides position)"
-                    },
-                    "width_pt": {
-                        "type": "number",
-                        "description": "Image width in points"
-                    },
-                    "height_pt": {
-                        "type": "number",
-                        "description": "Image height in points"
-                    }
+                "start_index": { "type": "integer", "description": "Range start (1-based, inclusive)" },
+                "end_index": { "type": "integer", "description": "Range end (exclusive)" },
+                "occurrence": { "type": "integer", "description": "Which occurrence of text (1-based)", "default": 1 },
+                "bold": { "type": "boolean" },
+                "italic": { "type": "boolean" },
+                "font_size_pt": { "type": "number" },
+                "font_family": { "type": "string" },
+                "foreground_color": { "type": "string", "description": "Hex color, e.g. '#CC0000'" },
+                "background_color": { "type": "string", "description": "Hex highlight color" },
+                "named_style": {
+                    "type": "string",
+                    "enum": ["NORMAL_TEXT", "HEADING_1", "HEADING_2", "HEADING_3", "HEADING_4", "HEADING_5", "HEADING_6", "TITLE", "SUBTITLE"]
                 },
-                "required": ["document_id"]
-            }
-        }),
-        json!({
-            "name": "gws_docs_format_text",
-            "description": "Apply text and paragraph styling to a range in a Google Doc. Use start_index/end_index OR text (finds the text automatically).",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "document_id": {
-                        "type": "string",
-                        "description": "The Google Docs document ID"
-                    },
-                    "start_index": {
-                        "type": "integer",
-                        "description": "Start of the range (1-based, inclusive). Not needed if 'text' is provided."
-                    },
-                    "end_index": {
-                        "type": "integer",
-                        "description": "End of the range (exclusive). Not needed if 'text' is provided."
-                    },
-                    "text": {
-                        "type": "string",
-                        "description": "Text to find and format (alternative to start_index/end_index)"
-                    },
-                    "occurrence": {
-                        "type": "integer",
-                        "description": "Which occurrence to format (1-based, default 1)"
-                    },
-                    "bold": { "type": "boolean" },
-                    "italic": { "type": "boolean" },
-                    "font_size_pt": { "type": "number" },
-                    "font_family": { "type": "string" },
-                    "foreground_color": { "type": "string", "description": "Hex color like '#CC0000'" },
-                    "background_color": { "type": "string", "description": "Hex highlight color" },
-                    "named_style": {
-                        "type": "string",
-                        "enum": ["NORMAL_TEXT", "HEADING_1", "HEADING_2", "HEADING_3", "HEADING_4", "HEADING_5", "HEADING_6", "TITLE", "SUBTITLE"],
-                        "description": "Named paragraph style"
-                    },
-                    "alignment": {
-                        "type": "string",
-                        "enum": ["START", "CENTER", "END", "JUSTIFIED"],
-                        "description": "Paragraph alignment"
-                    }
-                },
-                "required": ["document_id"]
-            }
-        }),
-        json!({
-            "name": "gws_docs_add_bullets",
-            "description": "Add bullet or numbered list formatting to a range of paragraphs.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "document_id": {
-                        "type": "string",
-                        "description": "The Google Docs document ID"
-                    },
-                    "start_index": {
-                        "type": "integer",
-                        "description": "Start of the range"
-                    },
-                    "end_index": {
-                        "type": "integer",
-                        "description": "End of the range"
-                    },
-                    "preset": {
-                        "type": "string",
-                        "enum": [
-                            "BULLET_DISC_CIRCLE_SQUARE",
-                            "BULLET_DIAMONDX_ARROW3D_SQUARE",
-                            "BULLET_CHECKBOX",
-                            "BULLET_ARROW_DIAMOND_DISC",
-                            "BULLET_STAR_CIRCLE_SQUARE",
-                            "BULLET_ARROW3D_CIRCLE_SQUARE",
-                            "BULLET_LEFTTRIANGLE_DIAMOND_DISC",
-                            "NUMBERED_DECIMAL_ALPHA_ROMAN",
-                            "NUMBERED_DECIMAL_ALPHA_ROMAN_PARENS",
-                            "NUMBERED_DECIMAL_NESTED",
-                            "NUMBERED_UPPERALPHA_ALPHA_ROMAN",
-                            "NUMBERED_UPPERROMAN_UPPERALPHA_DECIMAL",
-                            "NUMBERED_ZERODECIMAL_ALPHA_ROMAN"
-                        ],
-                        "description": "Bullet preset style"
-                    }
-                },
-                "required": ["document_id", "start_index", "end_index", "preset"]
-            }
-        }),
-    ]
+                "alignment": {
+                    "type": "string",
+                    "enum": ["START", "CENTER", "END", "JUSTIFIED"]
+                }
+            },
+            "required": ["document_id"]
+        }
+    })
 }
 
 pub fn heading_level(style: &str) -> Option<u32> {
@@ -1471,61 +1254,36 @@ pub fn build_append_section_requests(
     requests
 }
 
-pub fn structure_tool_schema() -> Value {
+pub fn outline_tool_schema() -> Value {
     json!({
-        "name": "gws_docs_structure",
-        "title": "Document Structure",
-        "description": "Get a compact outline of a Google Doc: headings, tables, images with start/end indexes. Much smaller than fetching the full document.",
+        "name": "gws_docs_outline",
+        "title": "Doc Outline",
+        "description": "Get doc structure: headings, sections, tables, images, with character indexes.",
         "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true },
         "inputSchema": {
             "type": "object",
             "properties": {
-                "document_id": { "type": "string", "description": "Document ID" }
+                "document_id": { "type": "string", "description": "Google Docs document ID" }
             },
             "required": ["document_id"]
         }
     })
 }
 
-pub fn find_text_tool_schema() -> Value {
+pub fn find_tool_schema() -> Value {
     json!({
-        "name": "gws_docs_find_text",
-        "title": "Find Text in Document",
-        "description": "Find text in a Google Doc and return its start/end indexes. Use before gws_docs_format_text or gws_docs_add_bullets.",
+        "name": "gws_docs_find",
+        "title": "Find Text in Doc",
+        "description": "Find text in a Google Doc, returns start/end character indexes for formatting.",
         "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true },
         "inputSchema": {
             "type": "object",
             "properties": {
-                "document_id": { "type": "string", "description": "Document ID" },
-                "text": { "type": "string", "description": "Text to search for (exact substring match)" },
-                "occurrence": { "type": "integer", "description": "Which occurrence (1-based, default 1)" }
+                "document_id": { "type": "string", "description": "Google Docs document ID" },
+                "text": { "type": "string", "description": "Exact substring to search for" },
+                "occurrence": { "type": "integer", "description": "Which occurrence (1-based)", "default": 1 }
             },
             "required": ["document_id", "text"]
-        }
-    })
-}
-
-pub fn append_section_tool_schema() -> Value {
-    json!({
-        "name": "gws_docs_append_section",
-        "title": "Append Section",
-        "description": "PREFERRED for document building. Append a complete section: heading + body text + optional bullet list. All in one call, no index math needed. Use this instead of multiple gws_docs_insert_text calls.",
-        "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": true },
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "document_id": { "type": "string", "description": "Document ID" },
-                "heading": { "type": "string", "description": "Section heading text" },
-                "heading_level": { "type": "integer", "description": "Heading level 1-6 (default 1)" },
-                "body": { "type": "string", "description": "Body text (newlines become paragraphs)" },
-                "items": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Bullet list items"
-                },
-                "bullet_preset": { "type": "string", "description": "Bullet style (default BULLET_DISC_CIRCLE_SQUARE)" }
-            },
-            "required": ["document_id"]
         }
     })
 }
@@ -1692,42 +1450,34 @@ pub fn read_table_from_doc(doc: &Value, table_index: usize) -> Value {
 pub fn insert_table_tool_schema() -> Value {
     json!({
         "name": "gws_docs_insert_table",
-        "title": "Insert Table",
-        "description": "PURPOSE: Insert a table into a Google Doc, optionally pre-filled with data. \
-    WHEN TO USE: Use when you need a table in the document. Pass headers and rows as JSON arrays — \
-    much easier than trying to write Markdown table syntax. \
-    HOW TO USE: Set rows/columns for an empty table, OR pass headers + rows arrays to create a \
-    pre-filled table with bold headers. \
-    LIMITATIONS: Requires document_id. Maximum ~20 rows recommended for performance.",
+        "title": "Insert Table in Doc",
+        "description": "Insert a table into a Google Doc from headers and row arrays.",
         "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": true },
         "inputSchema": {
             "type": "object",
             "properties": {
                 "document_id": {
                     "type": "string",
-                    "description": "Google Doc ID (accepts documentId too)"
+                    "description": "Google Docs document ID"
                 },
                 "headers": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Column header texts (creates a header row with bold text)"
+                    "description": "Column headers (bold row)"
                 },
                 "rows": {
                     "type": "array",
-                    "items": {
-                        "type": "array",
-                        "items": { "type": "string" }
-                    },
-                    "description": "Data rows as array of arrays. Each inner array is one row."
+                    "items": { "type": "array", "items": { "type": "string" } },
+                    "description": "Data rows as array of arrays"
                 },
                 "columns": {
                     "type": "integer",
-                    "description": "Number of columns (only needed for empty table without headers)"
+                    "description": "Column count (only for empty table without headers)"
                 },
                 "position": {
                     "type": "string",
                     "enum": ["end", "start"],
-                    "description": "Where to insert (default: end)"
+                    "default": "end"
                 }
             },
             "required": ["document_id"]
@@ -1738,22 +1488,20 @@ pub fn insert_table_tool_schema() -> Value {
 pub fn read_table_tool_schema() -> Value {
     json!({
         "name": "gws_docs_read_table",
-        "title": "Read Table from Google Doc",
-        "description": "PURPOSE: Read a table's content from a Google Doc as a JSON array. \
-    WHEN TO USE: Use when you need to inspect or extract table data from a document. \
-    Returns rows as arrays of cell values, plus the table's character indexes. \
-    HOW TO USE: Pass document_id and optionally table_index (0-based, default 0 for first table).",
+        "title": "Read Table from Doc",
+        "description": "Read a table from a Google Doc as a JSON array of rows.",
         "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true },
         "inputSchema": {
             "type": "object",
             "properties": {
                 "document_id": {
                     "type": "string",
-                    "description": "Google Doc ID (accepts documentId too)"
+                    "description": "Google Docs document ID"
                 },
                 "table_index": {
                     "type": "integer",
-                    "description": "Which table to read (0-based, default 0 = first table)"
+                    "description": "Which table (0-based)",
+                    "default": 0
                 }
             },
             "required": ["document_id"]
@@ -1765,52 +1513,40 @@ pub fn docs_write_tool_schema() -> Value {
     json!({
         "name": "gws_docs_write",
         "title": "Write to Google Doc",
-        "description": "PURPOSE: Write formatted content to a Google Doc. The server converts your content \
-    to native Google Docs elements (headings, bold, italic, bullets, numbered lists, tables). \
-    WHEN TO USE: Use this tool whenever you need to create or add content to a Google Doc. \
-    This is the primary document writing tool — prefer it over lower-level tools. \
-    HOW TO USE: Pass content as a Markdown string in the 'content' parameter. Use '\\n' for newlines. \
-    To create a new doc, provide 'title' (and optionally 'folder_id'). \
-    To write to an existing doc, provide 'document_id'. \
-    LIMITATIONS: The 'content' parameter must be a string, not an object or array. \
-    Requires either 'document_id' or 'title'. If neither is provided, the call will fail.",
+        "description": "Write or replace content in a Google Doc. Use section= to replace a specific section.",
         "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": true },
         "inputSchema": {
             "type": "object",
             "properties": {
+                "content": {
+                    "type": "string",
+                    "description": "Markdown string. # headings, **bold**, *italic*, - bullets, 1. numbered, | tables."
+                },
                 "document_id": {
                     "type": "string",
-                    "description": "ID of an existing Google Doc to write to. Get this from drive files.create response or gws_docs_read. Also accepts camelCase 'documentId'."
+                    "description": "Existing doc ID. Omit with title to create new."
                 },
                 "title": {
                     "type": "string",
-                    "description": "Title for a new document. When provided without document_id, creates a new Google Doc with this name."
+                    "description": "New doc title when creating without document_id."
                 },
                 "folder_id": {
                     "type": "string",
-                    "description": "Google Drive folder ID where the new doc should be created. Only used when creating a new doc with 'title'."
-                },
-                "content": {
-                    "type": "string",
-                    "description": "Content to write as a string. Use Markdown syntax: # for title, ## for headings, **bold**, *italic*, - for bullets, 1. for numbered lists, | for tables. Use \\n for newlines within the string."
-                },
-                "format": {
-                    "type": "string",
-                    "enum": ["markdown", "plain"],
-                    "description": "Content format. 'markdown' (default): full Markdown parsing with headings, lists, tables, inline formatting. 'plain': minimal parsing, # lines become headings."
+                    "description": "Drive folder for new doc creation."
                 },
                 "section": {
                     "type": "string",
-                    "description": "Name of an existing heading to find and replace. The content from that heading to the next same-level heading is replaced with the new content."
+                    "description": "Heading text to find and replace content under."
                 },
                 "position": {
                     "type": "string",
                     "enum": ["end", "start"],
-                    "description": "Where to insert content. 'end' (default) appends after existing content. 'start' inserts at the beginning."
+                    "default": "end"
                 },
-                "template_id": {
+                "format": {
                     "type": "string",
-                    "description": "Document ID of a template to copy named styles from (font families, sizes, colors for headings)."
+                    "enum": ["markdown", "plain"],
+                    "default": "markdown"
                 }
             },
             "required": ["content"]
@@ -1822,31 +1558,23 @@ pub fn docs_read_tool_schema() -> Value {
     json!({
         "name": "gws_docs_read",
         "title": "Read Google Doc",
-        "description": "PURPOSE: Read and inspect a Google Doc's content and structure. Returns a compact \
-    representation that is much smaller than the raw Google Docs API response. \
-    WHEN TO USE: Use this tool to inspect a document's structure before writing, to verify content \
-    after writing, or to find text positions for formatting operations. \
-    HOW TO USE: Pass the document_id and choose an output format. Use 'structure' (default) for a \
-    compact outline with element types and indexes. Use 'markdown' to get the content as Markdown. \
-    Use 'search' to find specific text and get its start/end character indexes. \
-    LIMITATIONS: The 'full' output format returns the complete Google Docs JSON which can be very \
-    large (60KB+). Prefer 'structure' or 'markdown' for token efficiency.",
+        "description": "Read a Google Doc as Markdown. Use section= to read a single section by heading name.",
         "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true },
         "inputSchema": {
             "type": "object",
             "properties": {
                 "document_id": {
                     "type": "string",
-                    "description": "ID of the Google Doc to read. Also accepts camelCase 'documentId'."
+                    "description": "Google Docs document ID"
                 },
-                "output": {
+                "section": {
                     "type": "string",
-                    "enum": ["structure", "markdown", "plain", "full"],
-                    "description": "Output format. 'structure' (default): compact outline with element types (title, heading, paragraph, list_item, table, image) and character indexes. 'markdown': document content converted to Markdown. 'plain': raw text without formatting. 'full': complete Google Docs JSON (large)."
+                    "description": "Heading text — returns only that section's content."
                 },
-                "search": {
+                "format": {
                     "type": "string",
-                    "description": "Search for this text in the document. Returns the startIndex and endIndex of the first match. Useful before calling formatting tools that need character positions."
+                    "enum": ["markdown", "plain"],
+                    "default": "markdown"
                 }
             },
             "required": ["document_id"]
@@ -2043,15 +1771,31 @@ mod tests {
     }
 
     #[test]
-    fn test_helper_tool_schemas_count() {
-        let schemas = helper_tool_schemas();
-        assert_eq!(schemas.len(), 5);
-        let names: Vec<&str> = schemas.iter().filter_map(|s| s["name"].as_str()).collect();
-        assert!(names.contains(&"gws_docs_insert_text"));
-        assert!(names.contains(&"gws_docs_insert_table"));
-        assert!(names.contains(&"gws_docs_insert_image"));
-        assert!(names.contains(&"gws_docs_format_text"));
-        assert!(names.contains(&"gws_docs_add_bullets"));
+    fn test_tool_schemas_have_short_descriptions() {
+        let schemas = vec![
+            docs_write_tool_schema(),
+            docs_read_tool_schema(),
+            outline_tool_schema(),
+            find_tool_schema(),
+            insert_table_tool_schema(),
+            read_table_tool_schema(),
+            insert_image_tool_schema(),
+            format_tool_schema(),
+        ];
+        for schema in &schemas {
+            let name = schema["name"].as_str().unwrap();
+            let desc = schema["description"].as_str().unwrap();
+            assert!(
+                desc.len() < 100,
+                "Tool {name} description too long ({} chars): {desc}",
+                desc.len()
+            );
+            assert!(
+                schema["inputSchema"]["type"].as_str() == Some("object"),
+                "Tool {name} missing inputSchema type"
+            );
+        }
+        assert_eq!(schemas.len(), 8);
     }
 
     #[test]
@@ -2205,15 +1949,6 @@ mod tests {
     }
 
     #[test]
-    fn test_markdown_tool_schema() {
-        let schema = markdown_tool_schema();
-        assert_eq!(schema["name"], "gws_docs_import_markdown");
-        assert!(schema["inputSchema"]["properties"]["markdown"].is_object());
-        let required = schema["inputSchema"]["required"].as_array().unwrap();
-        assert!(required.contains(&json!("markdown")));
-    }
-
-    #[test]
     fn test_markdown_ordered_list() {
         let requests = markdown_to_batch_requests("1. first\n2. second\n", 1);
         let bullets: Vec<&Value> = requests
@@ -2307,6 +2042,24 @@ mod tests {
         assert_eq!(tables.len(), 1);
         assert_eq!(tables[0]["insertTable"]["rows"], 3);
         assert_eq!(tables[0]["insertTable"]["columns"], 2);
+    }
+
+    #[test]
+    fn test_markdown_table_no_cell_inserts() {
+        let md = "| A | B |\n|---|---|\n| 1 | 2 |\n";
+        let requests = markdown_to_batch_requests(md, 1);
+        for (i, r) in requests.iter().enumerate() {
+            eprintln!("req[{i}]: {}", serde_json::to_string(r).unwrap());
+        }
+        // Should only have insertTable with _tableData, no cell insertText
+        assert_eq!(
+            requests.len(),
+            1,
+            "Expected only insertTable, got {} requests",
+            requests.len()
+        );
+        assert!(requests[0].get("insertTable").is_some());
+        assert!(requests[0].pointer("/insertTable/_tableData").is_some());
     }
 
     #[test]
