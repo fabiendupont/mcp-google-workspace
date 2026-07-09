@@ -246,6 +246,9 @@ pub async fn build_tools_list(
     // Docs helper tools
     tools.push(tool_from_json(crate::helpers::docs_write_tool_schema()));
     tools.push(tool_from_json(crate::helpers::docs_read_tool_schema()));
+    tools.push(tool_from_json(
+        crate::helpers::docs_replace_section_tool_schema(),
+    ));
     tools.push(tool_from_json(crate::helpers::outline_tool_schema()));
     tools.push(tool_from_json(crate::helpers::find_tool_schema()));
     tools.push(tool_from_json(crate::helpers::insert_table_tool_schema()));
@@ -277,6 +280,7 @@ fn tool_full_schema(name: &str) -> Option<Value> {
         "gws_drive_copy" => crate::drive_helpers::drive_copy_tool_schema(),
         "gws_drive_rename" => crate::drive_helpers::drive_rename_tool_schema(),
         "gws_docs_write" => crate::helpers::docs_write_tool_schema(),
+        "gws_docs_replace_section" => crate::helpers::docs_replace_section_tool_schema(),
         "gws_docs_read" => crate::helpers::docs_read_tool_schema(),
         "gws_docs_outline" => crate::helpers::outline_tool_schema(),
         "gws_docs_find" => crate::helpers::find_tool_schema(),

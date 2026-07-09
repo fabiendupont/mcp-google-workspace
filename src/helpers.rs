@@ -1554,6 +1554,33 @@ pub fn docs_write_tool_schema() -> Value {
     })
 }
 
+pub fn docs_replace_section_tool_schema() -> Value {
+    json!({
+        "name": "gws_docs_replace_section",
+        "title": "Replace Section in Doc",
+        "description": "Replace a section in a Google Doc by heading name. Deletes old content, writes new.",
+        "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": true },
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "document_id": {
+                    "type": "string",
+                    "description": "Google Docs document ID"
+                },
+                "section": {
+                    "type": "string",
+                    "description": "Heading text of the section to replace"
+                },
+                "content": {
+                    "type": "string",
+                    "description": "New Markdown content (include the heading itself)"
+                }
+            },
+            "required": ["document_id", "section", "content"]
+        }
+    })
+}
+
 pub fn docs_read_tool_schema() -> Value {
     json!({
         "name": "gws_docs_read",

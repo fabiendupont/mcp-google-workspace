@@ -981,7 +981,7 @@ async fn execute_docs_helper(
     state: &mut ServerState,
     dry_run: bool,
 ) -> Result<Value, GwsError> {
-    if tool_name == "gws_docs_write" {
+    if tool_name == "gws_docs_write" || tool_name == "gws_docs_replace_section" {
         tracing::info!(
             tool = tool_name,
             has_content = arguments.get("content").is_some(),
@@ -991,6 +991,28 @@ async fn execute_docs_helper(
             arg_keys = ?arguments.as_object().map(|m| m.keys().collect::<Vec<_>>()),
             "docs_write dispatch"
         );
+        // gws_docs_replace_section requires section — validate early
+        if tool_name == "gws_docs_replace_section" {
+            if arguments.get("section").and_then(|v| v.as_str()).is_none() {
+                return Err(GwsError::Validation(
+                    "Missing 'section' — specify the heading text of the section to replace."
+                        .into(),
+                ));
+            }
+            if arguments
+                .get("document_id")
+                .and_then(|v| v.as_str())
+                .is_none()
+                && arguments
+                    .get("documentId")
+                    .and_then(|v| v.as_str())
+                    .is_none()
+            {
+                return Err(GwsError::Validation(
+                    "Missing 'document_id' — specify the doc to update.".into(),
+                ));
+            }
+        }
         let format = crate::format::parse_format(arguments.get("format").and_then(|v| v.as_str()));
         return execute_docs_write(arguments, policy, meta, state, dry_run, format).await;
     }
