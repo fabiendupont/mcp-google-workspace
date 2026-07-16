@@ -39,6 +39,8 @@ pub struct Constraint {
     pub location: Option<String>,
     #[serde(default)]
     pub mode: ConstraintMode,
+    #[serde(default)]
+    pub recursive: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -68,6 +70,8 @@ pub struct ServerPolicy {
     #[serde(default)]
     pub rate_limit_rpm: Option<u32>,
     #[serde(default)]
+    pub rate_limits: Option<HashMap<String, u32>>,
+    #[serde(default)]
     pub allowed_origins: Vec<String>,
     #[serde(default)]
     pub credentials_file: Option<String>,
@@ -81,6 +85,7 @@ impl Default for ServerPolicy {
             read_only: false,
             max_request_bytes: default_max_request_bytes(),
             rate_limit_rpm: None,
+            rate_limits: None,
             allowed_origins: Vec::new(),
             credentials_file: None,
             project_id: None,
@@ -108,6 +113,7 @@ pub struct Policy {
     pub global_read_only: bool,
     pub max_request_bytes: usize,
     pub rate_limit_rpm: Option<u32>,
+    pub rate_limits: Option<HashMap<String, u32>>,
     pub allowed_origins: Vec<String>,
     pub credentials_file: Option<String>,
     pub project_id: Option<String>,
@@ -174,6 +180,7 @@ impl Policy {
                             access: Access::ReadOnly,
                             location: None,
                             mode: ConstraintMode::Protect,
+                            recursive: false,
                         });
                     }
                 }
@@ -184,6 +191,7 @@ impl Policy {
             global_read_only: file.server.read_only,
             max_request_bytes: file.server.max_request_bytes,
             rate_limit_rpm: file.server.rate_limit_rpm,
+            rate_limits: file.server.rate_limits,
             allowed_origins: file.server.allowed_origins,
             credentials_file: file.server.credentials_file,
             project_id: file.server.project_id,
@@ -191,6 +199,34 @@ impl Policy {
             services,
             templates: file.templates,
         }
+    }
+
+    pub fn with_extra_parent(&self, service: &str, folder_id: &str) -> Self {
+        let mut clone = self.clone();
+        if let Some(svc) = clone.services.get_mut(service) {
+            for c in &mut svc.constraints {
+                if c.param == "parents" && c.mode == ConstraintMode::Restrict {
+                    if !c.values.contains(&folder_id.to_string()) {
+                        c.values.push(folder_id.to_string());
+                    }
+                }
+            }
+        }
+        clone
+    }
+
+    pub fn recursive_parent_values(&self, service: &str) -> Vec<&str> {
+        self.constraints(service)
+            .iter()
+            .filter(|c| {
+                c.param == "parents"
+                    && c.recursive
+                    && c.mode == ConstraintMode::Restrict
+                    && (c.location.as_deref() == Some("body")
+                        || c.location.as_deref() == Some("body-write-only"))
+            })
+            .flat_map(|c| c.values.iter().map(|v| v.as_str()))
+            .collect()
     }
 
     pub fn templates(&self) -> &[TemplateEntry] {
@@ -332,18 +368,24 @@ impl Policy {
                 .collect();
 
             let location = group[0].location.as_deref();
-            let is_body = location == Some("body");
+            let is_body = location == Some("body") || location == Some("body-write-only");
+            let skip_read_filter = location == Some("body-write-only");
 
             if is_body {
                 if !restrict_group.is_empty() {
-                    self.enforce_body_constraint(
-                        param,
-                        &all_values,
-                        &rw_values,
-                        is_write,
-                        params,
-                        body,
-                    )?;
+                    if skip_read_filter && !is_write {
+                        // body-write-only: no read filtering
+                    } else {
+                        self.enforce_body_constraint(
+                            param,
+                            &all_values,
+                            &rw_values,
+                            is_write,
+                            skip_read_filter,
+                            params,
+                            body,
+                        )?;
+                    }
                     if is_write {
                         self.enforce_parent_params(param, &all_values, &rw_values, params)?;
                     }
@@ -376,6 +418,7 @@ impl Policy {
         all_values: &[&str],
         rw_values: &[&str],
         is_write: bool,
+        write_only: bool,
         params: &mut serde_json::Map<String, serde_json::Value>,
         body: &Option<serde_json::Value>,
     ) -> Result<(), GwsError> {
@@ -406,6 +449,9 @@ impl Policy {
             .unwrap_or_default();
 
         if body_values.is_empty() {
+            if write_only {
+                return Ok(());
+            }
             return Err(GwsError::Validation(format!(
                 "Write denied: '{param}' must be specified when constraints are configured. \
                  Allowed read-write values: {rw}. \
@@ -742,6 +788,74 @@ mod tests {
         assert!(
             p.enforce_constraints("gmail", &method, &mut params, &body)
                 .is_ok()
+        );
+    }
+
+    // -- body-write-only tests --
+
+    fn test_policy_write_only() -> Policy {
+        let json_str = r#"{
+            "server": {},
+            "services": [
+                {
+                    "name": "drive",
+                    "constraints": [
+                        { "param": "parents", "values": ["folder-allowed"], "access": "read-write", "location": "body-write-only" }
+                    ]
+                }
+            ]
+        }"#;
+        let file: PolicyFile = serde_json::from_str(json_str).unwrap();
+        Policy::from_policy_file(file)
+    }
+
+    #[test]
+    fn test_body_write_only_read_no_filter() {
+        let p = test_policy_write_only();
+        let method = get_method();
+        let mut params = serde_json::Map::new();
+        p.enforce_constraints("drive", &method, &mut params, &None)
+            .unwrap();
+        assert!(
+            params.get("q").is_none(),
+            "body-write-only should not inject q filter on reads"
+        );
+    }
+
+    #[test]
+    fn test_body_write_only_write_allowed() {
+        let p = test_policy_write_only();
+        let method = post_method();
+        let mut params = serde_json::Map::new();
+        let body = Some(serde_json::json!({ "parents": ["folder-allowed"] }));
+        assert!(
+            p.enforce_constraints("drive", &method, &mut params, &body)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_body_write_only_write_denied_wrong_folder() {
+        let p = test_policy_write_only();
+        let method = post_method();
+        let mut params = serde_json::Map::new();
+        let body = Some(serde_json::json!({ "parents": ["wrong-folder"] }));
+        assert!(
+            p.enforce_constraints("drive", &method, &mut params, &body)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_body_write_only_write_no_parents_passes() {
+        let p = test_policy_write_only();
+        let method = post_method();
+        let mut params = serde_json::Map::new();
+        let body = Some(serde_json::json!({ "name": "test.txt" }));
+        assert!(
+            p.enforce_constraints("drive", &method, &mut params, &body)
+                .is_ok(),
+            "body-write-only should allow writes that don't include the constrained param"
         );
     }
 

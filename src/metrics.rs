@@ -31,6 +31,26 @@ static ACTIVE_TASKS: LazyLock<IntGauge> = LazyLock::new(|| {
     gauge
 });
 
+static RATE_LIMIT_WAITS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let opts =
+        Opts::new("mcp_rate_limit_waits_total", "Rate limiter wait events").namespace("mcp_gws");
+    let counter = IntCounterVec::new(opts, &["service"]).unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+static RATE_LIMIT_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
+    let opts = HistogramOpts::new(
+        "mcp_rate_limit_wait_seconds",
+        "Duration spent waiting on rate limiter",
+    )
+    .namespace("mcp_gws")
+    .buckets(vec![0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0]);
+    let hist = HistogramVec::new(opts, &["service"]).unwrap();
+    REGISTRY.register(Box::new(hist.clone())).unwrap();
+    hist
+});
+
 static ERRORS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     let opts = Opts::new("mcp_errors_total", "Total MCP errors").namespace("mcp_gws");
     let counter = IntCounterVec::new(opts, &["method", "error_type"]).unwrap();
@@ -47,6 +67,13 @@ pub(crate) fn record_request(method: &str, is_error: bool, duration_secs: f64) {
     if is_error {
         ERRORS_TOTAL.with_label_values(&[method, "handler"]).inc();
     }
+}
+
+pub(crate) fn record_rate_limit_wait(service: &str, duration_secs: f64) {
+    RATE_LIMIT_WAITS.with_label_values(&[service]).inc();
+    RATE_LIMIT_DURATION
+        .with_label_values(&[service])
+        .observe(duration_secs);
 }
 
 pub(crate) fn set_active_tasks(count: i64) {

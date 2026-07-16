@@ -125,8 +125,25 @@ impl ServerHandler for GwsHandler {
             crate::metrics::set_active_tasks(task_count as i64);
 
             match result {
-                Ok(value) => Ok(value_to_call_tool_result(value)),
-                Err(e) => Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
+                Ok(ref value) => {
+                    let is_tool_error = value.get("isError").and_then(|v| v.as_bool()).unwrap_or(false);
+                    if is_tool_error {
+                        let err_text = value.get("content")
+                            .and_then(|c| c.as_array())
+                            .and_then(|a| a.first())
+                            .and_then(|e| e.get("text"))
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("unknown error");
+                        tracing::warn!(tool = %tool_name, error = %err_text, duration_ms = start.elapsed().as_millis() as u64, "Tool error");
+                    } else {
+                        tracing::info!(tool = %tool_name, duration_ms = start.elapsed().as_millis() as u64, "Tool ok");
+                    }
+                    Ok(value_to_call_tool_result(result.unwrap()))
+                }
+                Err(e) => {
+                    tracing::warn!(tool = %tool_name, error = %e, duration_ms = start.elapsed().as_millis() as u64, "Tool failed");
+                    Ok(CallToolResult::error(vec![Content::text(e.to_string())]))
+                }
             }
         }
     }

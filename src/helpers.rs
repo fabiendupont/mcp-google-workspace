@@ -1266,6 +1266,31 @@ pub fn outline_tool_schema() -> Value {
                 "document_id": { "type": "string", "description": "Google Docs document ID" }
             },
             "required": ["document_id"]
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "title": { "type": "string" },
+                "elements": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "type": { "type": "string", "enum": ["title", "subtitle", "heading", "paragraph", "table", "image", "list_item"] },
+                            "text": { "type": "string" },
+                            "preview": { "type": "string" },
+                            "level": { "type": "integer" },
+                            "rows": { "type": "integer" },
+                            "columns": { "type": "integer" },
+                            "startIndex": { "type": "integer" },
+                            "endIndex": { "type": "integer" }
+                        },
+                        "required": ["type", "startIndex", "endIndex"]
+                    }
+                },
+                "endIndex": { "type": "integer" }
+            },
+            "required": ["title", "elements", "endIndex"]
         }
     })
 }
@@ -1284,6 +1309,17 @@ pub fn find_tool_schema() -> Value {
                 "occurrence": { "type": "integer", "description": "Which occurrence (1-based)", "default": 1 }
             },
             "required": ["document_id", "text"]
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "found": { "type": "boolean" },
+                "startIndex": { "type": "integer" },
+                "endIndex": { "type": "integer" },
+                "occurrence": { "type": "integer" },
+                "occurrences_found": { "type": "integer" }
+            },
+            "required": ["found"]
         }
     })
 }
@@ -1447,6 +1483,24 @@ pub fn read_table_from_doc(doc: &Value, table_index: usize) -> Value {
     })
 }
 
+pub fn extract_all_tables(doc: &Value) -> Vec<Value> {
+    let Some(content) = doc.pointer("/body/content").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+
+    let table_count = content.iter().filter(|e| e.get("table").is_some()).count();
+    (0..table_count)
+        .map(|i| {
+            let mut table = read_table_from_doc(doc, i);
+            if let Some(obj) = table.as_object_mut() {
+                obj.insert("index".to_string(), json!(i));
+            }
+            table
+        })
+        .filter(|t| t.get("error").is_none())
+        .collect()
+}
+
 pub fn insert_table_tool_schema() -> Value {
     json!({
         "name": "gws_docs_insert_table",
@@ -1505,6 +1559,20 @@ pub fn read_table_tool_schema() -> Value {
                 }
             },
             "required": ["document_id"]
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "rows": {
+                    "type": "array",
+                    "items": { "type": "array", "items": { "type": "string" } }
+                },
+                "startIndex": { "type": "integer" },
+                "endIndex": { "type": "integer" },
+                "row_count": { "type": "integer" },
+                "column_count": { "type": "integer" }
+            },
+            "required": ["rows", "startIndex", "endIndex", "row_count", "column_count"]
         }
     })
 }
@@ -1513,7 +1581,7 @@ pub fn docs_write_tool_schema() -> Value {
     json!({
         "name": "gws_docs_write",
         "title": "Write to Google Doc",
-        "description": "Write or replace content in a Google Doc. Use section= to replace a specific section.",
+        "description": "Write to a document (not spreadsheet). Omit document_id with title to create new.",
         "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": true },
         "inputSchema": {
             "type": "object",
@@ -1585,7 +1653,7 @@ pub fn docs_read_tool_schema() -> Value {
     json!({
         "name": "gws_docs_read",
         "title": "Read Google Doc",
-        "description": "Read a Google Doc as Markdown. Use section= to read a single section by heading name.",
+        "description": "Read a Google Doc as Markdown. Use section= to read one section. Tables in structuredContent.",
         "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true },
         "inputSchema": {
             "type": "object",
@@ -1605,6 +1673,31 @@ pub fn docs_read_tool_schema() -> Value {
                 }
             },
             "required": ["document_id"]
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "text": { "type": "string" },
+                "tables": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "index": { "type": "integer" },
+                            "rows": {
+                                "type": "array",
+                                "items": { "type": "array", "items": { "type": "string" } }
+                            },
+                            "startIndex": { "type": "integer" },
+                            "endIndex": { "type": "integer" },
+                            "row_count": { "type": "integer" },
+                            "column_count": { "type": "integer" }
+                        },
+                        "required": ["index", "rows", "row_count", "column_count"]
+                    }
+                }
+            },
+            "required": ["text"]
         }
     })
 }
@@ -2101,5 +2194,120 @@ mod tests {
         assert!(has_insert);
         assert!(has_table);
         assert!(has_heading);
+    }
+
+    #[test]
+    fn test_output_schema_on_outline_tool() {
+        let schema = outline_tool_schema();
+        let os = &schema["outputSchema"];
+        assert_eq!(os["type"], "object");
+        assert!(os["properties"]["title"].is_object());
+        assert!(os["properties"]["elements"].is_object());
+        assert!(os["properties"]["endIndex"].is_object());
+        let items = &os["properties"]["elements"]["items"]["properties"];
+        assert!(items["type"].is_object());
+        assert!(items["startIndex"].is_object());
+    }
+
+    #[test]
+    fn test_output_schema_on_find_tool() {
+        let schema = find_tool_schema();
+        let os = &schema["outputSchema"];
+        assert_eq!(os["type"], "object");
+        assert!(os["properties"]["found"].is_object());
+        assert!(os["properties"]["startIndex"].is_object());
+        assert!(os["properties"]["endIndex"].is_object());
+        assert_eq!(os["required"][0], "found");
+    }
+
+    #[test]
+    fn test_output_schema_on_read_table_tool() {
+        let schema = read_table_tool_schema();
+        let os = &schema["outputSchema"];
+        assert_eq!(os["type"], "object");
+        assert!(os["properties"]["rows"].is_object());
+        assert!(os["properties"]["row_count"].is_object());
+        assert!(os["properties"]["column_count"].is_object());
+    }
+
+    #[test]
+    fn test_output_schema_on_docs_read_tool() {
+        let schema = docs_read_tool_schema();
+        let os = &schema["outputSchema"];
+        assert_eq!(os["type"], "object");
+        assert!(os["properties"]["text"].is_object());
+        assert!(os["properties"]["tables"].is_object());
+        assert_eq!(os["required"][0], "text");
+    }
+
+    #[test]
+    fn test_extract_all_tables_empty_doc() {
+        let doc = json!({ "body": { "content": [] } });
+        let tables = extract_all_tables(&doc);
+        assert!(tables.is_empty());
+    }
+
+    #[test]
+    fn test_extract_all_tables_no_body() {
+        let doc = json!({});
+        let tables = extract_all_tables(&doc);
+        assert!(tables.is_empty());
+    }
+
+    #[test]
+    fn test_extract_all_tables_with_tables() {
+        let doc = json!({
+            "body": {
+                "content": [
+                    {
+                        "startIndex": 1,
+                        "endIndex": 50,
+                        "table": {
+                            "rows": 2,
+                            "columns": 2,
+                            "tableRows": [
+                                {
+                                    "tableCells": [
+                                        { "content": [{ "paragraph": { "elements": [{ "textRun": { "content": "A1" } }] } }] },
+                                        { "content": [{ "paragraph": { "elements": [{ "textRun": { "content": "B1" } }] } }] }
+                                    ]
+                                },
+                                {
+                                    "tableCells": [
+                                        { "content": [{ "paragraph": { "elements": [{ "textRun": { "content": "A2" } }] } }] },
+                                        { "content": [{ "paragraph": { "elements": [{ "textRun": { "content": "B2" } }] } }] }
+                                    ]
+                                }
+                            ]
+                        }
+                    },
+                    {
+                        "startIndex": 51,
+                        "endIndex": 100,
+                        "table": {
+                            "rows": 1,
+                            "columns": 1,
+                            "tableRows": [
+                                {
+                                    "tableCells": [
+                                        { "content": [{ "paragraph": { "elements": [{ "textRun": { "content": "Only" } }] } }] }
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        });
+        let tables = extract_all_tables(&doc);
+        assert_eq!(tables.len(), 2);
+        assert_eq!(tables[0]["index"], 0);
+        assert_eq!(tables[0]["rows"][0][0], "A1");
+        assert_eq!(tables[0]["rows"][1][1], "B2");
+        assert_eq!(tables[0]["row_count"], 2);
+        assert_eq!(tables[0]["column_count"], 2);
+        assert_eq!(tables[1]["index"], 1);
+        assert_eq!(tables[1]["rows"][0][0], "Only");
+        assert_eq!(tables[1]["row_count"], 1);
     }
 }

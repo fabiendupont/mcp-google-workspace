@@ -33,7 +33,20 @@ impl AuditLogger {
         status: u16,
         duration_ms: u64,
     ) {
-        let entry = json!({
+        self.log_allowed_with_tool(None, service, resource, method, http_method, status, duration_ms);
+    }
+
+    pub fn log_allowed_with_tool(
+        &self,
+        tool_name: Option<&str>,
+        service: &str,
+        resource: &str,
+        method: &str,
+        http_method: &str,
+        status: u16,
+        duration_ms: u64,
+    ) {
+        let mut entry = json!({
             "timestamp": timestamp(),
             "action": "allowed",
             "service": service,
@@ -43,6 +56,9 @@ impl AuditLogger {
             "status": status,
             "duration_ms": duration_ms,
         });
+        if let Some(tn) = tool_name {
+            entry["tool"] = json!(tn);
+        }
         self.write(entry);
     }
 

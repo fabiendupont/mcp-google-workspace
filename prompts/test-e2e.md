@@ -19,7 +19,12 @@ Do the following:
    - Lessons learned with specific, actionable recommendations based on the incident reports and retro notes
 6. Read the outline of the report to verify it has all required sections
 7. Read the "Lessons Learned" section and replace it with an improved version that cross-references specific incidents and sprint feedback
-8. Copy the report to the "Final" folder and rename it "Project Alpha - Quarterly Review v1"
-9. Share the final report with the domain "redhat.com" as reader
-10. Move the draft to the trash
-11. List the "Final" folder to confirm the report is there
+8. Create a Google Sheets spreadsheet named "Project Alpha - Metrics Summary" in the "Drafts" folder with:
+   - A header row: Objective, Target, Actual, Status
+   - One row per charter objective with target vs actual values from the source data
+   - Read back the spreadsheet info to confirm the tab name and dimensions
+   - Read the data range to verify the content was written correctly
+9. Copy the report to the "Final" folder and rename it "Project Alpha - Quarterly Review v1"
+10. Share the final report with the domain "redhat.com" as reader
+11. Move the draft to the trash
+12. List the "Final" folder to confirm the report is there

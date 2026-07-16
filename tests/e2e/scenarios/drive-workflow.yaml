@@ -1,0 +1,50 @@
+name: drive-workflow
+description: "Create subfolder, create doc, list, copy, rename, get info"
+prompt_file: prompts/test-drive-workflow.md
+timeout_seconds: 180
+test_folder_id: "1VkrXx3bhkQaLJEmnY_t5VxVmBETfsbY1"
+
+rubric:
+  - id: subfolder_created
+    criterion: "'Drive Test Output' subfolder created inside test folder"
+    check: "gws_drive_list the test folder, look for 'Drive Test Output' folder"
+    weight: 1.0
+
+  - id: doc_created_in_subfolder
+    criterion: "'Test Document' created inside 'Drive Test Output'"
+    check: "gws_drive_list the subfolder"
+    weight: 1.0
+
+  - id: doc_has_content
+    criterion: "Document has a paragraph about cloud computing"
+    check: "gws docs documents get — read full body text"
+    weight: 0.5
+
+  - id: doc_content_quality
+    criterion: "Paragraph is substantive (3+ sentences, specific concepts, not just a dictionary definition)"
+    check: "Read document text. Score: 1.0 = rich paragraph (3+ sentences with specific examples or concepts like IaaS/PaaS/SaaS, elasticity, pay-as-you-go); 0.5 = adequate (2-3 generic sentences); 0.0 = single sentence or off-topic"
+    weight: 0.5
+
+  - id: subfolder_listed
+    criterion: "Model listed subfolder contents to verify document is there"
+    check: "Model called gws_drive_list on the subfolder"
+    weight: 0.5
+
+  - id: doc_copied
+    criterion: "Copy of document exists named 'Test Document Backup'"
+    check: "gws_drive_list the subfolder, look for 'Test Document Backup'"
+    weight: 1.0
+
+  - id: doc_renamed
+    criterion: "Original document renamed to 'Test Document (Original)'"
+    check: "gws_drive_list the subfolder, look for 'Test Document (Original)'"
+    weight: 1.0
+
+  - id: info_reported
+    criterion: "Model got info on the renamed document and reported name, type, last modified"
+    check: "Model called gws_drive_info and reported the three fields"
+    weight: 0.5
+
+cleanup:
+  - action: trash
+    name_pattern: "Drive Test Output"

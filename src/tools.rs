@@ -74,13 +74,24 @@ pub async fn build_tools_list(
 ) -> Result<Vec<Tool>, GwsError> {
     let mut tools = Vec::new();
 
+    const SERVICES_WITH_HELPERS: &[&str] = &["drive", "docs", "sheets", "slides"];
+
+    // Pre-load discovery docs for all services (helpers need them)
     for svc_name in policy.allowed_services() {
-        let doc = match get_or_fetch_doc(docs, svc_name).await {
-            Ok(doc) => doc,
-            Err(e) => {
-                tracing::warn!(service = svc_name, error = %e, "Failed to load discovery doc");
-                continue;
-            }
+        if let Err(e) = get_or_fetch_doc(docs, svc_name).await {
+            tracing::warn!(service = svc_name, error = %e, "Failed to load discovery doc");
+        }
+    }
+
+    // Only register generic tools for services without helpers
+    for svc_name in policy.allowed_services() {
+        if SERVICES_WITH_HELPERS.contains(&svc_name) {
+            continue;
+        }
+
+        let doc = match docs.get(svc_name) {
+            Some(doc) => Arc::clone(doc),
+            None => continue,
         };
 
         let mut resource_names = Vec::new();
@@ -258,6 +269,28 @@ pub async fn build_tools_list(
         tools.push(tool_from_json(crate::helpers::format_tool_schema()));
     }
 
+    // Sheets helper tools
+    tools.push(tool_from_json(
+        crate::sheets_helpers::sheets_read_tool_schema(),
+    ));
+    tools.push(tool_from_json(
+        crate::sheets_helpers::sheets_write_tool_schema(),
+    ));
+    tools.push(tool_from_json(
+        crate::sheets_helpers::sheets_info_tool_schema(),
+    ));
+    if !policy.compact_schemas {
+        tools.push(tool_from_json(
+            crate::sheets_helpers::sheets_append_tool_schema(),
+        ));
+        tools.push(tool_from_json(
+            crate::sheets_helpers::sheets_clear_tool_schema(),
+        ));
+        tools.push(tool_from_json(
+            crate::sheets_helpers::sheets_manage_tabs_tool_schema(),
+        ));
+    }
+
     // Slides & image tools
     tools.push(tool_from_json(crate::slides_helpers::marp_tool_schema()));
     tools.push(tool_from_json(
@@ -288,6 +321,12 @@ fn tool_full_schema(name: &str) -> Option<Value> {
         "gws_docs_read_table" => crate::helpers::read_table_tool_schema(),
         "gws_docs_insert_image" => crate::helpers::insert_image_tool_schema(),
         "gws_docs_format" => crate::helpers::format_tool_schema(),
+        "gws_sheets_read" => crate::sheets_helpers::sheets_read_tool_schema(),
+        "gws_sheets_write" => crate::sheets_helpers::sheets_write_tool_schema(),
+        "gws_sheets_append" => crate::sheets_helpers::sheets_append_tool_schema(),
+        "gws_sheets_info" => crate::sheets_helpers::sheets_info_tool_schema(),
+        "gws_sheets_clear" => crate::sheets_helpers::sheets_clear_tool_schema(),
+        "gws_sheets_manage_tabs" => crate::sheets_helpers::sheets_manage_tabs_tool_schema(),
         _ => return None,
     };
     let mut info = json!({

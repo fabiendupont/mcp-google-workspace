@@ -39,6 +39,27 @@ pub fn drive_list_tool_schema() -> Value {
                     "default": 20
                 }
             }
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "files": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": { "type": "string" },
+                            "name": { "type": "string" },
+                            "mimeType": { "type": "string" },
+                            "modifiedTime": { "type": "string" },
+                            "size": { "type": "string" },
+                            "parents": { "type": "array", "items": { "type": "string" } }
+                        },
+                        "required": ["id", "name", "mimeType"]
+                    }
+                }
+            },
+            "required": ["files"]
         }
     })
 }
@@ -159,6 +180,24 @@ pub fn drive_find_folder_tool_schema() -> Value {
                 }
             },
             "required": ["name"]
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "files": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": { "type": "string" },
+                            "name": { "type": "string" },
+                            "parents": { "type": "array", "items": { "type": "string" } }
+                        },
+                        "required": ["id", "name"]
+                    }
+                }
+            },
+            "required": ["files"]
         }
     })
 }
@@ -327,5 +366,28 @@ mod tests {
         assert!(q.contains("'folder1' in parents"));
         assert!(q.contains("name contains 'test'"));
         assert!(q.contains("mimeType = 'application/pdf'"));
+    }
+
+    #[test]
+    fn test_output_schema_on_drive_list_tool() {
+        let schema = drive_list_tool_schema();
+        let os = &schema["outputSchema"];
+        assert_eq!(os["type"], "object");
+        assert!(os["properties"]["files"].is_object());
+        let items = &os["properties"]["files"]["items"]["properties"];
+        assert!(items["id"].is_object());
+        assert!(items["name"].is_object());
+        assert!(items["mimeType"].is_object());
+    }
+
+    #[test]
+    fn test_output_schema_on_drive_find_folder_tool() {
+        let schema = drive_find_folder_tool_schema();
+        let os = &schema["outputSchema"];
+        assert_eq!(os["type"], "object");
+        assert!(os["properties"]["files"].is_object());
+        let items = &os["properties"]["files"]["items"]["properties"];
+        assert!(items["id"].is_object());
+        assert!(items["name"].is_object());
     }
 }

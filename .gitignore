@@ -3,3 +3,5 @@
 /site/public/
 /.playwright-mcp/
 *.png
+tests/e2e/results/*.jsonl
+tests/e2e/results/*-summary.md

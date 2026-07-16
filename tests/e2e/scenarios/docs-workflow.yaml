@@ -1,0 +1,70 @@
+name: docs-workflow
+description: "Create a doc with headings, table, bullets; read outline; read section; find text; replace section"
+prompt_file: prompts/test-docs-workflow.md
+timeout_seconds: 300
+test_folder_id: "1VkrXx3bhkQaLJEmnY_t5VxVmBETfsbY1"
+
+rubric:
+  - id: doc_created
+    criterion: "Google Doc 'AI Infrastructure Report' exists in the test folder"
+    check: "gws_drive_list the test folder, look for 'AI Infrastructure Report'"
+    weight: 1.0
+
+  - id: has_executive_summary
+    criterion: "Document has an executive summary heading mentioning hybrid architectures"
+    check: "gws_docs_outline, verify Executive Summary heading; gws_docs_read section, check for 'hybrid'"
+    weight: 1.0
+
+  - id: has_comparison_table
+    criterion: "Document contains a comparison table with at least 3 platforms"
+    check: "gws docs documents get — parse table elements from body content"
+    weight: 1.0
+
+  - id: table_quality
+    criterion: "Table has meaningful data: platform names are real, GPU support and cost columns have specific values (not placeholders or 'N/A' everywhere)"
+    check: "Read table cell contents. Score: 1.0 = real platforms with specific GPU/cost data; 0.5 = real platforms but vague data; 0.0 = placeholder data or fewer than 3 rows"
+    weight: 0.5
+
+  - id: has_recommendations
+    criterion: "Document has 3-5 actionable recommendations as bullet points"
+    check: "gws docs documents get — find recommendations section, count list items"
+    weight: 1.0
+
+  - id: recommendations_quality
+    criterion: "Recommendations are specific and actionable (not generic advice like 'use best practices')"
+    check: "Read each recommendation. Score: 1.0 = specific actions with concrete details (technologies, metrics, timelines); 0.5 = reasonable but generic; 0.0 = vague platitudes"
+    weight: 0.5
+
+  - id: has_conclusion
+    criterion: "Document has a conclusion section"
+    check: "gws docs documents get — check for conclusion heading"
+    weight: 0.5
+
+  - id: overall_coherence
+    criterion: "Document reads as a coherent report: sections flow logically, no contradictions, executive summary accurately reflects the body content"
+    check: "Read full document. Score: 1.0 = well-structured, internally consistent; 0.5 = minor inconsistencies or weak transitions; 0.0 = disjointed or contradictory"
+    weight: 0.5
+
+  - id: outline_verified
+    criterion: "Model read back the outline and verified headings, table, bullets"
+    check: "Model used gws_docs_outline and confirmed structure"
+    weight: 0.5
+
+  - id: section_read
+    criterion: "Model read just the recommendations section"
+    check: "Model used gws_docs_read with section parameter"
+    weight: 0.5
+
+  - id: find_text
+    criterion: "Model found 'hybrid' text and reported character indexes"
+    check: "Model used gws_docs_find for 'hybrid'"
+    weight: 0.5
+
+  - id: conclusion_replaced
+    criterion: "Conclusion was replaced with content mentioning edge computing"
+    check: "gws_docs_read section='Conclusion', verify 'edge' appears"
+    weight: 1.0
+
+cleanup:
+  - action: trash
+    name_pattern: "AI Infrastructure Report"

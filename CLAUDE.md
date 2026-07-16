@@ -10,15 +10,17 @@ main.rs           — CLI arg parsing, templates, interactive wizard, policy che
 handler.rs        — rmcp ServerHandler impl: tools, prompts, resources, completions, tasks, elicitation, subscriptions
 server.rs         — Tool dispatch business logic, Docs/Slides/Batch helpers, request explanation
 tools.rs          — Builds MCP tool list from Discovery Documents, compact schema mode
-execute.rs        — HTTP execution: URL rendering, params, pagination, resumable uploads, smart field defaults
+execute.rs        — HTTP execution: URL rendering, params, pagination, resumable uploads, smart field defaults, rate limiting
 format.rs         — Format transformers: Markdown/Plain → Docs batchUpdate, doc → Markdown reverse converter
 helpers.rs        — Google Docs enrichment: write/read/table tools, insert text/image, find text, structure outline
+sheets_helpers.rs — Google Sheets enrichment: read/write/append ranges, info, clear, tab management
 resources.rs      — MCP resources: gws:// URI scheme, resource templates from Discovery Documents
 completions.rs    — MCP completions: autocomplete for resource URIs and prompt arguments
 elicitation.rs    — MCP elicitation: structured user input (folder selection, overwrite confirmation)
 subscriptions.rs  — MCP subscriptions: Google Drive watch channels, webhook notifications
 prompts.rs        — MCP prompts: load external Markdown files, argument substitution
-policy.rs         — JSON policy engine: constraints, method denylists, read-only mode, compact schemas
+policy.rs         — JSON policy engine: constraints, method denylists, read-only mode, compact schemas, per-service rate limits
+rate_limit.rs     — Per-service sliding-window rate limiter for Google API quotas
 auth.rs           — OAuth2 chain: env var → credentials file → service account → ADC/gcloud
 audit.rs          — Structured JSONL audit log writer
 http.rs           — Hybrid Axum server: rmcp StreamableHttpService + health/metrics/webhooks

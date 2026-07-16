@@ -72,6 +72,9 @@ static FIELD_DEFAULTS: LazyLock<HashMap<(&str, &str, &str), &str>> = LazyLock::n
     m.insert(("calendar", "events", "get"), "id,summary,description,start,end,status,location,organizer,attendees,conferenceData,htmlLink");
     // Sheets
     m.insert(("sheets", "spreadsheets", "get"), "spreadsheetId,properties(title),sheets(properties(sheetId,title,index),data(rowData(values(formattedValue))))");
+    m.insert(("sheets", "spreadsheets.values", "get"), "range,values,majorDimension");
+    m.insert(("sheets", "spreadsheets.values", "update"), "updatedRange,updatedRows,updatedColumns,updatedCells");
+    m.insert(("sheets", "spreadsheets.values", "append"), "updates(updatedRange,updatedRows,updatedColumns,updatedCells)");
     m
 });
 
@@ -463,6 +466,8 @@ pub async fn execute_tool(
         } else if matches!(method.http_method.as_str(), "POST" | "PUT" | "PATCH") {
             request = request.header("Content-Length", "0");
         }
+
+        crate::rate_limit::acquire_global(service).await;
 
         let response =
             client::send_with_retry(|| request.try_clone().expect("request must be clonable"))
@@ -1007,6 +1012,8 @@ pub(crate) async fn initiate_resumable_upload(
     } else {
         request = request.header("Content-Length", "0");
     }
+
+    crate::rate_limit::acquire_global(service).await;
 
     let response =
         client::send_with_retry(|| request.try_clone().expect("request must be clonable"))

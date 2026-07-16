@@ -14,8 +14,10 @@ mod meta;
 mod metrics;
 mod policy;
 mod prompts;
+mod rate_limit;
 mod resources;
 mod server;
+mod sheets_helpers;
 mod slides_helpers;
 mod subscriptions;
 mod tasks;
@@ -1251,6 +1253,8 @@ async fn main() {
         }
     };
     policy.compact_schemas = compact_schemas;
+
+    rate_limit::init_global(policy.rate_limit_rpm, policy.rate_limits.clone());
 
     print_effective_policy(&policy);
 

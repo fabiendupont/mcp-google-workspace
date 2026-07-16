@@ -1,0 +1,65 @@
+name: docs-full
+description: "Create doc with table, generate and insert image, replace conclusion"
+prompt_file: prompts/test-docs-full.md
+timeout_seconds: 300
+test_folder_id: "1VkrXx3bhkQaLJEmnY_t5VxVmBETfsbY1"
+
+rubric:
+  - id: doc_created
+    criterion: "Google Doc 'AI Infrastructure Report' created in the test folder (by ID)"
+    check: "gws_drive_list folder 1VkrXx3bhkQaLJEmnY_t5VxVmBETfsbY1"
+    weight: 1.0
+
+  - id: has_executive_summary
+    criterion: "Document has an executive summary mentioning hybrid architectures"
+    check: "gws_docs_outline + gws_docs_read section"
+    weight: 1.0
+
+  - id: has_comparison_table
+    criterion: "Comparison table with at least 3 platforms, GPU support, and cost model"
+    check: "gws docs documents get — parse table elements from body content"
+    weight: 1.0
+
+  - id: table_quality
+    criterion: "Table has meaningful data: real platform names, specific GPU models/counts, concrete cost figures or models (not 'varies' or 'N/A')"
+    check: "Read table cell contents. Score: 1.0 = specific data throughout; 0.5 = mostly specific with some gaps; 0.0 = mostly placeholder/vague"
+    weight: 0.5
+
+  - id: has_recommendations
+    criterion: "3-5 actionable recommendations as bullet points"
+    check: "gws docs documents get — find recommendations, count items"
+    weight: 1.0
+
+  - id: recommendations_quality
+    criterion: "Recommendations are specific and actionable with concrete details"
+    check: "Score: 1.0 = specific actions mentioning technologies, metrics, or timelines; 0.5 = reasonable but generic; 0.0 = vague"
+    weight: 0.5
+
+  - id: outline_read_back
+    criterion: "Model read back outline and verified headings, table, bullets"
+    check: "Model called gws_docs_outline after creation"
+    weight: 0.5
+
+  - id: section_read_back
+    criterion: "Model read just the recommendations section"
+    check: "Model called gws_docs_read with section parameter"
+    weight: 0.5
+
+  - id: image_generated
+    criterion: "Model generated an image of a diagram with Edge, Core, Training components"
+    check: "Model called gws_generate_image"
+    weight: 0.5
+
+  - id: image_inserted
+    criterion: "Image was inserted into the document"
+    check: "Model called gws_docs_insert_image"
+    weight: 0.5
+
+  - id: conclusion_replaced
+    criterion: "Conclusion replaced with content mentioning edge computing"
+    check: "gws_docs_read section='Conclusion', check for 'edge'"
+    weight: 1.0
+
+cleanup:
+  - action: trash
+    name_pattern: "AI Infrastructure Report"

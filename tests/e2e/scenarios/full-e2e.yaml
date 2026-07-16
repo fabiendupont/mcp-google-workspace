@@ -1,0 +1,122 @@
+name: full-e2e
+description: "Full lifecycle: read source docs, create report, use tables, read/write sheets, organize in Drive"
+prompt_file: prompts/test-e2e.md
+timeout_seconds: 600
+test_folder_id: "1VkrXx3bhkQaLJEmnY_t5VxVmBETfsbY1"
+
+rubric:
+  # Drive operations
+  - id: test_folder_found
+    criterion: "Model found 'GWS MCP Test' folder"
+    check: "Model called gws_drive_list or gws_drive_find_folder"
+    weight: 0.5
+
+  - id: source_docs_read
+    criterion: "Model read all four Project Alpha source documents"
+    check: "Model called gws_docs_read 4 times on different documents"
+    weight: 1.0
+
+  - id: subfolder_created
+    criterion: "'Project Alpha Deliverables' subfolder created with 'Drafts' and 'Final' inside"
+    check: "gws_drive_list to verify folder hierarchy exists"
+    weight: 1.0
+
+  # Document creation and content
+  - id: report_created
+    criterion: "'Project Alpha - Quarterly Review' doc created in Drafts folder"
+    check: "gws_drive_list the Drafts subfolder"
+    weight: 1.0
+
+  - id: has_executive_summary
+    criterion: "Report has executive summary with key achievements and concerns"
+    check: "gws_docs_outline + gws_docs_read section"
+    weight: 1.0
+
+  - id: has_results_table
+    criterion: "Report has a results table comparing charter objectives (target vs actual)"
+    check: "gws docs documents get — parse table elements, verify target/actual columns"
+    weight: 1.0
+
+  - id: results_table_quality
+    criterion: "Table data matches source documents: objective names from charter, target values from charter, actual values from metrics dashboard"
+    check: "Cross-reference table cells against source docs. Score: 1.0 = all values traceable to sources; 0.5 = mostly correct with minor discrepancies; 0.0 = fabricated or missing data"
+    weight: 1.0
+
+  - id: has_risk_assessment
+    criterion: "Report has risk assessment section analyzing materialized vs mitigated risks"
+    check: "gws docs documents get — find risk section"
+    weight: 1.0
+
+  - id: risk_assessment_quality
+    criterion: "Risk analysis references specific risks from the charter and links them to actual outcomes from incident reports"
+    check: "Cross-reference against charter risks and incident reports. Score: 1.0 = specific risk-to-outcome mapping; 0.5 = mentions risks but no clear outcome linkage; 0.0 = generic risk discussion"
+    weight: 0.5
+
+  - id: has_lessons_learned
+    criterion: "Report has lessons learned with actionable recommendations"
+    check: "gws docs documents get — find lessons section"
+    weight: 1.0
+
+  - id: lessons_quality
+    criterion: "Lessons are derived from incident reports and sprint retro notes, not generic advice"
+    check: "Cross-reference against incident and retro data. Score: 1.0 = cites specific incidents/sprints; 0.5 = plausible but not clearly sourced; 0.0 = generic boilerplate"
+    weight: 0.5
+
+  - id: no_hallucinated_data
+    criterion: "All metrics, dates, team names, and specifics come from the source documents (no fabrication)"
+    check: "Cross-reference every factual claim in the report against the 4 source documents. Score: 1.0 = all facts traceable; 0.5 = mostly correct, 1-2 minor inventions; 0.0 = significant fabricated data"
+    weight: 1.0
+
+  - id: executive_summary_quality
+    criterion: "Executive summary accurately distills the report: mentions key achievements, top concerns, and overall project status"
+    check: "Compare executive summary claims against the body sections. Score: 1.0 = accurate, balanced, concise; 0.5 = accurate but incomplete or verbose; 0.0 = misleading or contradicts body"
+    weight: 0.5
+
+  # Verification and revision
+  - id: outline_verified
+    criterion: "Model read the outline to verify all required sections"
+    check: "Model called gws_docs_outline"
+    weight: 0.5
+
+  - id: lessons_revised
+    criterion: "Lessons Learned section was replaced with improved version cross-referencing incidents"
+    check: "gws_docs_read section='Lessons Learned', check for incident references"
+    weight: 1.0
+
+  # Sheets operations
+  - id: spreadsheet_created
+    criterion: "A summary spreadsheet was created with project metrics"
+    check: "gws_drive_list for spreadsheet in the folder"
+    weight: 1.0
+
+  - id: sheets_data_written
+    criterion: "Spreadsheet contains structured data (metrics, objectives, or scores)"
+    check: "gws_sheets_read to verify data rows"
+    weight: 1.0
+
+  # File management
+  - id: report_copied_to_final
+    criterion: "Report copied to Final folder and renamed with 'v1'"
+    check: "gws_drive_list the Final subfolder"
+    weight: 1.0
+
+  - id: report_shared
+    criterion: "Final report shared with redhat.com domain as reader"
+    check: "Model called gws_drive_share"
+    weight: 0.5
+
+  - id: draft_trashed
+    criterion: "Draft was moved to trash"
+    check: "Model called gws_drive_trash"
+    weight: 0.5
+
+  - id: final_folder_listed
+    criterion: "Model listed Final folder to confirm report is there"
+    check: "Model called gws_drive_list on Final folder"
+    weight: 0.5
+
+cleanup:
+  - action: trash
+    name_pattern: "Project Alpha Deliverables"
+  - action: trash
+    name_pattern: "Project Alpha - Metrics Summary"
