@@ -244,6 +244,35 @@ pub fn sheets_manage_tabs_tool_schema() -> Value {
     })
 }
 
+pub fn normalize_data(data: &Value) -> Value {
+    let Some(arr) = data.as_array() else {
+        return data.clone();
+    };
+    if arr.is_empty() {
+        return data.clone();
+    }
+    if arr[0].is_array() {
+        return data.clone();
+    }
+    if let Some(obj) = arr[0].as_object() {
+        let headers: Vec<String> = obj.keys().cloned().collect();
+        let mut rows: Vec<Value> = vec![json!(headers)];
+        for item in arr {
+            if let Some(o) = item.as_object() {
+                let row: Vec<Value> = headers
+                    .iter()
+                    .map(|h| o.get(h).cloned().unwrap_or(json!("")))
+                    .collect();
+                rows.push(json!(row));
+            }
+        }
+        json!(rows)
+    } else {
+        let rows: Vec<Value> = arr.iter().map(|v| json!([v])).collect();
+        json!(rows)
+    }
+}
+
 pub fn build_range(range: &str, sheet: Option<&str>) -> String {
     if range.contains('!') {
         return range.to_string();
@@ -514,5 +543,39 @@ mod tests {
     #[test]
     fn validate_spreadsheet_id_too_short() {
         assert!(validate_spreadsheet_id("short").is_err());
+    }
+
+    #[test]
+    fn normalize_array_of_arrays_passthrough() {
+        let data = json!([["A", "B"], [1, 2]]);
+        assert_eq!(normalize_data(&data), data);
+    }
+
+    #[test]
+    fn normalize_array_of_objects() {
+        let data = json!([
+            {"Name": "Alice", "Score": 95},
+            {"Name": "Bob", "Score": 78}
+        ]);
+        let result = normalize_data(&data);
+        let rows = result.as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows[0].as_array().unwrap().contains(&json!("Name")));
+        assert!(rows[0].as_array().unwrap().contains(&json!("Score")));
+    }
+
+    #[test]
+    fn normalize_flat_array() {
+        let data = json!(["Alice", "Bob", "Charlie"]);
+        let result = normalize_data(&data);
+        let rows = result.as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], json!(["Alice"]));
+    }
+
+    #[test]
+    fn normalize_empty_array() {
+        let data = json!([]);
+        assert_eq!(normalize_data(&data), data);
     }
 }

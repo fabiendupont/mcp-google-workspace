@@ -2312,7 +2312,35 @@ async fn execute_docs_write(
                 &mut state.token_cache,
             )
             .await;
-            if let Ok(ref r) = result {
+
+            // If batchUpdate fails with too many requests, retry in smaller chunks
+            let should_chunk = match &result {
+                Err(_) => final_reqs.len() > 10,
+                Ok(r) => check_api_result(r).is_err() && final_reqs.len() > 10,
+            };
+            if should_chunk {
+                tracing::info!(
+                    total_requests = final_reqs.len(),
+                    "batchUpdate failed, retrying in chunks of 50"
+                );
+                result = Ok(json!({}));
+                for chunk in final_reqs.chunks(50) {
+                    let chunk_args = json!({
+                        "params": { "documentId": doc_id },
+                        "body": { "requests": chunk }
+                    });
+                    result = crate::execute::execute_tool(
+                        &docs_doc, batch_method, "documents", "batchUpdate",
+                        &chunk_args, "docs", policy, meta, None, None, dry_run,
+                        &mut state.token_cache,
+                    ).await;
+                    match &result {
+                        Ok(r) if check_api_result(r).is_err() => break,
+                        Err(_) => break,
+                        _ => {}
+                    }
+                }
+            } else if let Ok(ref r) = result {
                 if check_api_result(r).is_err() {
                     break;
                 }
@@ -2615,7 +2643,9 @@ async fn execute_sheets_helper(
 
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-            if !new_id.is_empty() && data.is_array() {
+            let normalized_data = crate::sheets_helpers::normalize_data(data);
+
+            if !new_id.is_empty() && normalized_data.is_array() {
                 let values_resource =
                     tools::find_resource(&sheets_doc.resources, "spreadsheets.values")
                         .ok_or_else(|| {
@@ -2632,13 +2662,24 @@ async fn execute_sheets_helper(
                         "range": full_range,
                         "valueInputOption": "USER_ENTERED"
                     },
-                    "body": { "range": full_range, "values": data }
+                    "body": { "range": full_range, "values": normalized_data }
                 });
-                let write_result = crate::execute::execute_tool(
+                let mut write_result = crate::execute::execute_tool(
                     &sheets_doc, update_method, "spreadsheets.values", "update",
                     &write_args, "sheets", policy, meta, None, None, false,
                     &mut state.token_cache,
                 ).await?;
+
+                if write_result.get("updatedRows").is_none() {
+                    tracing::info!("sheets create-on-write: first write returned no updatedRows, retrying after 1s");
+                    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                    write_result = crate::execute::execute_tool(
+                        &sheets_doc, update_method, "spreadsheets.values", "update",
+                        &write_args, "sheets", policy, meta, None, None, false,
+                        &mut state.token_cache,
+                    ).await?;
+                }
+
                 tracing::info!(
                     spreadsheet_id = new_id,
                     updated_rows = ?write_result.get("updatedRows"),
@@ -2721,6 +2762,7 @@ async fn execute_sheets_helper(
                 .ok_or_else(|| GwsError::Validation(
                     "Missing 'data'. Pass an array of rows, e.g. [[\"Name\",\"Score\"],[\"Alice\",95]]".into()
                 ))?;
+            let normalized_data = crate::sheets_helpers::normalize_data(data);
             let sheet = arguments.get("sheet").and_then(|v| v.as_str());
             let values_resource = tools::find_resource(&sheets_doc.resources, "spreadsheets.values")
                 .ok_or_else(|| {
@@ -2730,7 +2772,7 @@ async fn execute_sheets_helper(
                 .methods
                 .get("update")
                 .ok_or_else(|| GwsError::Validation("update method not found".into()))?;
-            let args = crate::sheets_helpers::build_write_args(range, data, sheet);
+            let args = crate::sheets_helpers::build_write_args(range, &normalized_data, sheet);
             let mut args_with_id = args.clone();
             args_with_id["params"]["spreadsheetId"] = json!(spreadsheet_id);
             let result = crate::execute::execute_tool(
