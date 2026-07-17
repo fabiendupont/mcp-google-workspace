@@ -1,0 +1,106 @@
+# navra config for E2E testing mcp-google-workspace
+#
+# Prerequisites:
+#   - Ollama running with models pulled (gemma4:e4b, gemma4:26b, qwen3:8b, qwen3.6:35b-a3b)
+#   - MCP server running: ./target/release/mcp-google-workspace --policy tests/e2e/policy.generated.json --prompts-dir ./prompts --http 127.0.0.1:3100
+#   - For Claude Sonnet: gcloud auth configured for Vertex AI
+#
+# Usage:
+#   navra serve -c tests/e2e/navra.toml
+#   MCPD_TOKEN=<token> navra run -m gemma4:e4b "$(cat prompts/test-e2e.md)"
+
+[server]
+tcp = "127.0.0.1:9315"
+
+# --- Agent ---
+
+[[agents]]
+name = "gws-test"
+token_hash = "fc55a7d022fdd06d1109ba22c86df0d7c68d2dccaab408c1c67e63786646f1ef"
+permissions = "gws"
+model = "gemma4-26b"
+
+# --- Upstream MCP server ---
+
+[[upstream]]
+name = "google-workspace"
+transport = "http"
+url = "http://127.0.0.1:3100/mcp"
+request_timeout_secs = 60
+
+[upstream.tool_class]
+# Meta tools
+gws_discover      = { domain = "network", operation = "read" }
+gws_batch         = { domain = "network", operation = "write" }
+# Docs helpers
+gws_docs_write          = { domain = "network", operation = "write" }
+gws_docs_replace_section = { domain = "network", operation = "write" }
+gws_docs_read           = { domain = "network", operation = "read" }
+gws_docs_outline        = { domain = "network", operation = "read" }
+gws_docs_find           = { domain = "network", operation = "read" }
+gws_docs_insert_table   = { domain = "network", operation = "write" }
+gws_docs_read_table     = { domain = "network", operation = "read" }
+gws_docs_insert_image   = { domain = "network", operation = "write" }
+gws_docs_format         = { domain = "network", operation = "write" }
+# Drive helpers
+gws_drive_list          = { domain = "network", operation = "read" }
+gws_drive_find_folder   = { domain = "network", operation = "read" }
+gws_drive_info          = { domain = "network", operation = "read" }
+gws_drive_create_folder = { domain = "network", operation = "write" }
+gws_drive_copy          = { domain = "network", operation = "write" }
+gws_drive_rename        = { domain = "network", operation = "write" }
+gws_drive_move          = { domain = "network", operation = "write" }
+gws_drive_share         = { domain = "network", operation = "write" }
+gws_drive_trash         = { domain = "network", operation = "write" }
+# Sheets helpers
+gws_sheets_read         = { domain = "network", operation = "read" }
+gws_sheets_write        = { domain = "network", operation = "write" }
+gws_sheets_append       = { domain = "network", operation = "write" }
+gws_sheets_info         = { domain = "network", operation = "read" }
+gws_sheets_clear        = { domain = "network", operation = "write" }
+gws_sheets_manage_tabs  = { domain = "network", operation = "write" }
+# Slides & image
+gws_slides_import_marp  = { domain = "network", operation = "write" }
+gws_templates           = { domain = "network", operation = "read" }
+gws_generate_image      = { domain = "network", operation = "write" }
+
+# --- Models ---
+
+[models.embed]
+task = "embedding"
+source = "ollama://nomic-embed-text"
+dimensions = 768
+execution_mode = "served"
+runtime = "ollama"
+
+[models.gemma4-26b]
+task = "chat"
+source = "ollama://gemma4:26b"
+runtime = "embedded"
+context_size = 8192
+
+[models.vertex-claude]
+task = "chat"
+base_url = "https://aiplatform.googleapis.com/v1/projects/itpc-gcp-eco-eng-claude/locations/global/publishers/anthropic/models"
+model_name = "claude-sonnet-4-5@20250929"
+locality = "remote"
+
+[models.vertex-claude-opus]
+task = "chat"
+base_url = "https://aiplatform.googleapis.com/v1/projects/itpc-gcp-eco-eng-claude/locations/global/publishers/anthropic/models"
+model_name = "claude-opus-4-6@default"
+locality = "remote"
+
+[budget]
+max_parallel = 1
+
+# --- Permissions ---
+
+[permissions.gws]
+ring = 1
+tainted_write_policy = "allow"
+tool_disclosure_include = ["gws_*"]
+
+[[permissions.gws.domain_rules]]
+domain = "network"
+operations = ["read", "write"]
