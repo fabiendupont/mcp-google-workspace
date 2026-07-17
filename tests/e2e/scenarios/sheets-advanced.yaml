@@ -1,0 +1,70 @@
+name: sheets-advanced
+description: "Advanced sheets: formulas, conditional formatting, data validation, named ranges, dimensions, CSV, formula analysis"
+prompt_file: prompts/test-sheets-advanced.md
+timeout_seconds: 300
+test_folder_id: "1VkrXx3bhkQaLJEmnY_t5VxVmBETfsbY1"
+
+rubric:
+  - id: spreadsheet_created
+    criterion: "Spreadsheet 'Sales Tracker' exists in the test folder"
+    check: "gws_drive_list the test folder, look for 'Sales Tracker' with spreadsheet mimeType"
+    weight: 1.0
+
+  - id: data_written
+    criterion: "Spreadsheet has header row + 4 data rows with Rep, Region, Q1/Q2 Sales, Total, Status"
+    check: "gws_sheets_read range A1:F5, verify 5 rows with correct headers and data"
+    weight: 1.0
+
+  - id: formulas_work
+    criterion: "Total column (E) contains formulas that calculated correctly (e.g. E2 = 97000)"
+    check: "gws_sheets_read with format=values to see computed totals; gws_sheets_read with format=formula to see =C2+D2"
+    weight: 1.0
+
+  - id: conditional_formatting
+    criterion: "Conditional formatting rules exist on E2:E5 for green (>80000) and red (<70000)"
+    check: "gws_sheets_format action=list, verify rules exist with correct ranges and thresholds"
+    weight: 1.0
+
+  - id: data_validation
+    criterion: "Data validation on F2:F5 allows only 'On Track', 'At Risk', 'Behind'"
+    check: "gws_sheets_validate action=list, verify ONE_OF_LIST rule on Status column"
+    weight: 1.0
+
+  - id: named_range
+    criterion: "Named range 'SalesData' exists covering A1:F5"
+    check: "gws_sheets_named_range action=list, verify 'SalesData' exists"
+    weight: 1.0
+
+  - id: rows_inserted
+    criterion: "2 rows were inserted after the data"
+    check: "gws_sheets_info to check row count increased, or gws_sheets_read to verify empty rows exist"
+    weight: 0.5
+
+  - id: csv_exported
+    criterion: "Model exported CSV data from the spreadsheet"
+    check: "Model called gws_sheets_csv action=export"
+    weight: 0.5
+
+  - id: formulas_analyzed
+    criterion: "Model listed formulas and explained E2"
+    check: "Model called gws_sheets_formulas and gws_sheets_explain for E2"
+    weight: 0.5
+
+  - id: status_written
+    criterion: "Status column has values: On Track, At Risk, On Track, Behind"
+    check: "gws_sheets_read range F2:F5, verify the 4 status values"
+    weight: 1.0
+
+  - id: final_data_correct
+    criterion: "All data is consistent: totals match Q1+Q2, status values present, formulas intact"
+    check: "gws_sheets_read full range, cross-check computed totals vs source data"
+    weight: 1.0
+
+  - id: data_quality
+    criterion: "Specific numbers match the prompt (45000+52000=97000 for Alice, etc.)"
+    check: "Verify exact values: Alice total=97000, Bob=79000, Carol=99000, Dave=64000"
+    weight: 0.5
+
+cleanup:
+  - action: trash
+    name_pattern: "Sales Tracker"

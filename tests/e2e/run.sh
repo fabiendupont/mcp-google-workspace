@@ -9,7 +9,7 @@ MCP_PORT=3100
 NAVRA_PORT=9315
 
 ALL_MODELS="gemma4:e4b gemma4:26b qwen3:8b qwen3.6:35b-a3b claude-sonnet-4-5@20250929"
-ALL_SCENARIOS="drive-workflow docs-workflow docs-full full-e2e"
+ALL_SCENARIOS="drive-workflow docs-workflow docs-full full-e2e sheets-advanced"
 
 # --- Parse args ---
 MODELS=""
@@ -119,6 +119,7 @@ prompt_file() {
         docs-workflow)  echo "$PROJECT_DIR/prompts/test-docs-workflow.md" ;;
         docs-full)      echo "$PROJECT_DIR/prompts/test-docs-full.md" ;;
         full-e2e)       echo "$PROJECT_DIR/prompts/test-e2e.md" ;;
+        sheets-advanced) echo "$PROJECT_DIR/prompts/test-sheets-advanced.md" ;;
         *) echo ""; return 1 ;;
     esac
 }
