@@ -59,6 +59,14 @@ gws_sheets_append       = { domain = "network", operation = "write" }
 gws_sheets_info         = { domain = "network", operation = "read" }
 gws_sheets_clear        = { domain = "network", operation = "write" }
 gws_sheets_manage_tabs  = { domain = "network", operation = "write" }
+gws_sheets_trace        = { domain = "network", operation = "read" }
+gws_sheets_explain      = { domain = "network", operation = "read" }
+gws_sheets_format       = { domain = "network", operation = "write" }
+gws_sheets_validate     = { domain = "network", operation = "write" }
+gws_sheets_named_range  = { domain = "network", operation = "write" }
+gws_sheets_csv          = { domain = "network", operation = "write" }
+gws_sheets_dimensions   = { domain = "network", operation = "write" }
+gws_sheets_formulas     = { domain = "network", operation = "read" }
 # Slides & image
 gws_slides_import_marp  = { domain = "network", operation = "write" }
 gws_templates           = { domain = "network", operation = "read" }

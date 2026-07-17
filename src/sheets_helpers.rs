@@ -519,6 +519,416 @@ pub fn sheets_explain_tool_schema() -> Value {
     })
 }
 
+pub fn sheets_format_tool_schema() -> Value {
+    json!({
+        "name": "gws_sheets_format",
+        "title": "Conditional Formatting",
+        "description": "Add, update, delete, or list conditional formatting rules on a spreadsheet.",
+        "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": true },
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "spreadsheet_id": { "type": "string", "description": "Spreadsheet ID" },
+                "action": { "type": "string", "enum": ["add", "update", "delete", "list"], "description": "add, update, delete, or list" },
+                "sheet_id": { "type": "integer", "description": "Tab ID (from gws_sheets_info)" },
+                "range": { "type": "string", "description": "A1 range for the rule (e.g. 'A1:D10')" },
+                "rule": { "type": "object", "description": "Conditional format rule: {type, values, format}. E.g. {\"type\":\"NUMBER_GREATER\",\"values\":[\"90\"],\"format\":{\"backgroundColor\":{\"red\":0,\"green\":1,\"blue\":0}}}" },
+                "index": { "type": "integer", "description": "Rule index for update/delete (0-based)" }
+            },
+            "required": ["spreadsheet_id", "action"]
+        }
+    })
+}
+
+pub fn sheets_validate_tool_schema() -> Value {
+    json!({
+        "name": "gws_sheets_validate",
+        "title": "Data Validation",
+        "description": "Set, clear, or list data validation rules on spreadsheet cells.",
+        "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": true },
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "spreadsheet_id": { "type": "string", "description": "Spreadsheet ID" },
+                "action": { "type": "string", "enum": ["set", "clear", "list"], "description": "set, clear, or list" },
+                "sheet_id": { "type": "integer", "description": "Tab ID (from gws_sheets_info)" },
+                "range": { "type": "string", "description": "A1 range (e.g. 'B2:B100')" },
+                "rule": { "type": "object", "description": "Validation rule: {type, values, strict, message}. E.g. {\"type\":\"ONE_OF_LIST\",\"values\":[\"Yes\",\"No\"],\"strict\":true}" }
+            },
+            "required": ["spreadsheet_id", "action"]
+        }
+    })
+}
+
+pub fn sheets_named_range_tool_schema() -> Value {
+    json!({
+        "name": "gws_sheets_named_range",
+        "title": "Named Ranges",
+        "description": "Create, update, delete, list, or read named ranges in a spreadsheet.",
+        "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": true },
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "spreadsheet_id": { "type": "string", "description": "Spreadsheet ID" },
+                "action": { "type": "string", "enum": ["create", "update", "delete", "list", "read"], "description": "create, update, delete, list, or read" },
+                "name": { "type": "string", "description": "Named range name (for create/update/read)" },
+                "range": { "type": "string", "description": "A1 range (for create/update)" },
+                "sheet_id": { "type": "integer", "description": "Tab ID (for create/update)" },
+                "named_range_id": { "type": "string", "description": "Named range ID (for update/delete, from list)" }
+            },
+            "required": ["spreadsheet_id", "action"]
+        }
+    })
+}
+
+pub fn sheets_csv_tool_schema() -> Value {
+    json!({
+        "name": "gws_sheets_csv",
+        "title": "CSV Import/Export",
+        "description": "Export spreadsheet data as CSV string or import CSV data into a spreadsheet.",
+        "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": true },
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "spreadsheet_id": { "type": "string", "description": "Spreadsheet ID" },
+                "action": { "type": "string", "enum": ["export", "import"], "description": "export or import" },
+                "sheet": { "type": "string", "description": "Tab name (defaults to Sheet1)" },
+                "data": { "type": "string", "description": "CSV string (for import)" },
+                "separator": { "type": "string", "description": "Field separator (default: comma)" }
+            },
+            "required": ["spreadsheet_id", "action"]
+        }
+    })
+}
+
+pub fn sheets_dimensions_tool_schema() -> Value {
+    json!({
+        "name": "gws_sheets_dimensions",
+        "title": "Row/Column Management",
+        "description": "Insert, append, delete, move, or resize rows and columns in a spreadsheet.",
+        "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true },
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "spreadsheet_id": { "type": "string", "description": "Spreadsheet ID" },
+                "action": { "type": "string", "enum": ["insert", "append", "delete", "move", "resize"], "description": "insert, append, delete, move, or resize" },
+                "sheet_id": { "type": "integer", "description": "Tab ID (from gws_sheets_info)" },
+                "dimension": { "type": "string", "enum": ["ROWS", "COLUMNS"], "description": "ROWS or COLUMNS" },
+                "start": { "type": "integer", "description": "Start index (0-based, for insert/delete)" },
+                "end": { "type": "integer", "description": "End index (exclusive, for delete)" },
+                "count": { "type": "integer", "description": "Number to insert/append (default 1)" },
+                "size": { "type": "integer", "description": "Pixel size (for resize)" },
+                "destination": { "type": "integer", "description": "Destination index (for move)" }
+            },
+            "required": ["spreadsheet_id", "action"]
+        }
+    })
+}
+
+pub fn sheets_formulas_tool_schema() -> Value {
+    json!({
+        "name": "gws_sheets_formulas",
+        "title": "Dump All Formulas",
+        "description": "List all formulas in a spreadsheet tab. Shows which columns have formulas and their patterns.",
+        "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true },
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "spreadsheet_id": { "type": "string", "description": "Spreadsheet ID" },
+                "sheet": { "type": "string", "description": "Tab name (defaults to Sheet1)" },
+                "range": { "type": "string", "description": "A1 range (defaults to all data)" }
+            },
+            "required": ["spreadsheet_id"]
+        }
+    })
+}
+
+pub fn a1_to_grid_range(range: &str, sheet_id: i64) -> Value {
+    let parts: Vec<&str> = range.split(':').collect();
+    let (start_col, start_row) = parse_cell_ref(parts[0]);
+    if parts.len() == 1 {
+        return json!({
+            "sheetId": sheet_id,
+            "startRowIndex": start_row,
+            "endRowIndex": start_row + 1,
+            "startColumnIndex": start_col,
+            "endColumnIndex": start_col + 1
+        });
+    }
+    let (end_col, end_row) = parse_cell_ref(parts[1]);
+    json!({
+        "sheetId": sheet_id,
+        "startRowIndex": start_row,
+        "endRowIndex": end_row + 1,
+        "startColumnIndex": start_col,
+        "endColumnIndex": end_col + 1
+    })
+}
+
+fn parse_cell_ref(cell: &str) -> (i64, i64) {
+    let col_end = cell.chars().take_while(|c| c.is_ascii_uppercase()).count();
+    let col_letters = &cell[..col_end];
+    let row: i64 = cell[col_end..].parse().unwrap_or(1) - 1;
+    let col = col_letters
+        .bytes()
+        .fold(0i64, |acc, b| acc * 26 + (b - b'A') as i64 + 1)
+        - 1;
+    (col.max(0), row.max(0))
+}
+
+pub fn build_conditional_format_request(
+    action: &str,
+    sheet_id: Option<i64>,
+    range: Option<&str>,
+    rule: Option<&Value>,
+    index: Option<i64>,
+) -> Result<Value, String> {
+    match action {
+        "add" => {
+            let sid = sheet_id.ok_or("Missing sheet_id for add")?;
+            let r = range.ok_or("Missing range for add")?;
+            let rl = rule.ok_or("Missing rule for add")?;
+            let grid = a1_to_grid_range(r, sid);
+            let condition_type = rl.get("type").and_then(|v| v.as_str()).unwrap_or("CUSTOM_FORMULA");
+            let values: Vec<Value> = rl.get("values")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().map(|v| json!({"userEnteredValue": v})).collect())
+                .unwrap_or_default();
+            let format = rl.get("format").cloned().unwrap_or(json!({}));
+            Ok(json!({
+                "body": { "requests": [{
+                    "addConditionalFormatRule": {
+                        "rule": {
+                            "ranges": [grid],
+                            "booleanRule": {
+                                "condition": { "type": condition_type, "values": values },
+                                "format": format
+                            }
+                        },
+                        "index": index.unwrap_or(0)
+                    }
+                }]}
+            }))
+        }
+        "delete" => {
+            let idx = index.ok_or("Missing index for delete")?;
+            let sid = sheet_id.ok_or("Missing sheet_id for delete")?;
+            Ok(json!({
+                "body": { "requests": [{
+                    "deleteConditionalFormatRule": { "sheetId": sid, "index": idx }
+                }]}
+            }))
+        }
+        _ => Err(format!("Use action 'add', 'delete', or 'list'. Got: {action}")),
+    }
+}
+
+pub fn build_data_validation_request(
+    action: &str,
+    sheet_id: Option<i64>,
+    range: Option<&str>,
+    rule: Option<&Value>,
+) -> Result<Value, String> {
+    match action {
+        "set" => {
+            let sid = sheet_id.ok_or("Missing sheet_id for set")?;
+            let r = range.ok_or("Missing range for set")?;
+            let rl = rule.ok_or("Missing rule for set")?;
+            let grid = a1_to_grid_range(r, sid);
+            let condition_type = rl.get("type").and_then(|v| v.as_str()).unwrap_or("ONE_OF_LIST");
+            let values: Vec<Value> = rl.get("values")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().map(|v| json!({"userEnteredValue": v})).collect())
+                .unwrap_or_default();
+            let strict = rl.get("strict").and_then(|v| v.as_bool()).unwrap_or(true);
+            let message = rl.get("message").and_then(|v| v.as_str());
+            let mut dv_rule = json!({
+                "condition": { "type": condition_type, "values": values },
+                "strict": strict,
+                "showCustomUi": true
+            });
+            if let Some(msg) = message {
+                dv_rule["inputMessage"] = json!(msg);
+            }
+            Ok(json!({
+                "body": { "requests": [{
+                    "setDataValidation": {
+                        "range": grid,
+                        "rule": dv_rule
+                    }
+                }]}
+            }))
+        }
+        "clear" => {
+            let sid = sheet_id.ok_or("Missing sheet_id for clear")?;
+            let r = range.ok_or("Missing range for clear")?;
+            let grid = a1_to_grid_range(r, sid);
+            Ok(json!({
+                "body": { "requests": [{
+                    "setDataValidation": { "range": grid }
+                }]}
+            }))
+        }
+        _ => Err(format!("Use action 'set', 'clear', or 'list'. Got: {action}")),
+    }
+}
+
+pub fn build_named_range_request(
+    action: &str,
+    name: Option<&str>,
+    sheet_id: Option<i64>,
+    range: Option<&str>,
+    named_range_id: Option<&str>,
+) -> Result<Value, String> {
+    match action {
+        "create" => {
+            let n = name.ok_or("Missing name for create")?;
+            let sid = sheet_id.ok_or("Missing sheet_id for create")?;
+            let r = range.ok_or("Missing range for create")?;
+            let grid = a1_to_grid_range(r, sid);
+            Ok(json!({
+                "body": { "requests": [{
+                    "addNamedRange": {
+                        "namedRange": { "name": n, "range": grid }
+                    }
+                }]}
+            }))
+        }
+        "delete" => {
+            let nid = named_range_id.ok_or("Missing named_range_id for delete")?;
+            Ok(json!({
+                "body": { "requests": [{
+                    "deleteNamedRange": { "namedRangeId": nid }
+                }]}
+            }))
+        }
+        _ => Err(format!("Use action 'create', 'delete', 'list', or 'read'. Got: {action}")),
+    }
+}
+
+pub fn build_dimension_request(
+    action: &str,
+    sheet_id: Option<i64>,
+    dimension: Option<&str>,
+    start: Option<i64>,
+    end: Option<i64>,
+    count: Option<i64>,
+    size: Option<i64>,
+    destination: Option<i64>,
+) -> Result<Value, String> {
+    let sid = sheet_id.ok_or("Missing sheet_id")?;
+    let dim = dimension.unwrap_or("ROWS");
+    match action {
+        "insert" => {
+            let s = start.ok_or("Missing start index for insert")?;
+            let c = count.unwrap_or(1);
+            Ok(json!({
+                "body": { "requests": [{
+                    "insertDimension": {
+                        "range": { "sheetId": sid, "dimension": dim, "startIndex": s, "endIndex": s + c },
+                        "inheritFromBefore": s > 0
+                    }
+                }]}
+            }))
+        }
+        "append" => {
+            let c = count.unwrap_or(1);
+            Ok(json!({
+                "body": { "requests": [{
+                    "appendDimension": { "sheetId": sid, "dimension": dim, "length": c }
+                }]}
+            }))
+        }
+        "delete" => {
+            let s = start.ok_or("Missing start index for delete")?;
+            let e = end.ok_or("Missing end index for delete")?;
+            Ok(json!({
+                "body": { "requests": [{
+                    "deleteDimension": {
+                        "range": { "sheetId": sid, "dimension": dim, "startIndex": s, "endIndex": e }
+                    }
+                }]}
+            }))
+        }
+        "move" => {
+            let s = start.ok_or("Missing start index for move")?;
+            let e = end.unwrap_or(s + 1);
+            let d = destination.ok_or("Missing destination for move")?;
+            Ok(json!({
+                "body": { "requests": [{
+                    "moveDimension": {
+                        "source": { "sheetId": sid, "dimension": dim, "startIndex": s, "endIndex": e },
+                        "destinationIndex": d
+                    }
+                }]}
+            }))
+        }
+        "resize" => {
+            let s = start.ok_or("Missing start index for resize")?;
+            let e = end.unwrap_or(s + 1);
+            let px = size.ok_or("Missing size (pixels) for resize")?;
+            Ok(json!({
+                "body": { "requests": [{
+                    "updateDimensionProperties": {
+                        "range": { "sheetId": sid, "dimension": dim, "startIndex": s, "endIndex": e },
+                        "properties": { "pixelSize": px },
+                        "fields": "pixelSize"
+                    }
+                }]}
+            }))
+        }
+        _ => Err(format!("Use action 'insert', 'append', 'delete', 'move', or 'resize'. Got: {action}")),
+    }
+}
+
+pub fn csv_to_values(csv: &str, separator: char) -> Vec<Vec<String>> {
+    csv.lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let mut fields = Vec::new();
+            let mut current = String::new();
+            let mut in_quotes = false;
+            let mut chars = line.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c == '"' {
+                    if in_quotes && chars.peek() == Some(&'"') {
+                        current.push('"');
+                        chars.next();
+                    } else {
+                        in_quotes = !in_quotes;
+                    }
+                } else if c == separator && !in_quotes {
+                    fields.push(current.trim().to_string());
+                    current = String::new();
+                } else {
+                    current.push(c);
+                }
+            }
+            fields.push(current.trim().to_string());
+            fields
+        })
+        .collect()
+}
+
+pub fn values_to_csv(values: &[Vec<String>], separator: char) -> String {
+    values
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|cell| {
+                    if cell.contains(separator) || cell.contains('"') || cell.contains('\n') {
+                        format!("\"{}\"", cell.replace('"', "\"\""))
+                    } else {
+                        cell.clone()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(&separator.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub fn build_range(range: &str, sheet: Option<&str>) -> String {
     if range.contains('!') {
         return range.to_string();
@@ -880,6 +1290,69 @@ mod tests {
         let (col, row) = resolve_cell_name("B2", &headers, &row_labels).unwrap();
         assert_eq!(col, "Score");
         assert_eq!(row, "Alice");
+    }
+
+    #[test]
+    fn csv_roundtrip() {
+        let values = vec![
+            vec!["Name".into(), "Score".into()],
+            vec!["Alice".into(), "95".into()],
+        ];
+        let csv = values_to_csv(&values, ',');
+        assert_eq!(csv, "Name,Score\nAlice,95");
+        let parsed = csv_to_values(&csv, ',');
+        assert_eq!(parsed, values);
+    }
+
+    #[test]
+    fn csv_with_quotes() {
+        let values = vec![vec!["Hello, World".into(), "normal".into()]];
+        let csv = values_to_csv(&values, ',');
+        assert!(csv.contains("\"Hello, World\""));
+        let parsed = csv_to_values(&csv, ',');
+        assert_eq!(parsed[0][0], "Hello, World");
+    }
+
+    #[test]
+    fn a1_to_grid_single_cell() {
+        let grid = a1_to_grid_range("B2", 0);
+        assert_eq!(grid["startColumnIndex"], 1);
+        assert_eq!(grid["startRowIndex"], 1);
+        assert_eq!(grid["endColumnIndex"], 2);
+        assert_eq!(grid["endRowIndex"], 2);
+    }
+
+    #[test]
+    fn a1_to_grid_range_multi() {
+        let grid = a1_to_grid_range("A1:C5", 42);
+        assert_eq!(grid["sheetId"], 42);
+        assert_eq!(grid["startColumnIndex"], 0);
+        assert_eq!(grid["startRowIndex"], 0);
+        assert_eq!(grid["endColumnIndex"], 3);
+        assert_eq!(grid["endRowIndex"], 5);
+    }
+
+    #[test]
+    fn build_dimension_insert() {
+        let req = build_dimension_request("insert", Some(0), Some("ROWS"), Some(5), None, Some(3), None, None).unwrap();
+        let insert = &req["body"]["requests"][0]["insertDimension"];
+        assert_eq!(insert["range"]["startIndex"], 5);
+        assert_eq!(insert["range"]["endIndex"], 8);
+        assert_eq!(insert["range"]["dimension"], "ROWS");
+    }
+
+    #[test]
+    fn build_cond_format_add() {
+        let rule = json!({"type": "NUMBER_GREATER", "values": ["90"], "format": {"backgroundColor": {"red": 0, "green": 1, "blue": 0}}});
+        let req = build_conditional_format_request("add", Some(0), Some("A1:A10"), Some(&rule), None).unwrap();
+        assert!(req["body"]["requests"][0]["addConditionalFormatRule"].is_object());
+    }
+
+    #[test]
+    fn build_data_validation_set() {
+        let rule = json!({"type": "ONE_OF_LIST", "values": ["Yes", "No"], "strict": true});
+        let req = build_data_validation_request("set", Some(0), Some("B2:B100"), Some(&rule)).unwrap();
+        assert!(req["body"]["requests"][0]["setDataValidation"].is_object());
     }
 
     #[test]

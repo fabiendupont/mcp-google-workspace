@@ -2993,6 +2993,247 @@ async fn execute_sheets_helper(
             }))
         }
 
+        "gws_sheets_format" | "gws_sheets_validate" | "gws_sheets_named_range" | "gws_sheets_dimensions" => {
+            let spreadsheet_id = spreadsheet_id_opt.unwrap();
+            let action = arguments.get("action").and_then(|v| v.as_str())
+                .ok_or_else(|| GwsError::Validation("Missing 'action'".into()))?;
+            let sheet_id = arguments.get("sheet_id").and_then(|v| v.as_i64());
+            let range = arguments.get("range").and_then(|v| v.as_str());
+            let rule = arguments.get("rule");
+            let index = arguments.get("index").and_then(|v| v.as_i64());
+            let name = arguments.get("name").and_then(|v| v.as_str());
+            let named_range_id = arguments.get("named_range_id").and_then(|v| v.as_str());
+            let dimension = arguments.get("dimension").and_then(|v| v.as_str());
+            let start = arguments.get("start").and_then(|v| v.as_i64());
+            let end = arguments.get("end").and_then(|v| v.as_i64());
+            let count = arguments.get("count").and_then(|v| v.as_i64());
+            let size = arguments.get("size").and_then(|v| v.as_i64());
+            let destination = arguments.get("destination").and_then(|v| v.as_i64());
+
+            // List actions: read from spreadsheet metadata
+            if action == "list" {
+                let spreadsheets_resource = tools::find_resource(&sheets_doc.resources, "spreadsheets")
+                    .ok_or_else(|| GwsError::Validation("spreadsheets resource not found".into()))?;
+                let get_method = spreadsheets_resource.methods.get("get")
+                    .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
+                let fields = match tool_name {
+                    "gws_sheets_format" => "sheets(conditionalFormats)",
+                    "gws_sheets_validate" => "sheets(data(rowData(values(dataValidation))))",
+                    "gws_sheets_named_range" => "namedRanges",
+                    _ => "sheets",
+                };
+                let args = json!({"params": {"spreadsheetId": spreadsheet_id}, "fields": fields});
+                let result = crate::execute::execute_tool(
+                    &sheets_doc, get_method, "spreadsheets", "get",
+                    &args, "sheets", policy, meta, None, None, false,
+                    &mut state.token_cache,
+                ).await?;
+                return Ok(json!({
+                    "content": [{"type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default()}],
+                    "structuredContent": result,
+                    "isError": false
+                }));
+            }
+
+            // Read action for named ranges
+            if tool_name == "gws_sheets_named_range" && action == "read" {
+                let n = name.ok_or_else(|| GwsError::Validation("Missing 'name' for read".into()))?;
+                let spreadsheets_resource = tools::find_resource(&sheets_doc.resources, "spreadsheets")
+                    .ok_or_else(|| GwsError::Validation("spreadsheets resource not found".into()))?;
+                let get_method = spreadsheets_resource.methods.get("get")
+                    .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
+                let meta_result = crate::execute::execute_tool(
+                    &sheets_doc, get_method, "spreadsheets", "get",
+                    &json!({"params": {"spreadsheetId": spreadsheet_id}, "fields": "namedRanges,sheets(properties(sheetId,title))"}),
+                    "sheets", policy, meta, None, None, false, &mut state.token_cache,
+                ).await?;
+                // Find the named range and read its values
+                let named_ranges = meta_result.get("namedRanges").and_then(|v| v.as_array());
+                let found = named_ranges.and_then(|nrs| nrs.iter().find(|nr| nr.get("name").and_then(|v| v.as_str()) == Some(n)));
+                if let Some(nr) = found {
+                    let nr_range = nr.get("range");
+                    let result = json!({"name": n, "namedRange": nr, "range": nr_range});
+                    return Ok(json!({
+                        "content": [{"type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default()}],
+                        "structuredContent": result,
+                        "isError": false
+                    }));
+                }
+                return Err(GwsError::Validation(format!("Named range '{n}' not found")));
+            }
+
+            // Build batchUpdate request
+            let batch_args = match tool_name {
+                "gws_sheets_format" => crate::sheets_helpers::build_conditional_format_request(action, sheet_id, range, rule, index),
+                "gws_sheets_validate" => crate::sheets_helpers::build_data_validation_request(action, sheet_id, range, rule),
+                "gws_sheets_named_range" => crate::sheets_helpers::build_named_range_request(action, name, sheet_id, range, named_range_id),
+                "gws_sheets_dimensions" => crate::sheets_helpers::build_dimension_request(action, sheet_id, dimension, start, end, count, size, destination),
+                _ => unreachable!(),
+            }.map_err(GwsError::Validation)?;
+
+            let spreadsheets_resource = tools::find_resource(&sheets_doc.resources, "spreadsheets")
+                .ok_or_else(|| GwsError::Validation("spreadsheets resource not found".into()))?;
+            let batch_method = spreadsheets_resource.methods.get("batchUpdate")
+                .ok_or_else(|| GwsError::Validation("batchUpdate method not found".into()))?;
+            let mut args = batch_args;
+            args["params"] = json!({"spreadsheetId": spreadsheet_id});
+            let result = crate::execute::execute_tool(
+                &sheets_doc, batch_method, "spreadsheets", "batchUpdate",
+                &args, "sheets", policy, meta, None, None, false,
+                &mut state.token_cache,
+            ).await?;
+            state.sheet_cache.invalidate(spreadsheet_id);
+            Ok(json!({
+                "content": [{"type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default()}],
+                "structuredContent": result,
+                "isError": false
+            }))
+        }
+
+        "gws_sheets_csv" => {
+            let spreadsheet_id = spreadsheet_id_opt.unwrap();
+            let action = arguments.get("action").and_then(|v| v.as_str())
+                .ok_or_else(|| GwsError::Validation("Missing 'action' (export or import)".into()))?;
+            let sheet = arguments.get("sheet").and_then(|v| v.as_str()).unwrap_or("Sheet1");
+            let separator = arguments.get("separator").and_then(|v| v.as_str())
+                .and_then(|s| s.chars().next()).unwrap_or(',');
+
+            let values_resource = tools::find_resource(&sheets_doc.resources, "spreadsheets.values")
+                .ok_or_else(|| GwsError::Validation("spreadsheets.values resource not found".into()))?;
+
+            if action == "export" {
+                let get_method = values_resource.methods.get("get")
+                    .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
+                let full_range = crate::sheets_helpers::build_range(sheet, None);
+                let args = json!({"params": {"spreadsheetId": spreadsheet_id, "range": full_range, "valueRenderOption": "FORMATTED_VALUE"}});
+                let result = crate::execute::execute_tool(
+                    &sheets_doc, get_method, "spreadsheets.values", "get",
+                    &args, "sheets", policy, meta, None, None, false,
+                    &mut state.token_cache,
+                ).await?;
+                let values: Vec<Vec<String>> = result.get("values")
+                    .and_then(|v| v.as_array())
+                    .map(|rows| rows.iter().map(|row| {
+                        row.as_array().map(|cells| cells.iter().map(|c| c.as_str().unwrap_or("").to_string()).collect()).unwrap_or_default()
+                    }).collect())
+                    .unwrap_or_default();
+                let csv = crate::sheets_helpers::values_to_csv(&values, separator);
+                Ok(json!({
+                    "content": [{"type": "text", "text": csv}],
+                    "isError": false
+                }))
+            } else if action == "import" {
+                let csv_data = arguments.get("data").and_then(|v| v.as_str())
+                    .ok_or_else(|| GwsError::Validation("Missing 'data' (CSV string) for import".into()))?;
+                let values = crate::sheets_helpers::csv_to_values(csv_data, separator);
+                let update_method = values_resource.methods.get("update")
+                    .ok_or_else(|| GwsError::Validation("update method not found".into()))?;
+                let full_range = crate::sheets_helpers::build_range(sheet, None);
+                let data_json: Vec<Value> = values.iter().map(|row| json!(row)).collect();
+                let args = json!({
+                    "params": {"spreadsheetId": spreadsheet_id, "range": full_range, "valueInputOption": "USER_ENTERED"},
+                    "body": {"range": full_range, "values": data_json}
+                });
+                let result = crate::execute::execute_tool(
+                    &sheets_doc, update_method, "spreadsheets.values", "update",
+                    &args, "sheets", policy, meta, None, None, false,
+                    &mut state.token_cache,
+                ).await?;
+                state.sheet_cache.invalidate(spreadsheet_id);
+                Ok(json!({
+                    "content": [{"type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default()}],
+                    "structuredContent": result,
+                    "isError": false
+                }))
+            } else {
+                Err(GwsError::Validation("action must be 'export' or 'import'".into()))
+            }
+        }
+
+        "gws_sheets_formulas" => {
+            let spreadsheet_id = spreadsheet_id_opt.unwrap();
+            let sheet = arguments.get("sheet").and_then(|v| v.as_str()).unwrap_or("Sheet1");
+            let range = arguments.get("range").and_then(|v| v.as_str()).unwrap_or(sheet);
+            let full_range = crate::sheets_helpers::build_range(range, Some(sheet));
+
+            let values_resource = tools::find_resource(&sheets_doc.resources, "spreadsheets.values")
+                .ok_or_else(|| GwsError::Validation("spreadsheets.values resource not found".into()))?;
+            let get_method = values_resource.methods.get("get")
+                .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
+
+            // Read formulas
+            let formula_args = json!({"params": {"spreadsheetId": spreadsheet_id, "range": full_range, "valueRenderOption": "FORMULA"}});
+            let formula_result = crate::execute::execute_tool(
+                &sheets_doc, get_method, "spreadsheets.values", "get",
+                &formula_args, "sheets", policy, meta, None, None, false,
+                &mut state.token_cache,
+            ).await?;
+
+            // Read headers
+            let header_range = crate::sheets_helpers::build_range("1:1", Some(sheet));
+            let header_args = json!({"params": {"spreadsheetId": spreadsheet_id, "range": header_range, "valueRenderOption": "FORMATTED_VALUE"}});
+            let header_result = crate::execute::execute_tool(
+                &sheets_doc, get_method, "spreadsheets.values", "get",
+                &header_args, "sheets", policy, meta, None, None, false,
+                &mut state.token_cache,
+            ).await?;
+            let headers: Vec<String> = header_result.pointer("/values/0")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+
+            let rows = formula_result.get("values").and_then(|v| v.as_array());
+            let mut columns_with_formulas: Vec<Value> = Vec::new();
+            let mut all_formulas: Vec<Value> = Vec::new();
+
+            if let Some(rows) = rows {
+                let col_count = rows.iter().map(|r| r.as_array().map(|a| a.len()).unwrap_or(0)).max().unwrap_or(0);
+                for col_idx in 0..col_count {
+                    let header = headers.get(col_idx).cloned().unwrap_or_else(|| {
+                        let mut s = String::new();
+                        let mut c = col_idx;
+                        loop { s.insert(0, (b'A' + (c % 26) as u8) as char); if c < 26 { break; } c = c / 26 - 1; }
+                        s
+                    });
+                    let mut formula_count = 0;
+                    let mut samples = Vec::new();
+                    for (row_idx, row) in rows.iter().enumerate() {
+                        if let Some(cell) = row.as_array().and_then(|a| a.get(col_idx)).and_then(|v| v.as_str()) {
+                            if cell.starts_with('=') {
+                                formula_count += 1;
+                                let cell_ref = format!("{}{}", {
+                                    let mut s = String::new();
+                                    let mut c = col_idx;
+                                    loop { s.insert(0, (b'A' + (c % 26) as u8) as char); if c < 26 { break; } c = c / 26 - 1; }
+                                    s
+                                }, row_idx + 1);
+                                all_formulas.push(json!({"cell": cell_ref, "formula": cell}));
+                                if samples.len() < 3 { samples.push(cell.to_string()); }
+                            }
+                        }
+                    }
+                    if formula_count > 0 {
+                        columns_with_formulas.push(json!({
+                            "column": header,
+                            "formula_count": formula_count,
+                            "samples": samples
+                        }));
+                    }
+                }
+            }
+
+            let output = json!({
+                "columns_with_formulas": columns_with_formulas,
+                "total_formulas": all_formulas.len(),
+                "all_formulas": all_formulas
+            });
+            Ok(json!({
+                "content": [{"type": "text", "text": serde_json::to_string_pretty(&output).unwrap_or_default()}],
+                "structuredContent": output,
+                "isError": false
+            }))
+        }
+
         "gws_sheets_trace" | "gws_sheets_explain" => {
             let spreadsheet_id = spreadsheet_id_opt.unwrap();
             let cell = arguments

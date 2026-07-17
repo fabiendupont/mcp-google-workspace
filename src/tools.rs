@@ -297,6 +297,24 @@ pub async fn build_tools_list(
         tools.push(tool_from_json(
             crate::sheets_helpers::sheets_explain_tool_schema(),
         ));
+        tools.push(tool_from_json(
+            crate::sheets_helpers::sheets_format_tool_schema(),
+        ));
+        tools.push(tool_from_json(
+            crate::sheets_helpers::sheets_validate_tool_schema(),
+        ));
+        tools.push(tool_from_json(
+            crate::sheets_helpers::sheets_named_range_tool_schema(),
+        ));
+        tools.push(tool_from_json(
+            crate::sheets_helpers::sheets_csv_tool_schema(),
+        ));
+        tools.push(tool_from_json(
+            crate::sheets_helpers::sheets_dimensions_tool_schema(),
+        ));
+        tools.push(tool_from_json(
+            crate::sheets_helpers::sheets_formulas_tool_schema(),
+        ));
     }
 
     // Slides & image tools
@@ -365,6 +383,12 @@ fn tool_full_schema(name: &str) -> Option<Value> {
         "gws_sheets_manage_tabs" => crate::sheets_helpers::sheets_manage_tabs_tool_schema(),
         "gws_sheets_trace" => crate::sheets_helpers::sheets_trace_tool_schema(),
         "gws_sheets_explain" => crate::sheets_helpers::sheets_explain_tool_schema(),
+        "gws_sheets_format" => crate::sheets_helpers::sheets_format_tool_schema(),
+        "gws_sheets_validate" => crate::sheets_helpers::sheets_validate_tool_schema(),
+        "gws_sheets_named_range" => crate::sheets_helpers::sheets_named_range_tool_schema(),
+        "gws_sheets_csv" => crate::sheets_helpers::sheets_csv_tool_schema(),
+        "gws_sheets_dimensions" => crate::sheets_helpers::sheets_dimensions_tool_schema(),
+        "gws_sheets_formulas" => crate::sheets_helpers::sheets_formulas_tool_schema(),
         _ => return None,
     };
     let mut info = json!({
