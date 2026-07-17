@@ -24,6 +24,9 @@ pub(crate) struct ServerState {
     pub prompts: Vec<crate::prompts::Prompt>,
     pub subscriptions: Arc<tokio::sync::Mutex<crate::subscriptions::SubscriptionMap>>,
     pub webhook_url: Option<String>,
+    pub sheet_cache: crate::cache::SheetCache,
+    pub activated_services: std::collections::HashSet<String>,
+    pub eager_tools: bool,
 }
 
 impl ServerState {
@@ -37,6 +40,9 @@ impl ServerState {
             prompts: Vec::new(),
             subscriptions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             webhook_url: None,
+            sheet_cache: crate::cache::SheetCache::new(20, 300),
+            activated_services: std::collections::HashSet::new(),
+            eager_tools: false,
         }
     }
 
@@ -102,6 +108,13 @@ async fn handle_tool_call_inner_concurrent(
 
     if tool_name == "gws_discover" {
         let mut st = state.lock().await;
+        // Activate service for lazy tool discovery
+        if let Some(svc) = arguments.get("service").and_then(|v| v.as_str()) {
+            if !st.eager_tools && st.activated_services.insert(svc.to_string()) {
+                st.tools = None; // Force rebuild on next list_tools
+                tracing::info!(service = svc, "Lazy discovery: service activated");
+            }
+        }
         let result = tools::handle_discover(arguments, policy, &mut st.docs).await?;
         return Ok(result);
     }
@@ -2718,6 +2731,23 @@ async fn execute_sheets_helper(
                 .unwrap_or("Sheet1");
             let sheet = arguments.get("sheet").and_then(|v| v.as_str());
             let format = arguments.get("format").and_then(|v| v.as_str());
+            let full_range = crate::sheets_helpers::build_range(range, sheet);
+            let render_option = match format {
+                Some("values") => "UNFORMATTED_VALUE",
+                Some("formula") => "FORMULA",
+                _ => "FORMATTED_VALUE",
+            };
+
+            if let Some(cached) = state.sheet_cache.get(spreadsheet_id, &full_range, render_option) {
+                tracing::debug!(spreadsheet_id, range = %full_range, "sheets cache hit");
+                let result = cached.clone();
+                return Ok(json!({
+                    "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
+                    "structuredContent": result,
+                    "isError": false
+                }));
+            }
+
             let values_resource = tools::find_resource(&sheets_doc.resources, "spreadsheets.values")
                 .ok_or_else(|| {
                     GwsError::Validation("spreadsheets.values resource not found".into())
@@ -2744,6 +2774,9 @@ async fn execute_sheets_helper(
                 &mut state.token_cache,
             )
             .await?;
+
+            state.sheet_cache.put(spreadsheet_id, &full_range, render_option, result.clone());
+
             Ok(json!({
                 "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
                 "structuredContent": result,
@@ -2790,6 +2823,7 @@ async fn execute_sheets_helper(
                 &mut state.token_cache,
             )
             .await?;
+            state.sheet_cache.invalidate(spreadsheet_id);
             Ok(json!({
                 "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
                 "structuredContent": result,
@@ -2833,6 +2867,7 @@ async fn execute_sheets_helper(
                 &mut state.token_cache,
             )
             .await?;
+            state.sheet_cache.invalidate(spreadsheet_id);
             Ok(json!({
                 "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
                 "structuredContent": result,
@@ -2908,6 +2943,7 @@ async fn execute_sheets_helper(
                 &mut state.token_cache,
             )
             .await?;
+            state.sheet_cache.invalidate(spreadsheet_id);
             Ok(json!({
                 "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
                 "structuredContent": result,
@@ -2955,6 +2991,155 @@ async fn execute_sheets_helper(
                 "structuredContent": result,
                 "isError": false
             }))
+        }
+
+        "gws_sheets_trace" | "gws_sheets_explain" => {
+            let spreadsheet_id = spreadsheet_id_opt.unwrap();
+            let cell = arguments
+                .get("cell")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| GwsError::Validation("Missing 'cell' (e.g. 'B5')".into()))?;
+            let sheet = arguments
+                .get("sheet")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Sheet1");
+            let values_resource = tools::find_resource(&sheets_doc.resources, "spreadsheets.values")
+                .ok_or_else(|| {
+                    GwsError::Validation("spreadsheets.values resource not found".into())
+                })?;
+            let get_method = values_resource
+                .methods
+                .get("get")
+                .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
+
+            // Read the cell's formula
+            let cell_range = crate::sheets_helpers::build_range(cell, Some(sheet));
+            let cell_args = json!({
+                "params": {
+                    "spreadsheetId": spreadsheet_id,
+                    "range": cell_range,
+                    "valueRenderOption": "FORMULA"
+                }
+            });
+            let cell_result = crate::execute::execute_tool(
+                &sheets_doc, get_method, "spreadsheets.values", "get",
+                &cell_args, "sheets", policy, meta, None, None, false,
+                &mut state.token_cache,
+            ).await?;
+
+            let formula = cell_result
+                .pointer("/values/0/0")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let is_formula = formula.starts_with('=');
+
+            if tool_name == "gws_sheets_explain" {
+                // Read headers (row 1) and row labels (column A)
+                let header_args = json!({
+                    "params": {
+                        "spreadsheetId": spreadsheet_id,
+                        "range": crate::sheets_helpers::build_range("1:1", Some(sheet)),
+                        "valueRenderOption": "FORMATTED_VALUE"
+                    }
+                });
+                let header_result = crate::execute::execute_tool(
+                    &sheets_doc, get_method, "spreadsheets.values", "get",
+                    &header_args, "sheets", policy, meta, None, None, false,
+                    &mut state.token_cache,
+                ).await?;
+                let headers: Vec<String> = header_result
+                    .pointer("/values/0")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .unwrap_or_default();
+
+                let label_args = json!({
+                    "params": {
+                        "spreadsheetId": spreadsheet_id,
+                        "range": crate::sheets_helpers::build_range("A2:A100", Some(sheet)),
+                        "valueRenderOption": "FORMATTED_VALUE"
+                    }
+                });
+                let label_result = crate::execute::execute_tool(
+                    &sheets_doc, get_method, "spreadsheets.values", "get",
+                    &label_args, "sheets", policy, meta, None, None, false,
+                    &mut state.token_cache,
+                ).await?;
+                let row_labels: Vec<String> = label_result
+                    .get("values")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|row| row.get(0).and_then(|v| v.as_str()).map(String::from)).collect())
+                    .unwrap_or_default();
+
+                let explanation = if is_formula {
+                    crate::sheets_helpers::explain_formula(formula, &headers, &row_labels)
+                } else {
+                    format!("Cell {cell} contains the value: {formula}")
+                };
+
+                let refs = crate::sheets_helpers::extract_cell_references(formula);
+                let referenced: Vec<Value> = refs.iter().map(|r| {
+                    let name = crate::sheets_helpers::resolve_cell_name(r, &headers, &row_labels);
+                    json!({
+                        "ref": r,
+                        "column": name.as_ref().map(|(c, _)| c.as_str()).unwrap_or(""),
+                        "row_label": name.as_ref().map(|(_, r)| r.as_str()).unwrap_or(""),
+                    })
+                }).collect();
+
+                let output = json!({
+                    "cell": cell,
+                    "formula": formula,
+                    "explanation": explanation,
+                    "referenced_cells": referenced,
+                });
+                Ok(json!({
+                    "content": [{ "type": "text", "text": serde_json::to_string_pretty(&output).unwrap_or_default() }],
+                    "structuredContent": output,
+                    "isError": false
+                }))
+            } else {
+                // gws_sheets_trace — single-level dependency extraction
+                fn build_trace_tree(
+                    cell: &str,
+                    formula: &str,
+                    is_formula: bool,
+                ) -> Value {
+                    if !is_formula {
+                        return json!({
+                            "cell": cell,
+                            "value": formula,
+                            "type": if formula.is_empty() { "empty" } else { "value" },
+                        });
+                    }
+                    let refs = crate::sheets_helpers::extract_cell_references(formula);
+                    json!({
+                        "cell": cell,
+                        "formula": formula,
+                        "type": "formula",
+                        "references": refs,
+                    })
+                }
+
+                let tree = build_trace_tree(cell, formula, is_formula);
+
+                let output = json!({
+                    "cell": cell,
+                    "formula": if is_formula { formula } else { "" },
+                    "type": if is_formula { "formula" } else if formula.is_empty() { "empty" } else { "value" },
+                    "references": if is_formula { crate::sheets_helpers::extract_cell_references(formula) } else { vec![] },
+                    "note": if is_formula {
+                        format!("Formula references {} cells. Use gws_sheets_explain for a human-readable explanation.", crate::sheets_helpers::extract_cell_references(formula).len())
+                    } else {
+                        format!("Cell contains a plain value: {formula}")
+                    },
+                });
+                Ok(json!({
+                    "content": [{ "type": "text", "text": serde_json::to_string_pretty(&output).unwrap_or_default() }],
+                    "structuredContent": output,
+                    "isError": false
+                }))
+            }
         }
 
         _ => Err(GwsError::Validation(format!(

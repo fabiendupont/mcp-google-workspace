@@ -71,6 +71,8 @@ pub(crate) async fn get_or_fetch_doc(
 pub async fn build_tools_list(
     policy: &Policy,
     docs: &mut HashMap<String, Arc<RestDescription>>,
+    activated: Option<&std::collections::HashSet<String>>,
+    eager: bool,
 ) -> Result<Vec<Tool>, GwsError> {
     let mut tools = Vec::new();
 
@@ -289,6 +291,12 @@ pub async fn build_tools_list(
         tools.push(tool_from_json(
             crate::sheets_helpers::sheets_manage_tabs_tool_schema(),
         ));
+        tools.push(tool_from_json(
+            crate::sheets_helpers::sheets_trace_tool_schema(),
+        ));
+        tools.push(tool_from_json(
+            crate::sheets_helpers::sheets_explain_tool_schema(),
+        ));
     }
 
     // Slides & image tools
@@ -298,7 +306,35 @@ pub async fn build_tools_list(
     ));
     tools.push(tool_from_json(crate::image_gen::image_gen_tool_schema()));
 
-    Ok(tools)
+    if eager {
+        return Ok(tools);
+    }
+
+    // Lazy mode: filter to meta tools + helpers for activated services
+    let meta_tools = ["gws_discover", "gws_batch"];
+    let service_for_tool = |name: &str| -> Option<&str> {
+        if name.starts_with("gws_drive_") { Some("drive") }
+        else if name.starts_with("gws_docs_") { Some("docs") }
+        else if name.starts_with("gws_sheets_") { Some("sheets") }
+        else if name.starts_with("gws_slides_") || name == "gws_templates" || name == "gws_generate_image" { Some("slides") }
+        else { None }
+    };
+
+    let filtered: Vec<Tool> = tools
+        .into_iter()
+        .filter(|t| {
+            let name: &str = &t.name;
+            if meta_tools.contains(&name) {
+                return true;
+            }
+            match service_for_tool(name) {
+                Some(svc) => activated.map(|a| a.contains(svc)).unwrap_or(false),
+                None => true,
+            }
+        })
+        .collect();
+
+    Ok(filtered)
 }
 
 fn tool_full_schema(name: &str) -> Option<Value> {
@@ -327,6 +363,8 @@ fn tool_full_schema(name: &str) -> Option<Value> {
         "gws_sheets_info" => crate::sheets_helpers::sheets_info_tool_schema(),
         "gws_sheets_clear" => crate::sheets_helpers::sheets_clear_tool_schema(),
         "gws_sheets_manage_tabs" => crate::sheets_helpers::sheets_manage_tabs_tool_schema(),
+        "gws_sheets_trace" => crate::sheets_helpers::sheets_trace_tool_schema(),
+        "gws_sheets_explain" => crate::sheets_helpers::sheets_explain_tool_schema(),
         _ => return None,
     };
     let mut info = json!({

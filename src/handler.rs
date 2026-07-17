@@ -23,10 +23,12 @@ impl GwsHandler {
         policy: Policy,
         prompts: Vec<crate::prompts::Prompt>,
         audit: Option<Arc<crate::audit::AuditLogger>>,
+        eager_tools: bool,
     ) -> Self {
         let mut state = ServerState::new();
         state.prompts = prompts;
         state.audit = audit;
+        state.eager_tools = eager_tools;
         Self {
             state: Arc::new(Mutex::new(state)),
             policy: Arc::new(RwLock::new(policy)),
@@ -71,11 +73,18 @@ impl ServerHandler for GwsHandler {
             let policy = self.policy.read().await;
             let mut st = self.state.lock().await;
             if st.tools.is_none() {
-                let tools = crate::tools::build_tools_list(&policy, &mut st.docs)
-                    .await
-                    .map_err(|e| {
-                        McpError::internal_error(format!("Failed to build tools: {e}"), None)
-                    })?;
+                let activated = st.activated_services.clone();
+                let eager = st.eager_tools;
+                let tools = crate::tools::build_tools_list(
+                    &policy,
+                    &mut st.docs,
+                    Some(&activated),
+                    eager,
+                )
+                .await
+                .map_err(|e| {
+                    McpError::internal_error(format!("Failed to build tools: {e}"), None)
+                })?;
                 st.tools = Some(tools);
             }
             let tools = st.tools.as_ref().unwrap().clone();
@@ -121,8 +130,19 @@ impl ServerHandler for GwsHandler {
 
             let is_err = result.is_err();
             crate::metrics::record_request("tools/call", is_err, start.elapsed().as_secs_f64());
-            let task_count = self.state.lock().await.tasks.len();
-            crate::metrics::set_active_tasks(task_count as i64);
+            let tools_invalidated = {
+                let st = self.state.lock().await;
+                crate::metrics::set_active_tasks(st.tasks.len() as i64);
+                st.tools.is_none() && !st.eager_tools
+            };
+            if tools_invalidated {
+                let _ = peer
+                    .send_notification(rmcp::model::ServerNotification::ToolListChangedNotification(
+                        rmcp::model::NotificationNoParam::default(),
+                    ))
+                    .await;
+                tracing::info!("Sent tools/list_changed notification");
+            }
 
             match result {
                 Ok(ref value) => {

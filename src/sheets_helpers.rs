@@ -273,6 +273,252 @@ pub fn normalize_data(data: &Value) -> Value {
     }
 }
 
+pub fn extract_cell_references(formula: &str) -> Vec<String> {
+    let mut refs = Vec::new();
+    let chars: Vec<char> = formula.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        // Skip quoted strings
+        if chars[i] == '"' {
+            i += 1;
+            while i < len && chars[i] != '"' {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+
+        // Look for cell references: optional sheet prefix + column letters + row digits
+        // Patterns: A1, AB12, Sheet1!A1, 'Sheet Name'!A1, A1:B5
+        if chars[i].is_ascii_uppercase() {
+            let start = i;
+            // Collect column letters
+            while i < len && chars[i].is_ascii_uppercase() {
+                i += 1;
+            }
+            // Must be followed by digits
+            if i < len && chars[i].is_ascii_digit() {
+                while i < len && chars[i].is_ascii_digit() {
+                    i += 1;
+                }
+                let cell_ref: String = chars[start..i].iter().collect();
+                // Check for range notation (A1:B5)
+                if i < len && chars[i] == ':' {
+                    let colon = i;
+                    i += 1;
+                    let range_start = i;
+                    while i < len && chars[i].is_ascii_uppercase() {
+                        i += 1;
+                    }
+                    if i < len && chars[i].is_ascii_digit() {
+                        while i < len && chars[i].is_ascii_digit() {
+                            i += 1;
+                        }
+                        let range_ref: String = chars[start..i].iter().collect();
+                        refs.push(range_ref);
+                    } else {
+                        refs.push(cell_ref);
+                        i = colon + 1;
+                    }
+                } else {
+                    // Skip function names (all-alpha followed by open paren)
+                    if !cell_ref.chars().all(|c| c.is_ascii_alphabetic()) || (i < len && chars[i] != '(') {
+                        refs.push(cell_ref);
+                    }
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    refs
+}
+
+static FUNCTION_TRANSLATIONS: &[(&str, &str)] = &[
+    ("SUM", "sum of"),
+    ("AVERAGE", "average of"),
+    ("COUNT", "count of"),
+    ("COUNTA", "count of non-empty values in"),
+    ("MAX", "maximum of"),
+    ("MIN", "minimum of"),
+    ("IF", "if"),
+    ("VLOOKUP", "look up"),
+    ("HLOOKUP", "look up horizontally"),
+    ("INDEX", "value at index in"),
+    ("MATCH", "position of"),
+    ("CONCATENATE", "join"),
+    ("LEN", "length of"),
+    ("LEFT", "left characters of"),
+    ("RIGHT", "right characters of"),
+    ("MID", "middle characters of"),
+    ("TRIM", "trimmed"),
+    ("UPPER", "uppercase of"),
+    ("LOWER", "lowercase of"),
+    ("ROUND", "rounded"),
+    ("ROUNDUP", "rounded up"),
+    ("ROUNDDOWN", "rounded down"),
+    ("ABS", "absolute value of"),
+    ("SUMIF", "sum where"),
+    ("COUNTIF", "count where"),
+    ("AVERAGEIF", "average where"),
+    ("IFERROR", "if error then"),
+    ("ISBLANK", "is blank"),
+    ("TODAY", "today's date"),
+    ("NOW", "current date and time"),
+    ("YEAR", "year of"),
+    ("MONTH", "month of"),
+    ("DAY", "day of"),
+    ("DATEDIF", "difference between dates"),
+    ("TEXT", "formatted text of"),
+    ("VALUE", "numeric value of"),
+    ("SUBSTITUTE", "substitute in"),
+    ("UNIQUE", "unique values of"),
+    ("SORT", "sorted"),
+    ("FILTER", "filtered"),
+    ("ARRAYFORMULA", "array formula"),
+];
+
+pub fn explain_formula(formula: &str, headers: &[String], row_labels: &[String]) -> String {
+    let mut explanation = formula.to_string();
+
+    // Replace cell references with human-readable names
+    let refs = extract_cell_references(formula);
+    for cell_ref in &refs {
+        if let Some((col_name, row_name)) = resolve_cell_name(cell_ref, headers, row_labels) {
+            let readable = if row_name.is_empty() {
+                format!("\"{col_name}\"")
+            } else {
+                format!("\"{col_name}\" for \"{row_name}\"")
+            };
+            explanation = explanation.replace(cell_ref, &readable);
+        }
+    }
+
+    // Replace function names with English
+    for (func, english) in FUNCTION_TRANSLATIONS {
+        let pattern = format!("{func}(");
+        if explanation.contains(&pattern) {
+            explanation = explanation.replace(&pattern, &format!("{english}("));
+        }
+    }
+
+    // Clean up operators
+    explanation = explanation.replace(">=", " is at least ");
+    explanation = explanation.replace("<=", " is at most ");
+    explanation = explanation.replace("<>", " is not equal to ");
+    explanation = explanation.replace('>', " is greater than ");
+    explanation = explanation.replace('<', " is less than ");
+
+    explanation
+}
+
+pub fn resolve_cell_name(cell_ref: &str, headers: &[String], row_labels: &[String]) -> Option<(String, String)> {
+    // Parse column letters and row number from e.g. "B5"
+    let col_end = cell_ref.chars().take_while(|c| c.is_ascii_uppercase()).count();
+    if col_end == 0 || col_end >= cell_ref.len() {
+        return None;
+    }
+    let col_letters = &cell_ref[..col_end];
+    let row_num: usize = cell_ref[col_end..].parse().ok()?;
+
+    // Convert column letters to 0-based index: A=0, B=1, ..., Z=25, AA=26
+    let col_idx = col_letters
+        .bytes()
+        .fold(0usize, |acc, b| acc * 26 + (b - b'A') as usize + 1)
+        .checked_sub(1)?;
+
+    let col_name = headers.get(col_idx).cloned().unwrap_or_else(|| col_letters.to_string());
+
+    let row_name = if row_num >= 2 {
+        row_labels
+            .get(row_num - 2) // row_labels is 0-indexed from row 2
+            .cloned()
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    Some((col_name, row_name))
+}
+
+pub fn sheets_trace_tool_schema() -> Value {
+    json!({
+        "name": "gws_sheets_trace",
+        "title": "Trace Cell Dependencies",
+        "description": "Trace what feeds into a spreadsheet cell. Shows the dependency tree of formulas.",
+        "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true },
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "spreadsheet_id": {
+                    "type": "string",
+                    "description": "Spreadsheet ID"
+                },
+                "cell": {
+                    "type": "string",
+                    "description": "Cell reference (e.g. 'B5')"
+                },
+                "sheet": {
+                    "type": "string",
+                    "description": "Tab name (defaults to first sheet)"
+                },
+                "depth": {
+                    "type": "integer",
+                    "description": "Max recursion depth (default 5)"
+                }
+            },
+            "required": ["spreadsheet_id", "cell"]
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "cell": { "type": "string" },
+                "formula": { "type": "string" },
+                "type": { "type": "string" },
+                "deps": { "type": "array" }
+            }
+        }
+    })
+}
+
+pub fn sheets_explain_tool_schema() -> Value {
+    json!({
+        "name": "gws_sheets_explain",
+        "title": "Explain Cell Formula",
+        "description": "Explain a spreadsheet formula in plain English using column headers and row labels.",
+        "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true },
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "spreadsheet_id": {
+                    "type": "string",
+                    "description": "Spreadsheet ID"
+                },
+                "cell": {
+                    "type": "string",
+                    "description": "Cell reference (e.g. 'B5')"
+                },
+                "sheet": {
+                    "type": "string",
+                    "description": "Tab name (defaults to first sheet)"
+                }
+            },
+            "required": ["spreadsheet_id", "cell"]
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "cell": { "type": "string" },
+                "formula": { "type": "string" },
+                "explanation": { "type": "string" },
+                "referenced_cells": { "type": "array" }
+            }
+        }
+    })
+}
+
 pub fn build_range(range: &str, sheet: Option<&str>) -> String {
     if range.contains('!') {
         return range.to_string();
@@ -577,5 +823,70 @@ mod tests {
     fn normalize_empty_array() {
         let data = json!([]);
         assert_eq!(normalize_data(&data), data);
+    }
+
+    #[test]
+    fn extract_simple_refs() {
+        let refs = extract_cell_references("=A1+B2");
+        assert_eq!(refs, vec!["A1", "B2"]);
+    }
+
+    #[test]
+    fn extract_range_ref() {
+        let refs = extract_cell_references("=SUM(A1:A10)");
+        assert_eq!(refs, vec!["A1:A10"]);
+    }
+
+    #[test]
+    fn extract_mixed_refs() {
+        let refs = extract_cell_references("=IF(A1>0,B2,C3)");
+        assert_eq!(refs, vec!["A1", "B2", "C3"]);
+    }
+
+    #[test]
+    fn extract_no_function_names() {
+        let refs = extract_cell_references("=SUM(A1)");
+        assert!(refs.contains(&"A1".to_string()));
+        assert!(!refs.contains(&"SUM".to_string()));
+    }
+
+    #[test]
+    fn extract_skips_quoted_strings() {
+        let refs = extract_cell_references("=IF(A1=\"B2\",C3,D4)");
+        assert!(!refs.contains(&"B2".to_string()));
+        assert!(refs.contains(&"A1".to_string()));
+        assert!(refs.contains(&"C3".to_string()));
+    }
+
+    #[test]
+    fn explain_replaces_refs() {
+        let headers = vec!["Name".into(), "Score".into(), "Status".into()];
+        let row_labels = vec!["Alice".into(), "Bob".into()];
+        let result = explain_formula("=B2+B3", &headers, &row_labels);
+        assert!(result.contains("Score"));
+        assert!(result.contains("Alice"));
+    }
+
+    #[test]
+    fn explain_translates_functions() {
+        let result = explain_formula("=SUM(A1:A10)", &[], &[]);
+        assert!(result.contains("sum of"));
+    }
+
+    #[test]
+    fn resolve_cell_name_basic() {
+        let headers = vec!["Name".into(), "Score".into()];
+        let row_labels = vec!["Alice".into()];
+        let (col, row) = resolve_cell_name("B2", &headers, &row_labels).unwrap();
+        assert_eq!(col, "Score");
+        assert_eq!(row, "Alice");
+    }
+
+    #[test]
+    fn resolve_cell_name_header_row() {
+        let headers = vec!["Name".into()];
+        let (col, row) = resolve_cell_name("A1", &headers, &[]).unwrap();
+        assert_eq!(col, "Name");
+        assert_eq!(row, "");
     }
 }
