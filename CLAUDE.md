@@ -7,124 +7,117 @@ Written in Rust, uses direct Google REST API calls (not a CLI wrapper).
 
 ```
 main.rs           — CLI arg parsing, templates, interactive wizard, policy checker
-handler.rs        — rmcp ServerHandler impl: tools, prompts, resources, completions, tasks, elicitation, subscriptions
-server.rs         — Tool dispatch business logic, Docs/Slides/Batch helpers, request explanation
-tools.rs          — Builds MCP tool list from Discovery Documents, compact schema mode
+handler.rs        — rmcp ServerHandler impl: tools, prompts, resources, completions, tasks, elicitation, subscriptions, lazy tool discovery
+server.rs         — Tool dispatch business logic, Docs/Sheets/Slides/Drive helpers, request explanation
+tools.rs          — Builds MCP tool list, lazy filtering by activated services, compact schema mode
 execute.rs        — HTTP execution: URL rendering, params, pagination, resumable uploads, smart field defaults, rate limiting
 format.rs         — Format transformers: Markdown/Plain → Docs batchUpdate, doc → Markdown reverse converter
-helpers.rs        — Google Docs enrichment: write/read/table tools, insert text/image, find text, structure outline
-sheets_helpers.rs — Google Sheets enrichment: read/write/append ranges, info, clear, tab management
+helpers.rs        — Google Docs enrichment (9 tools): write/read/replace, outline, find, table, image, format
+sheets_helpers.rs — Google Sheets enrichment (14 tools): read/write/append/clear, info, tabs, formatting, validation, named ranges, CSV, dimensions, formula analysis
+drive_helpers.rs  — Google Drive enrichment (9 tools): list, find, create folder, copy, rename, move, share, trash, info
+slides_helpers.rs — Google Slides enrichment: Marp import, templates
+cache.rs          — LRU + TTL in-memory cache for Sheets values.get responses
+rate_limit.rs     — Per-service sliding-window rate limiter for Google API quotas
 resources.rs      — MCP resources: gws:// URI scheme, resource templates from Discovery Documents
 completions.rs    — MCP completions: autocomplete for resource URIs and prompt arguments
 elicitation.rs    — MCP elicitation: structured user input (folder selection, overwrite confirmation)
 subscriptions.rs  — MCP subscriptions: Google Drive watch channels, webhook notifications
 prompts.rs        — MCP prompts: load external Markdown files, argument substitution
-policy.rs         — JSON policy engine: constraints, method denylists, read-only mode, compact schemas, per-service rate limits
-rate_limit.rs     — Per-service sliding-window rate limiter for Google API quotas
+policy.rs         — JSON policy engine: constraints, method denylists, read-only mode, body-write-only, recursive parent ancestry
 auth.rs           — OAuth2 chain: env var → credentials file → service account → ADC/gcloud
-audit.rs          — Structured JSONL audit log writer
+audit.rs          — Structured JSONL audit log writer with tool name tracking
 http.rs           — Hybrid Axum server: rmcp StreamableHttpService + health/metrics/webhooks
 tasks.rs          — Task lifecycle for resumable uploads and chunked downloads
-metrics.rs        — Prometheus counters, histograms, gauges
+metrics.rs        — Prometheus counters, histograms, gauges (including rate limit waits)
 meta.rs           — Request metadata (W3C Trace Context) for Google API header propagation
+image_gen.rs      — Gemini image generation and Drive upload
+marp.rs           — Marp Markdown to Google Slides conversion
 ```
+
+## Tools (37 in eager mode, 2 in lazy mode)
+
+| Service | Tools | Notes |
+|---------|-------|-------|
+| Meta | `gws_discover`, `gws_batch` | Always available. gws_discover activates services in lazy mode. |
+| Drive | 9 tools (`gws_drive_*`) | list, find_folder, info, create_folder, copy, rename, move, share, trash |
+| Docs | 9 tools (`gws_docs_*`) | write (creates or updates), read, replace_section, outline, find, insert_table, insert_image, read_table, format |
+| Sheets | 14 tools (`gws_sheets_*`) | read, write (creates or updates), append, clear, info, manage_tabs, trace, explain, formulas, format, validate, named_range, csv, dimensions |
+| Slides | 3 tools | slides_import_marp, templates, generate_image |
 
 ## Key Design Decisions
 
-- **Discovery-driven**: Fetches Google Discovery Documents at runtime to learn each
-  API's resources/methods/parameters. No hardcoded API list — new endpoints appear
-  automatically.
-- **Policy-as-code**: A JSON file scopes what an agent can access per-project.
-  Generic parameter constraints, method denylists, and read-only mode.
-  See `policy.example.json`.
-- **One tool per service**: Each Google service (drive, gmail, calendar) is exposed
-  as a single MCP tool. The agent specifies `resource` and `method` as arguments.
-  `gws_discover` is a meta-tool for schema introspection.
-- **Consolidated docs tools**: `gws_docs_write` and `gws_docs_read` handle most
-  document operations. `gws_docs_write` accepts Markdown or plain text and converts
-  to native Google Docs formatting (headings, bullets, tables, bold, italic).
-  `gws_docs_read` returns compact structure, Markdown, or plain text.
-  `gws_docs_insert_table` creates and populates tables from JSON arrays.
-  Legacy individual tools remain available in normal mode.
-- **Small model optimizations**: Compact schema mode (`--compact-schemas`) reduces
-  tool count from 19 to 10. Smart field defaults auto-select response fields for
-  19 common API calls. Google metadata stripping removes 30+ noisy fields. Tool
-  descriptions follow MCP spec research (PURPOSE, WHEN TO USE, HOW TO USE, LIMITATIONS).
-- **Format transformers**: Pluggable content format conversion via `format.rs`.
-  Markdown and Plain text supported. Extensible for RST, AsciiDoc.
-- **MCP prompts**: External Markdown files with YAML frontmatter in `prompts/` directory,
-  loaded at startup. Teaches models workflow recipes.
-- **rmcp-based transport**: Uses the `rmcp` crate (official Rust MCP SDK) for
-  protocol handling, stdio transport, and Streamable HTTP server with session management.
-- **Full MCP capabilities**: tools, prompts, resources (with subscribe), completions,
-  tasks (via OperationProcessor), elicitation, progress notifications.
-- **Direct API calls**: Uses `reqwest` + `yup-oauth2` to call googleapis.com
-  directly. The `google-workspace` crate (path dependency) provides Discovery
-  Document types, service registry, HTTP client with retry, and validation.
-
-## Dependencies
-
-- `rmcp` crate: Official Rust MCP SDK — ServerHandler trait, stdio/HTTP transports,
-  elicitation, task management.
-- `google-workspace` crate: git dependency from `github.com/googleworkspace/cli` (pinned to rev `a3768d0`).
-- `pulldown-cmark` crate: Markdown parsing for the Docs enrichment converter.
-- `dialoguer` crate: interactive terminal prompts for the policy wizard.
-- OAuth2 credentials: Requires one of the 7 sources in the credential chain.
+- **Discovery-driven**: Fetches Google Discovery Documents at runtime.
+  New API endpoints appear automatically.
+- **Policy-as-code**: JSON file scopes per-project access.
+  Constraints, method denylists, read-only mode, body-write-only parent restrictions
+  with recursive ancestry checking.
+- **Lazy tool discovery**: Default: only `gws_discover` + `gws_batch` visible.
+  When model calls `gws_discover(service="sheets")`, sheets helpers are activated
+  and `ToolListChangedNotification` is sent. `--eager-tools` flag loads all at startup.
+- **No generic service tools**: Services with helpers (drive, docs, sheets, slides)
+  suppress their generic tool. Models use helpers only — no ambiguity.
+- **Create-on-write**: `gws_docs_write` and `gws_sheets_write` create new files
+  when `title` is provided instead of `document_id`/`spreadsheet_id`. Same pattern
+  for both services.
+- **Sheet name resolution**: Advanced sheets tools accept `sheet` (tab name) as
+  alternative to `sheet_id`. Server resolves name to numeric ID automatically.
+- **Sheet caching**: LRU + TTL in-memory cache for Sheets reads (20 entries, 5 min TTL).
+  Transparent — checked before API call, invalidated after writes.
+- **Formula analysis**: Local parsing — regex cell reference extraction, function-to-English
+  translation, dependency tracing. Only API calls are spreadsheets.values.get.
+- **Small model optimizations**: Short descriptions, smart defaults (range defaults to Sheet1),
+  auto-detection (folder ID vs spreadsheet ID), prescriptive error messages with examples,
+  data normalization (array-of-objects → array-of-arrays).
+- **MCP prompts**: Workflow recipes in `prompts/` with JSON tool call examples.
+  Fetched via MCP `prompts/get` — user-controlled, not auto-injected.
+  Context-expensive (~1K tokens each) — hurt 8K-context models.
+- **Tool response logging**: Every tool call logs ok/error/failed with duration.
+  Sheets create-on-write logs data write results.
 
 ## Build and Test
 
 ```bash
-cargo check          # Type-check
-cargo test           # 292 unit tests across all modules
-cargo build --release
+cargo check                      # Type-check
+cargo test                       # 361 unit tests
+cargo build --release            # Release binary
+
+# E2E tests (requires Google auth + navra + Ollama)
+export GWS_TEST_FOLDER_ID=... GWS_PROJECT_ID=... MCPD_TOKEN=...
+bash tests/e2e/run.sh            # Full matrix: 5 scenarios × 5 models with Opus judge
+bash tests/e2e/run.sh --model gemma4:e4b --scenario full-e2e  # Single run
 ```
 
 ## Running
 
 ```bash
-# With policy file (recommended)
-./target/release/mcp-google-workspace --policy gws-policy.json
-
-# With compact schemas for small models (10 tools instead of 19)
-./target/release/mcp-google-workspace --policy gws-policy.json --compact-schemas
-
-# HTTP transport with webhooks for subscriptions
-./target/release/mcp-google-workspace --policy gws-policy.json --http 127.0.0.1:3000 --external-url https://mcp.example.com
-
-# With MCP prompts directory
+# Lazy discovery (default) — 2 tools initially, more on demand
 ./target/release/mcp-google-workspace --policy gws-policy.json --prompts-dir ./prompts
 
-# With service list (no constraints)
-./target/release/mcp-google-workspace --services drive,gmail,calendar
+# Eager mode — all 37 tools at startup
+./target/release/mcp-google-workspace --policy gws-policy.json --eager-tools
 
-# Check credential chain
-./target/release/mcp-google-workspace --check-auth
+# HTTP transport
+./target/release/mcp-google-workspace --policy gws-policy.json --http 127.0.0.1:3100 --eager-tools
 ```
 
-## Claude Code integration
+## E2E Test Harness
 
-Add to `.mcp.json` in your project:
-```json
-{
-  "mcpServers": {
-    "google-workspace": {
-      "command": "/path/to/mcp-google-workspace",
-      "args": [
-        "--policy", "/path/to/gws-policy.json",
-        "--prompts-dir", "/path/to/prompts"
-      ]
-    }
-  }
-}
-```
+All test config in `tests/e2e/`:
+- `policy.template.json` — policy with env var placeholders
+- `navra.toml` — navra config for local + Vertex AI models
+- `run.sh` — builds, starts servers, runs models, judges with Claude Opus
+- `scenarios/` — YAML rubrics with quality criteria
+- `judge.md` — Opus judge prompt template (envsubst variables)
 
-## navra integration (local models via Ollama)
+The judge uses the same GWS MCP tools to verify what was actually created in Drive.
 
-See `navra-gws-test.toml` for a complete navra config. Key points:
-- Transport: stdio (navra spawns the MCP server)
-- Tool classification: all GWS tools classified as `network` domain
-- Use `--compact-schemas` for small models (reduces tool count)
-- Tested with: Claude (full), Qwen3.6 35B (full), Gemma4 26B (full with retries)
+## navra integration
+
+See `tests/e2e/navra.toml`. Key points:
+- HTTP transport pointing at `127.0.0.1:3100/mcp`
+- Tool classifications for all 37 tools (network domain, read/write)
+- Models: gemma4:e4b, gemma4:26b, qwen3:8b, qwen3.6:35b, claude-sonnet-4-5, claude-opus-4-6
+- MCP prompts injectable via `--upstream-prompt google-workspace:work-with-spreadsheet`
 
 ## Code Conventions
 
@@ -132,4 +125,5 @@ See `navra-gws-test.toml` for a complete navra config. Key points:
 - Error handling via `google_workspace::error::GwsError`
 - Tracing goes to stderr, MCP JSON-RPC to stdout
 - Policy tests use `#[cfg(test)]` inline in each module
-- Tool descriptions follow PURPOSE/WHEN/HOW/LIMITATIONS structure
+- Tool descriptions: short (one sentence), direct, matching across services
+- Tool schemas: required params only, examples in param descriptions

@@ -185,7 +185,7 @@ pub async fn build_tools_list(
     tools.push(make_tool(
         "gws_discover",
         "API & Tool Discovery",
-        "Discover API schemas or get full tool documentation. Use tool= for helper tool details, or service= for API resources/methods.",
+        "Explore APIs and activate services. Use service= to enable tools, tool= for docs.",
         ToolAnnotations::new().read_only(true).destructive(false).idempotent(true).open_world(false),
         json!({
             "type": "object",
@@ -201,7 +201,7 @@ pub async fn build_tools_list(
     tools.push(make_tool(
         "gws_batch",
         "Batch API Calls",
-        "Execute multiple Google API calls in a single request. All sub-requests are validated against policy before any are executed. Max 100 requests per batch.",
+        "Run multiple API calls in one request. Max 100 per batch.",
         ToolAnnotations::new().read_only(false).destructive(false).idempotent(false).open_world(true),
         json!({
             "type": "object",

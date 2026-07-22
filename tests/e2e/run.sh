@@ -219,11 +219,13 @@ for scenario in $SCENARIOS; do
 
             if MCPD_TOKEN="$MCPD_TOKEN" navra run -m claude-opus-4-6@default -n 50 "$judge_prompt" >"$judgefile" 2>&1; then
                 grep '^{' "$judgefile" > "$RESULTS_DIR/${RUN_ID}-${slug}-${scenario}.jsonl" 2>/dev/null || true
-                score_line=$(grep -o '"score":[0-9.]*' "$RESULTS_DIR/${RUN_ID}-${slug}-${scenario}.jsonl" 2>/dev/null \
-                    | awk -F: '{s+=$2} END {printf "%.1f", s}')
-                max_line=$(grep -o '"max":[0-9.]*' "$RESULTS_DIR/${RUN_ID}-${slug}-${scenario}.jsonl" 2>/dev/null \
-                    | awk -F: '{s+=$2} END {printf "%.1f", s}')
-                echo "  Judge score: ${score_line:-?}/${max_line:-?}"
+                total_line=$(grep '"_total"' "$RESULTS_DIR/${RUN_ID}-${slug}-${scenario}.jsonl" 2>/dev/null || echo "")
+                if [[ -n "$total_line" ]]; then
+                    score_str=$(echo "$total_line" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(f'{d.get(\"points\",d.get(\"score\",\"?\"))}/{d.get(\"max\",\"?\")}')" 2>/dev/null)
+                    echo "  Judge score: ${score_str:-?}"
+                else
+                    echo "  Judge score: no total"
+                fi
                 PASS=$((PASS + 1))
             else
                 echo "  Judge FAILED"

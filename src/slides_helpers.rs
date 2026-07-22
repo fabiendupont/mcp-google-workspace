@@ -813,7 +813,7 @@ pub fn templates_tool_schema() -> Value {
     json!({
         "name": "gws_templates",
         "title": "List presentation templates",
-        "description": "List available presentation templates configured in the policy, with their layout names. Use this to discover which templates and layouts are available before creating a presentation with gws_slides_import_marp.",
+        "description": "List presentation templates and their slide layouts.",
         "annotations": {
             "readOnlyHint": true,
             "destructiveHint": false,
@@ -836,7 +836,7 @@ pub fn marp_tool_schema() -> Value {
     json!({
         "name": "gws_slides_import_marp",
         "title": "Import Marp Markdown to Slides",
-        "description": "Convert Marp-flavored Markdown into a Google Slides presentation. When a template is specified, automatically selects the best layout for each slide (Title, Divider, Interior title and body, etc.) based on content. Supports slide separators (---), headings as titles, text formatting, bullet lists, code blocks, tables, images, background images, speaker notes, and per-slide directives.",
+        "description": "Create a presentation from Marp Markdown. Supports headings, bullets, tables, images, speaker notes.",
         "annotations": {
             "readOnlyHint": false,
             "destructiveHint": false,

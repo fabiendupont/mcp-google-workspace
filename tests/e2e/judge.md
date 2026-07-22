@@ -34,11 +34,20 @@ For each criterion in the rubric:
 
 Output ONLY JSONL lines — one per criterion, no other text:
 
-{"run_id":"$RUN_ID","model":"$MODEL","scenario":"$SCENARIO","criterion_id":"<id>","score":<score>,"max":<weight>,"pass":<true|false>,"note":"<note>"}
+{"run_id":"$RUN_ID","model":"$MODEL","scenario":"$SCENARIO","criterion_id":"<id>","score":<score>,"weight":<weight>,"points":<score * weight>,"note":"<note>"}
+
+Where:
+- score: 0.0 to 1.0 (proportion of criterion met)
+- weight: from the rubric (importance of this criterion)
+- points: score multiplied by weight (the actual points earned)
 
 After all criteria, output one summary line:
 
-{"run_id":"$RUN_ID","model":"$MODEL","scenario":"$SCENARIO","criterion_id":"_total","score":<sum of score*max>,"max":<sum of max>}
+{"run_id":"$RUN_ID","model":"$MODEL","scenario":"$SCENARIO","criterion_id":"_total","points":<sum of all points>,"max":<sum of all weights>}
+
+Example: a criterion with weight 0.5 scored at 1.0 (full pass) earns 0.5 points.
+A criterion with weight 1.0 scored at 0.5 (partial) earns 0.5 points.
+Total can never exceed max.
 
 ## Scoring guidelines
 

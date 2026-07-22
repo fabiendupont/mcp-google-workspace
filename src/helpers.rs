@@ -994,7 +994,7 @@ pub fn format_tool_schema() -> Value {
     json!({
         "name": "gws_docs_format",
         "title": "Format Text in Doc",
-        "description": "Apply text or paragraph styling to a range. Target by start_index/end_index or by text search.",
+        "description": "Apply bold, italic, color, or font styling to text in a document.",
         "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": true },
         "inputSchema": {
             "type": "object",
@@ -1581,7 +1581,7 @@ pub fn docs_write_tool_schema() -> Value {
     json!({
         "name": "gws_docs_write",
         "title": "Write to Google Doc",
-        "description": "Write to a document (not spreadsheet). Omit document_id with title to create new.",
+        "description": "Write to a document. Omit document_id with title to create new.",
         "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": true },
         "inputSchema": {
             "type": "object",
@@ -1653,7 +1653,7 @@ pub fn docs_read_tool_schema() -> Value {
     json!({
         "name": "gws_docs_read",
         "title": "Read Google Doc",
-        "description": "Read a Google Doc as Markdown. Use section= to read one section. Tables in structuredContent.",
+        "description": "Read a document as Markdown. Use section= to read one section.",
         "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true },
         "inputSchema": {
             "type": "object",

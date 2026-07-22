@@ -523,7 +523,7 @@ pub fn sheets_format_tool_schema() -> Value {
     json!({
         "name": "gws_sheets_format",
         "title": "Conditional Formatting",
-        "description": "Add or list conditional formatting rules. Highlight cells by value.",
+        "description": "Add, delete, or list conditional formatting rules on a spreadsheet.",
         "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": true },
         "inputSchema": {
             "type": "object",
