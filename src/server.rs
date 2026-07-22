@@ -2997,7 +2997,37 @@ async fn execute_sheets_helper(
             let spreadsheet_id = spreadsheet_id_opt.unwrap();
             let action = arguments.get("action").and_then(|v| v.as_str())
                 .ok_or_else(|| GwsError::Validation("Missing 'action'".into()))?;
-            let sheet_id = arguments.get("sheet_id").and_then(|v| v.as_i64());
+            let mut sheet_id = arguments.get("sheet_id").and_then(|v| v.as_i64());
+            let sheet_name = arguments.get("sheet").and_then(|v| v.as_str());
+
+            // Resolve sheet name to sheet_id if not provided
+            if sheet_id.is_none() {
+                if let Some(name) = sheet_name {
+                    let spreadsheets_resource = tools::find_resource(&sheets_doc.resources, "spreadsheets")
+                        .ok_or_else(|| GwsError::Validation("spreadsheets resource not found".into()))?;
+                    let get_method = spreadsheets_resource.methods.get("get")
+                        .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
+                    let meta_result = crate::execute::execute_tool(
+                        &sheets_doc, get_method, "spreadsheets", "get",
+                        &json!({"params": {"spreadsheetId": spreadsheet_id}, "fields": "sheets(properties(sheetId,title))"}),
+                        "sheets", policy, meta, None, None, false, &mut state.token_cache,
+                    ).await?;
+                    sheet_id = meta_result.get("sheets")
+                        .and_then(|v| v.as_array())
+                        .and_then(|sheets| sheets.iter().find(|s| {
+                            s.pointer("/properties/title").and_then(|t| t.as_str()) == Some(name)
+                        }))
+                        .and_then(|s| s.pointer("/properties/sheetId"))
+                        .and_then(|v| v.as_i64());
+                    if sheet_id.is_none() {
+                        return Err(GwsError::Validation(format!(
+                            "Tab '{name}' not found. Use gws_sheets_info to list available tabs."
+                        )));
+                    }
+                } else if action != "list" {
+                    sheet_id = Some(0);
+                }
+            }
             let range = arguments.get("range").and_then(|v| v.as_str());
             let rule = arguments.get("rule");
             let index = arguments.get("index").and_then(|v| v.as_i64());

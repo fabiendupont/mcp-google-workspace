@@ -128,6 +128,18 @@ model_slug() {
     echo "$1" | tr ':/@.' '-'
 }
 
+# Map scenarios to MCP prompts for context injection
+mcp_prompt_for_scenario() {
+    case "$1" in
+        drive-workflow)  echo "" ;;
+        docs-workflow)   echo "google-workspace:create-document" ;;
+        docs-full)       echo "google-workspace:create-document" ;;
+        full-e2e)        echo "google-workspace:create-document" ;;
+        sheets-advanced) echo "google-workspace:work-with-spreadsheet" ;;
+        *) echo "" ;;
+    esac
+}
+
 # --- Clean test folder ---
 clean_test_folder() {
     local did
@@ -173,8 +185,16 @@ for scenario in $SCENARIOS; do
             sleep 2
         fi
 
-        # Run the test model
-        if MCPD_TOKEN="$MCPD_TOKEN" navra run -m "$model" -n 100 "$(cat "$pfile")" >"$logfile" 2>&1; then
+        # Run the test model (with MCP prompt injection for large-context models only)
+        mcp_prompt=$(mcp_prompt_for_scenario "$scenario")
+        prompt_flag=""
+        if [[ -n "$mcp_prompt" ]]; then
+            case "$model" in
+                *claude*|*opus*|*sonnet*|qwen3.6*) prompt_flag="--upstream-prompt $mcp_prompt" ;;
+                *) ;; # skip for small-context models (gemma4:e4b, qwen3:8b, gemma4:26b)
+            esac
+        fi
+        if MCPD_TOKEN="$MCPD_TOKEN" navra run -m "$model" -n 100 $prompt_flag "$(cat "$pfile")" >"$logfile" 2>&1; then
             errors=$(grep -c "Tool error\|Tool failed" /tmp/mcp-e2e-server.log 2>/dev/null || echo "0")
             iterations=$(grep -o "Iterations: [0-9]*" "$logfile" | grep -o "[0-9]*" || echo "?")
             time_s=$(grep -o "Time:.*s" "$logfile" | grep -o "[0-9.]*" || echo "?")

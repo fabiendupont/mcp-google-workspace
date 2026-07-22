@@ -523,17 +523,18 @@ pub fn sheets_format_tool_schema() -> Value {
     json!({
         "name": "gws_sheets_format",
         "title": "Conditional Formatting",
-        "description": "Add, update, delete, or list conditional formatting rules on a spreadsheet.",
+        "description": "Add or list conditional formatting rules. Highlight cells by value.",
         "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": true },
         "inputSchema": {
             "type": "object",
             "properties": {
                 "spreadsheet_id": { "type": "string", "description": "Spreadsheet ID" },
-                "action": { "type": "string", "enum": ["add", "update", "delete", "list"], "description": "add, update, delete, or list" },
-                "sheet_id": { "type": "integer", "description": "Tab ID (from gws_sheets_info)" },
-                "range": { "type": "string", "description": "A1 range for the rule (e.g. 'A1:D10')" },
-                "rule": { "type": "object", "description": "Conditional format rule: {type, values, format}. E.g. {\"type\":\"NUMBER_GREATER\",\"values\":[\"90\"],\"format\":{\"backgroundColor\":{\"red\":0,\"green\":1,\"blue\":0}}}" },
-                "index": { "type": "integer", "description": "Rule index for update/delete (0-based)" }
+                "action": { "type": "string", "enum": ["add", "delete", "list"], "description": "add, delete, or list" },
+                "range": { "type": "string", "description": "A1 range (e.g. 'E2:E10')" },
+                "rule": { "type": "object", "description": "Rule: {\"type\":\"NUMBER_GREATER\",\"values\":[\"90\"],\"format\":{\"backgroundColor\":{\"red\":0,\"green\":1,\"blue\":0}}}" },
+                "sheet": { "type": "string", "description": "Tab name (default: first tab)" },
+                "sheet_id": { "type": "integer", "description": "Tab ID (alternative to sheet name)" },
+                "index": { "type": "integer", "description": "Rule index for delete (0-based)" }
             },
             "required": ["spreadsheet_id", "action"]
         }
@@ -544,16 +545,17 @@ pub fn sheets_validate_tool_schema() -> Value {
     json!({
         "name": "gws_sheets_validate",
         "title": "Data Validation",
-        "description": "Set, clear, or list data validation rules on spreadsheet cells.",
+        "description": "Set dropdown or validation rules on spreadsheet cells.",
         "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": true },
         "inputSchema": {
             "type": "object",
             "properties": {
                 "spreadsheet_id": { "type": "string", "description": "Spreadsheet ID" },
                 "action": { "type": "string", "enum": ["set", "clear", "list"], "description": "set, clear, or list" },
-                "sheet_id": { "type": "integer", "description": "Tab ID (from gws_sheets_info)" },
-                "range": { "type": "string", "description": "A1 range (e.g. 'B2:B100')" },
-                "rule": { "type": "object", "description": "Validation rule: {type, values, strict, message}. E.g. {\"type\":\"ONE_OF_LIST\",\"values\":[\"Yes\",\"No\"],\"strict\":true}" }
+                "range": { "type": "string", "description": "A1 range (e.g. 'F2:F100')" },
+                "rule": { "type": "object", "description": "Rule: {\"type\":\"ONE_OF_LIST\",\"values\":[\"Yes\",\"No\"],\"strict\":true}" },
+                "sheet": { "type": "string", "description": "Tab name (default: first tab)" },
+                "sheet_id": { "type": "integer", "description": "Tab ID (alternative to sheet name)" }
             },
             "required": ["spreadsheet_id", "action"]
         }
@@ -564,17 +566,18 @@ pub fn sheets_named_range_tool_schema() -> Value {
     json!({
         "name": "gws_sheets_named_range",
         "title": "Named Ranges",
-        "description": "Create, update, delete, list, or read named ranges in a spreadsheet.",
+        "description": "Create, delete, or list named ranges in a spreadsheet.",
         "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": true },
         "inputSchema": {
             "type": "object",
             "properties": {
                 "spreadsheet_id": { "type": "string", "description": "Spreadsheet ID" },
-                "action": { "type": "string", "enum": ["create", "update", "delete", "list", "read"], "description": "create, update, delete, list, or read" },
-                "name": { "type": "string", "description": "Named range name (for create/update/read)" },
-                "range": { "type": "string", "description": "A1 range (for create/update)" },
-                "sheet_id": { "type": "integer", "description": "Tab ID (for create/update)" },
-                "named_range_id": { "type": "string", "description": "Named range ID (for update/delete, from list)" }
+                "action": { "type": "string", "enum": ["create", "delete", "list", "read"], "description": "create, delete, list, or read" },
+                "name": { "type": "string", "description": "Range name (e.g. 'SalesData')" },
+                "range": { "type": "string", "description": "A1 range (e.g. 'A1:F10') for create" },
+                "sheet": { "type": "string", "description": "Tab name (default: first tab)" },
+                "sheet_id": { "type": "integer", "description": "Tab ID (alternative to sheet name)" },
+                "named_range_id": { "type": "string", "description": "ID from list (for delete)" }
             },
             "required": ["spreadsheet_id", "action"]
         }
@@ -605,18 +608,19 @@ pub fn sheets_dimensions_tool_schema() -> Value {
     json!({
         "name": "gws_sheets_dimensions",
         "title": "Row/Column Management",
-        "description": "Insert, append, delete, move, or resize rows and columns in a spreadsheet.",
+        "description": "Insert, append, or delete rows/columns in a spreadsheet.",
         "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true },
         "inputSchema": {
             "type": "object",
             "properties": {
                 "spreadsheet_id": { "type": "string", "description": "Spreadsheet ID" },
                 "action": { "type": "string", "enum": ["insert", "append", "delete", "move", "resize"], "description": "insert, append, delete, move, or resize" },
-                "sheet_id": { "type": "integer", "description": "Tab ID (from gws_sheets_info)" },
-                "dimension": { "type": "string", "enum": ["ROWS", "COLUMNS"], "description": "ROWS or COLUMNS" },
-                "start": { "type": "integer", "description": "Start index (0-based, for insert/delete)" },
-                "end": { "type": "integer", "description": "End index (exclusive, for delete)" },
+                "dimension": { "type": "string", "enum": ["ROWS", "COLUMNS"], "description": "ROWS or COLUMNS (default: ROWS)" },
+                "start": { "type": "integer", "description": "Start position (0-based). Row 6 = index 5." },
                 "count": { "type": "integer", "description": "Number to insert/append (default 1)" },
+                "end": { "type": "integer", "description": "End position (exclusive, for delete)" },
+                "sheet": { "type": "string", "description": "Tab name (default: first tab)" },
+                "sheet_id": { "type": "integer", "description": "Tab ID (alternative to sheet name)" },
                 "size": { "type": "integer", "description": "Pixel size (for resize)" },
                 "destination": { "type": "integer", "description": "Destination index (for move)" }
             },
