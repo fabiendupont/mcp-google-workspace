@@ -146,9 +146,7 @@ pub async fn handle_webhook(
         );
         let _ = sub
             .peer
-            .notify_resource_updated(ResourceUpdatedNotificationParam {
-                uri: sub.uri.clone(),
-            })
+            .notify_resource_updated(ResourceUpdatedNotificationParam::new(sub.uri.clone()))
             .await;
     } else {
         tracing::warn!(

@@ -164,7 +164,9 @@ impl ServerHandler for GwsHandler {
                 }
                 Err(e) => {
                     tracing::warn!(tool = %tool_name, error = %e, duration_ms = start.elapsed().as_millis() as u64, "Tool failed");
-                    Ok(CallToolResult::error(vec![Content::text(e.to_string())]))
+                    Ok(CallToolResult::error(vec![ContentBlock::text(
+                        e.to_string(),
+                    )]))
                 }
             }
         }
@@ -462,7 +464,7 @@ impl ServerHandler for GwsHandler {
                 .unwrap_or("")
                 .to_string();
 
-            let messages = vec![PromptMessage::new_text(PromptMessageRole::User, body_text)];
+            let messages = vec![PromptMessage::new_text(Role::User, body_text)];
 
             let mut r = GetPromptResult::new(messages);
             if let Some(desc) = description {
@@ -511,7 +513,9 @@ impl ServerHandler for GwsHandler {
 
                 let call_result = match result {
                     Ok(value) => Ok(value_to_call_tool_result(value)),
-                    Err(e) => Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
+                    Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(
+                        e.to_string(),
+                    )])),
                 };
 
                 Ok(Box::new(ToolCallTaskResult::new(tid, call_result))
@@ -553,7 +557,7 @@ impl ServerHandler for GwsHandler {
 
     fn get_task_info(
         &self,
-        request: GetTaskInfoParams,
+        request: GetTaskParams,
         _context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<GetTaskResult, McpError>> + Send + '_ {
         async move {
@@ -568,14 +572,14 @@ impl ServerHandler for GwsHandler {
                         TaskStatus::Failed
                     };
                     let task = rmcp::model::Task::new(request.task_id, status, now.clone(), now);
-                    return Ok(GetTaskResult { meta: None, task });
+                    return Ok(GetTaskResult::new(task));
                 }
             }
 
             if proc.list_running().contains(&request.task_id) {
                 let task =
                     rmcp::model::Task::new(request.task_id, TaskStatus::Working, now.clone(), now);
-                return Ok(GetTaskResult { meta: None, task });
+                return Ok(GetTaskResult::new(task));
             }
 
             Err(McpError::invalid_params(
@@ -587,7 +591,7 @@ impl ServerHandler for GwsHandler {
 
     fn get_task_result(
         &self,
-        request: GetTaskResultParams,
+        request: GetTaskPayloadParams,
         _context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<GetTaskPayloadResult, McpError>> + Send + '_ {
         async move {
@@ -638,7 +642,7 @@ impl ServerHandler for GwsHandler {
                     now.clone(),
                     now,
                 );
-                Ok(CancelTaskResult { meta: None, task })
+                Ok(CancelTaskResult::new(task))
             } else {
                 Err(McpError::invalid_params(
                     format!("Task '{}' not found or already completed", request.task_id),
@@ -655,14 +659,16 @@ fn value_to_call_tool_result(value: Value) -> CallToolResult {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let content: Vec<Content> = if let Some(arr) = value.get("content").and_then(|v| v.as_array()) {
+    let content: Vec<ContentBlock> = if let Some(arr) =
+        value.get("content").and_then(|v| v.as_array())
+    {
         arr.iter()
             .map(|item| {
                 let content_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("text");
                 match content_type {
                     "text" => {
                         let text = item.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                        Content::text(text)
+                        ContentBlock::text(text)
                     }
                     "image" => {
                         let data = item.get("data").and_then(|v| v.as_str()).unwrap_or("");
@@ -670,18 +676,18 @@ fn value_to_call_tool_result(value: Value) -> CallToolResult {
                             .get("mimeType")
                             .and_then(|v| v.as_str())
                             .unwrap_or("image/png");
-                        Content::image(data, mime)
+                        ContentBlock::image(data, mime)
                     }
                     _ => {
                         let text = serde_json::to_string(item).unwrap_or_else(|_| "{}".to_string());
-                        Content::text(text)
+                        ContentBlock::text(text)
                     }
                 }
             })
             .collect()
     } else {
         let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string());
-        vec![Content::text(text)]
+        vec![ContentBlock::text(text)]
     };
 
     let structured_content = value.get("structuredContent").cloned();
