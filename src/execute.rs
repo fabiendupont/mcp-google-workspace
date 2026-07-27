@@ -45,7 +45,7 @@ static FIELD_DEFAULTS: LazyLock<HashMap<(&str, &str, &str), &str>> = LazyLock::n
     // Slides
     m.insert(
         ("slides", "presentations", "get"),
-        "presentationId,title,slides(objectId,pageElements(objectId,size,transform,shape))",
+        "presentationId,title,masters(objectId),layouts(objectId,layoutProperties,pageElements(objectId,size,transform,shape(placeholder,text,shapeType))),slides(objectId,slideProperties(layoutObjectId,notesPage(notesProperties,pageElements(objectId,shape(text)))),pageElements(objectId,size,transform,shape,table))",
     );
     m.insert(
         ("slides", "presentations", "create"),
@@ -193,7 +193,7 @@ fn parse_args(
         .filter(|v| !v.as_object().is_some_and(|m| m.is_empty()))
         .cloned();
 
-    policy.enforce_constraints(service, method, &mut params, &body)?;
+    policy.enforce_constraints(service, method_name, method, &mut params, &body)?;
 
     Ok(ParsedArgs { params, body })
 }

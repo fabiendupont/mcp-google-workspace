@@ -1,0 +1,50 @@
+name: slides-template
+description: "Slides with branded template: placeholder details, targeted placeholder updates, background images"
+prompt_file: prompts/test-slides-template.md
+timeout_seconds: 300
+test_folder_id: "1VkrXx3bhkQaLJEmnY_t5VxVmBETfsbY1"
+
+rubric:
+  - id: templates_listed
+    criterion: "Model called gws_templates and received layout details with placeholder info"
+    check: "Model called gws_templates and received placeholders with labels and spatial hints (position, size)"
+    weight: 1.0
+
+  - id: presentation_created
+    criterion: "Presentation 'Template Test' exists in the test folder"
+    check: "gws_drive_list the test folder, look for 'Template Test' with presentation mimeType"
+    weight: 1.0
+
+  - id: template_used
+    criterion: "Presentation was created from the template (has branded layouts)"
+    check: "gws_slides_read the presentation, verify slides have layout_name values from the template"
+    weight: 1.0
+
+  - id: slide_added_with_content
+    criterion: "Slide 2 has title 'Key Findings' with bullet points about performance, cost, deployment"
+    check: "gws_slides_read slide_number=2, verify title and body content"
+    weight: 1.0
+
+  - id: background_image_slide
+    criterion: "A slide was created with a background image"
+    check: "Model called gws_slides_add with background_image parameter"
+    weight: 1.0
+
+  - id: placeholder_update
+    criterion: "Slide 2 title was updated to 'Updated Key Findings' via gws_slides_update"
+    check: "gws_slides_read slide_number=2, verify title is 'Updated Key Findings'"
+    weight: 1.0
+
+  - id: final_slide_count
+    criterion: "Presentation has at least 3 slides"
+    check: "gws_slides_read, verify slide_count >= 3"
+    weight: 1.0
+
+  - id: final_titles
+    criterion: "Slide 1 is 'Template Test', slide 2 is 'Updated Key Findings'"
+    check: "gws_slides_read all slides, verify first two slide titles"
+    weight: 1.0
+
+cleanup:
+  - action: trash
+    name_pattern: "Template Test"

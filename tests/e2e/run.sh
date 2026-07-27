@@ -9,7 +9,7 @@ MCP_PORT=3100
 NAVRA_PORT=9315
 
 ALL_MODELS="gemma4:e4b gemma4:26b qwen3:8b qwen3.6:35b-a3b claude-sonnet-4-5@20250929"
-ALL_SCENARIOS="drive-workflow docs-workflow docs-full full-e2e sheets-advanced"
+ALL_SCENARIOS="drive-workflow docs-workflow docs-full full-e2e sheets-advanced slides-workflow slides-template"
 
 # --- Parse args ---
 MODELS=""
@@ -71,7 +71,7 @@ echo "Policy generated: $POLICY"
 
 # --- Start MCP server ---
 echo "Starting MCP server on port $MCP_PORT..."
-"$BINARY" --policy "$POLICY" --prompts-dir "$PROJECT_DIR/prompts" --http "127.0.0.1:$MCP_PORT" &>/tmp/mcp-e2e-server.log &
+"$BINARY" --policy "$POLICY" --prompts-dir "$PROJECT_DIR/prompts" --http "127.0.0.1:$MCP_PORT" --eager-tools >/dev/null 2>/tmp/mcp-e2e-server.log &
 MCP_PID=$!
 sleep 4
 if ! curl -s "http://127.0.0.1:$MCP_PORT/health" >/dev/null 2>&1; then
@@ -85,7 +85,10 @@ echo "MCP server ready (PID $MCP_PID)"
 echo "Starting navra on port $NAVRA_PORT..."
 navra serve -c "$SCRIPT_DIR/navra.toml" &>/tmp/navra-e2e-serve.log &
 NAVRA_PID=$!
-sleep 4
+for i in $(seq 1 15); do
+    sleep 1
+    curl -s "http://127.0.0.1:$NAVRA_PORT/health" >/dev/null 2>&1 && break
+done
 if ! curl -s "http://127.0.0.1:$NAVRA_PORT/health" >/dev/null 2>&1; then
     echo "ERROR: navra failed to start"
     tail -5 /tmp/navra-e2e-serve.log
@@ -120,6 +123,8 @@ prompt_file() {
         docs-full)      echo "$PROJECT_DIR/prompts/test-docs-full.md" ;;
         full-e2e)       echo "$PROJECT_DIR/prompts/test-e2e.md" ;;
         sheets-advanced) echo "$PROJECT_DIR/prompts/test-sheets-advanced.md" ;;
+        slides-workflow) echo "$PROJECT_DIR/prompts/test-slides-workflow.md" ;;
+        slides-template) echo "$PROJECT_DIR/prompts/test-slides-template.md" ;;
         *) echo ""; return 1 ;;
     esac
 }
@@ -136,6 +141,8 @@ mcp_prompt_for_scenario() {
         docs-full)       echo "google-workspace:create-document" ;;
         full-e2e)        echo "google-workspace:create-document" ;;
         sheets-advanced) echo "google-workspace:work-with-spreadsheet" ;;
+        slides-workflow) echo "" ;;
+        slides-template) echo "google-workspace:create-presentation" ;;
         *) echo "" ;;
     esac
 }
@@ -149,7 +156,7 @@ clean_test_folder() {
         gws drive files update --params "{\"fileId\":\"$did\"}" --json '{"trashed":true}' >/dev/null 2>&1 || true
     fi
     # Also clean stray test files
-    for pattern in "Drive Test Output" "AI Infrastructure Report"; do
+    for pattern in "Drive Test Output" "AI Infrastructure Report" "Quarterly Review" "Sales Tracker" "Template Test"; do
         local fid
         fid=$(gws drive files list --params "{\"q\": \"name = '$pattern' and '$GWS_TEST_FOLDER_ID' in parents and trashed = false\", \"fields\": \"files(id)\"}" 2>/dev/null \
             | python3 -c "import sys,json; f=json.loads(sys.stdin.read())['files']; print(f[0]['id'] if f else '')" 2>/dev/null || true)
@@ -179,6 +186,9 @@ for scenario in $SCENARIOS; do
         echo "--- [$slug] $scenario ---"
         clean_test_folder
 
+        # Mark log position before this run
+        log_offset=$(wc -c < /tmp/mcp-e2e-server.log 2>/dev/null || echo 0)
+
         # Preload local model
         if [[ "$model" != *"claude"* && "$model" != *"vertex"* ]]; then
             curl -s http://localhost:11434/api/generate -d "{\"model\":\"$model\",\"prompt\":\"hi\",\"stream\":false}" >/dev/null 2>&1 || true
@@ -194,17 +204,23 @@ for scenario in $SCENARIOS; do
                 *) ;; # skip for small-context models (gemma4:e4b, qwen3:8b, gemma4:26b)
             esac
         fi
-        if MCPD_TOKEN="$MCPD_TOKEN" navra run -m "$model" -n 100 $prompt_flag "$(cat "$pfile")" >"$logfile" 2>&1; then
-            errors=$(grep -c "Tool error\|Tool failed" /tmp/mcp-e2e-server.log 2>/dev/null || echo "0")
+        if MCPD_TOKEN="$MCPD_TOKEN" navra run -e "http://127.0.0.1:$NAVRA_PORT/mcp" -m "$model" -n 100 $prompt_flag "$(cat "$pfile")" >"$logfile" 2>&1; then
+            errors=$(tail -c +$((log_offset + 1)) /tmp/mcp-e2e-server.log 2>/dev/null | grep -c "Tool error\|Tool failed" || echo "0")
             iterations=$(grep -o "Iterations: [0-9]*" "$logfile" | grep -o "[0-9]*" || echo "?")
             time_s=$(grep -o "Time:.*s" "$logfile" | grep -o "[0-9.]*" || echo "?")
             echo "  Model done: ${iterations} iterations, ${time_s}s, ${errors} tool errors"
         else
             echo "  Model FAILED (navra exit code $?)"
             FAIL=$((FAIL + 1))
-            > /tmp/mcp-e2e-server.log
             continue
         fi
+
+        # Extract tool calls from MCP server log for the judge (only this run's portion)
+        tool_calls_file="$RESULTS_DIR/${RUN_ID}-${slug}-${scenario}.tools.log"
+        tail -c +$((log_offset + 1)) /tmp/mcp-e2e-server.log \
+            | sed 's/\x1b\[[0-9;]*m//g' \
+            | grep "Tool call\|Tool ok\|Tool fail" \
+            > "$tool_calls_file" 2>/dev/null || true
 
         # Judge with Claude Opus via Vertex AI
         judgefile="$RESULTS_DIR/${RUN_ID}-${slug}-${scenario}.judge.log"
@@ -212,12 +228,20 @@ for scenario in $SCENARIOS; do
         judge_template="$SCRIPT_DIR/judge.md"
         if [[ -f "$rubric_file" && -f "$judge_template" ]]; then
             echo "  Judging..."
+            max_score=$(python3 -c "
+import yaml, sys
+with open('$rubric_file') as f:
+    d = yaml.safe_load(f)
+print(sum(c.get('weight', 1.0) for c in d.get('rubric', [])))
+" 2>/dev/null || echo "?")
             export RUN_ID MODEL="$model" SCENARIO="$scenario" GWS_TEST_FOLDER_ID
             export PROMPT_CONTENT="$(cat "$pfile")"
             export RUBRIC_CONTENT="$(cat "$rubric_file")"
+            export TOOL_CALLS="$(cat "$tool_calls_file")"
+            export MAX_SCORE="$max_score"
             judge_prompt=$(envsubst < "$judge_template")
 
-            if MCPD_TOKEN="$MCPD_TOKEN" navra run -m claude-opus-4-6@default -n 50 "$judge_prompt" >"$judgefile" 2>&1; then
+            if MCPD_TOKEN="$MCPD_TOKEN" navra run -e "http://127.0.0.1:$NAVRA_PORT/mcp" -m claude-opus-4-6@default -n 50 "$judge_prompt" >"$judgefile" 2>&1; then
                 grep '^{' "$judgefile" > "$RESULTS_DIR/${RUN_ID}-${slug}-${scenario}.jsonl" 2>/dev/null || true
                 total_line=$(grep '"_total"' "$RESULTS_DIR/${RUN_ID}-${slug}-${scenario}.jsonl" 2>/dev/null || echo "")
                 if [[ -n "$total_line" ]]; then
@@ -236,8 +260,7 @@ for scenario in $SCENARIOS; do
             PASS=$((PASS + 1))
         fi
 
-        # Reset server log for next run
-        > /tmp/mcp-e2e-server.log
+        # (log offset tracking replaces log truncation between runs)
     done
 done
 

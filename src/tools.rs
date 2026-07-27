@@ -322,6 +322,24 @@ pub async fn build_tools_list(
     tools.push(tool_from_json(
         crate::slides_helpers::templates_tool_schema(),
     ));
+    tools.push(tool_from_json(
+        crate::slides_helpers::slides_read_tool_schema(),
+    ));
+    tools.push(tool_from_json(
+        crate::slides_helpers::slides_add_tool_schema(),
+    ));
+    tools.push(tool_from_json(
+        crate::slides_helpers::slides_delete_tool_schema(),
+    ));
+    tools.push(tool_from_json(
+        crate::slides_helpers::slides_reorder_tool_schema(),
+    ));
+    tools.push(tool_from_json(
+        crate::slides_helpers::slides_duplicate_tool_schema(),
+    ));
+    tools.push(tool_from_json(
+        crate::slides_helpers::slides_update_tool_schema(),
+    ));
     tools.push(tool_from_json(crate::image_gen::image_gen_tool_schema()));
 
     if eager {
@@ -389,6 +407,14 @@ fn tool_full_schema(name: &str) -> Option<Value> {
         "gws_sheets_csv" => crate::sheets_helpers::sheets_csv_tool_schema(),
         "gws_sheets_dimensions" => crate::sheets_helpers::sheets_dimensions_tool_schema(),
         "gws_sheets_formulas" => crate::sheets_helpers::sheets_formulas_tool_schema(),
+        "gws_slides_import_marp" => crate::slides_helpers::marp_tool_schema(),
+        "gws_templates" => crate::slides_helpers::templates_tool_schema(),
+        "gws_slides_read" => crate::slides_helpers::slides_read_tool_schema(),
+        "gws_slides_add" => crate::slides_helpers::slides_add_tool_schema(),
+        "gws_slides_delete" => crate::slides_helpers::slides_delete_tool_schema(),
+        "gws_slides_reorder" => crate::slides_helpers::slides_reorder_tool_schema(),
+        "gws_slides_duplicate" => crate::slides_helpers::slides_duplicate_tool_schema(),
+        "gws_slides_update" => crate::slides_helpers::slides_update_tool_schema(),
         _ => return None,
     };
     let mut info = json!({

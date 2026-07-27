@@ -69,6 +69,12 @@ gws_sheets_dimensions   = { domain = "network", operation = "write" }
 gws_sheets_formulas     = { domain = "network", operation = "read" }
 # Slides & image
 gws_slides_import_marp  = { domain = "network", operation = "write" }
+gws_slides_read         = { domain = "network", operation = "read" }
+gws_slides_add          = { domain = "network", operation = "write" }
+gws_slides_delete       = { domain = "network", operation = "write" }
+gws_slides_reorder      = { domain = "network", operation = "write" }
+gws_slides_duplicate    = { domain = "network", operation = "write" }
+gws_slides_update       = { domain = "network", operation = "write" }
 gws_templates           = { domain = "network", operation = "read" }
 gws_generate_image      = { domain = "network", operation = "write" }
 

@@ -15,7 +15,7 @@ format.rs         — Format transformers: Markdown/Plain → Docs batchUpdate, 
 helpers.rs        — Google Docs enrichment (9 tools): write/read/replace, outline, find, table, image, format
 sheets_helpers.rs — Google Sheets enrichment (14 tools): read/write/append/clear, info, tabs, formatting, validation, named ranges, CSV, dimensions, formula analysis
 drive_helpers.rs  — Google Drive enrichment (9 tools): list, find, create folder, copy, rename, move, share, trash, info
-slides_helpers.rs — Google Slides enrichment: Marp import, templates
+slides_helpers.rs — Google Slides enrichment (9 tools): read, add, update, duplicate, delete, reorder, Marp import, templates, image gen
 cache.rs          — LRU + TTL in-memory cache for Sheets values.get responses
 rate_limit.rs     — Per-service sliding-window rate limiter for Google API quotas
 resources.rs      — MCP resources: gws:// URI scheme, resource templates from Discovery Documents
@@ -34,7 +34,7 @@ image_gen.rs      — Gemini image generation and Drive upload
 marp.rs           — Marp Markdown to Google Slides conversion
 ```
 
-## Tools (37 in eager mode, 2 in lazy mode)
+## Tools (43 in eager mode, 2 in lazy mode)
 
 | Service | Tools | Notes |
 |---------|-------|-------|
@@ -42,7 +42,7 @@ marp.rs           — Marp Markdown to Google Slides conversion
 | Drive | 9 tools (`gws_drive_*`) | list, find_folder, info, create_folder, copy, rename, move, share, trash |
 | Docs | 9 tools (`gws_docs_*`) | write (creates or updates), read, replace_section, outline, find, insert_table, insert_image, read_table, format |
 | Sheets | 14 tools (`gws_sheets_*`) | read, write (creates or updates), append, clear, info, manage_tabs, trace, explain, formulas, format, validate, named_range, csv, dimensions |
-| Slides | 3 tools | slides_import_marp, templates, generate_image |
+| Slides | 9 tools (`gws_slides_*`) | read, add, update, duplicate, delete, reorder, import_marp, templates, generate_image |
 
 ## Key Design Decisions
 

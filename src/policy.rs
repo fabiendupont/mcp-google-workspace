@@ -326,6 +326,7 @@ impl Policy {
     pub fn enforce_constraints(
         &self,
         service: &str,
+        method_name: &str,
         method: &RestMethod,
         params: &mut serde_json::Map<String, serde_json::Value>,
         body: &Option<serde_json::Value>,
@@ -336,6 +337,9 @@ impl Policy {
         }
 
         let is_write = method.http_method != "GET";
+        // copy/export are POST but only read the source param — params are read-inputs,
+        // not write-targets. Body params (like parents) are still write-targets.
+        let params_are_read_only = method_name == "copy" || method_name == "export";
 
         let mut by_param: HashMap<&str, Vec<&Constraint>> = HashMap::new();
         for c in constraints {
@@ -394,16 +398,17 @@ impl Policy {
                     self.enforce_body_protect(param, &protect_ro_values, body)?;
                 }
             } else {
+                let param_is_write = is_write && !params_are_read_only;
                 if !restrict_group.is_empty() {
                     self.enforce_param_constraint(
                         param,
                         &all_values,
                         &rw_values,
-                        is_write,
+                        param_is_write,
                         params,
                     )?;
                 }
-                if is_write && !protect_ro_values.is_empty() {
+                if param_is_write && !protect_ro_values.is_empty() {
                     self.enforce_param_protect(param, &protect_ro_values, params)?;
                 }
             }
@@ -699,7 +704,7 @@ mod tests {
         let p = test_policy();
         let method = get_method();
         let mut params = serde_json::Map::new();
-        p.enforce_constraints("drive", &method, &mut params, &None)
+        p.enforce_constraints("drive", "update", &method, &mut params, &None)
             .unwrap();
         let q = params.get("q").unwrap().as_str().unwrap();
         assert!(q.contains("'folder-readonly' in parents"));
@@ -715,7 +720,7 @@ mod tests {
             "q".to_string(),
             serde_json::Value::String("mimeType='application/pdf'".to_string()),
         );
-        p.enforce_constraints("drive", &method, &mut params, &None)
+        p.enforce_constraints("drive", "update", &method, &mut params, &None)
             .unwrap();
         let q = params.get("q").unwrap().as_str().unwrap();
         assert!(q.contains("mimeType='application/pdf'"));
@@ -732,7 +737,7 @@ mod tests {
             "name": "test.txt"
         }));
         assert!(
-            p.enforce_constraints("drive", &method, &mut params, &body)
+            p.enforce_constraints("drive", "update", &method, &mut params, &body)
                 .is_ok()
         );
     }
@@ -747,7 +752,7 @@ mod tests {
             "name": "test.txt"
         }));
         let err = p
-            .enforce_constraints("drive", &method, &mut params, &body)
+            .enforce_constraints("drive", "update", &method, &mut params, &body)
             .unwrap_err();
         assert!(err.to_string().contains("read-only"));
     }
@@ -762,7 +767,7 @@ mod tests {
             "name": "test.txt"
         }));
         let err = p
-            .enforce_constraints("drive", &method, &mut params, &body)
+            .enforce_constraints("drive", "update", &method, &mut params, &body)
             .unwrap_err();
         assert!(err.to_string().contains("not in the allowed list"));
     }
@@ -774,7 +779,7 @@ mod tests {
         let mut params = serde_json::Map::new();
         let body = Some(serde_json::json!({ "name": "test.txt" }));
         let err = p
-            .enforce_constraints("drive", &method, &mut params, &body)
+            .enforce_constraints("drive", "update", &method, &mut params, &body)
             .unwrap_err();
         assert!(err.to_string().contains("parents"));
     }
@@ -786,7 +791,7 @@ mod tests {
         let mut params = serde_json::Map::new();
         let body = Some(serde_json::json!({ "name": "test.txt" }));
         assert!(
-            p.enforce_constraints("gmail", &method, &mut params, &body)
+            p.enforce_constraints("gmail", "update", &method, &mut params, &body)
                 .is_ok()
         );
     }
@@ -814,7 +819,7 @@ mod tests {
         let p = test_policy_write_only();
         let method = get_method();
         let mut params = serde_json::Map::new();
-        p.enforce_constraints("drive", &method, &mut params, &None)
+        p.enforce_constraints("drive", "update", &method, &mut params, &None)
             .unwrap();
         assert!(
             params.get("q").is_none(),
@@ -829,7 +834,7 @@ mod tests {
         let mut params = serde_json::Map::new();
         let body = Some(serde_json::json!({ "parents": ["folder-allowed"] }));
         assert!(
-            p.enforce_constraints("drive", &method, &mut params, &body)
+            p.enforce_constraints("drive", "update", &method, &mut params, &body)
                 .is_ok()
         );
     }
@@ -841,7 +846,7 @@ mod tests {
         let mut params = serde_json::Map::new();
         let body = Some(serde_json::json!({ "parents": ["wrong-folder"] }));
         assert!(
-            p.enforce_constraints("drive", &method, &mut params, &body)
+            p.enforce_constraints("drive", "update", &method, &mut params, &body)
                 .is_err()
         );
     }
@@ -853,7 +858,7 @@ mod tests {
         let mut params = serde_json::Map::new();
         let body = Some(serde_json::json!({ "name": "test.txt" }));
         assert!(
-            p.enforce_constraints("drive", &method, &mut params, &body)
+            p.enforce_constraints("drive", "update", &method, &mut params, &body)
                 .is_ok(),
             "body-write-only should allow writes that don't include the constrained param"
         );
@@ -872,7 +877,7 @@ mod tests {
         );
         let body = Some(serde_json::json!({ "parents": ["folder-readwrite"] }));
         assert!(
-            p.enforce_constraints("drive", &method, &mut params, &body)
+            p.enforce_constraints("drive", "update", &method, &mut params, &body)
                 .is_ok()
         );
     }
@@ -888,7 +893,7 @@ mod tests {
         );
         let body = Some(serde_json::json!({ "parents": ["folder-readwrite"] }));
         let err = p
-            .enforce_constraints("drive", &method, &mut params, &body)
+            .enforce_constraints("drive", "update", &method, &mut params, &body)
             .unwrap_err();
         assert!(err.to_string().contains("read-only"));
     }
@@ -904,7 +909,7 @@ mod tests {
         );
         let body = Some(serde_json::json!({ "parents": ["folder-readwrite"] }));
         let err = p
-            .enforce_constraints("drive", &method, &mut params, &body)
+            .enforce_constraints("drive", "update", &method, &mut params, &body)
             .unwrap_err();
         assert!(err.to_string().contains("not in the allowed list"));
     }
@@ -920,7 +925,7 @@ mod tests {
         );
         let body = Some(serde_json::json!({ "parents": ["folder-readwrite"] }));
         let err = p
-            .enforce_constraints("drive", &method, &mut params, &body)
+            .enforce_constraints("drive", "update", &method, &mut params, &body)
             .unwrap_err();
         assert!(err.to_string().contains("read-only"));
     }
@@ -937,7 +942,7 @@ mod tests {
             serde_json::Value::String("holidays".to_string()),
         );
         assert!(
-            p.enforce_constraints("calendar", &method, &mut params, &None)
+            p.enforce_constraints("calendar", "update", &method, &mut params, &None)
                 .is_ok()
         );
     }
@@ -952,7 +957,7 @@ mod tests {
             serde_json::Value::String("holidays".to_string()),
         );
         let err = p
-            .enforce_constraints("calendar", &method, &mut params, &None)
+            .enforce_constraints("calendar", "update", &method, &mut params, &None)
             .unwrap_err();
         assert!(err.to_string().contains("read-only"));
     }
@@ -967,7 +972,7 @@ mod tests {
             serde_json::Value::String("primary".to_string()),
         );
         assert!(
-            p.enforce_constraints("calendar", &method, &mut params, &None)
+            p.enforce_constraints("calendar", "update", &method, &mut params, &None)
                 .is_ok()
         );
     }
@@ -982,7 +987,7 @@ mod tests {
             serde_json::Value::String("secret@group.calendar.google.com".to_string()),
         );
         let err = p
-            .enforce_constraints("calendar", &method, &mut params, &None)
+            .enforce_constraints("calendar", "update", &method, &mut params, &None)
             .unwrap_err();
         assert!(err.to_string().contains("not allowed by policy"));
     }
@@ -993,7 +998,7 @@ mod tests {
         let method = get_method();
         let mut params = serde_json::Map::new();
         let err = p
-            .enforce_constraints("calendar", &method, &mut params, &None)
+            .enforce_constraints("calendar", "update", &method, &mut params, &None)
             .unwrap_err();
         assert!(err.to_string().contains("calendarId"));
     }
@@ -1024,7 +1029,7 @@ mod tests {
             serde_json::Value::String("abc123".to_string()),
         );
         assert!(
-            p.enforce_constraints("sheets", &method, &mut params, &None)
+            p.enforce_constraints("sheets", "update", &method, &mut params, &None)
                 .is_ok()
         );
 
@@ -1033,7 +1038,7 @@ mod tests {
             serde_json::Value::String("other".to_string()),
         );
         assert!(
-            p.enforce_constraints("sheets", &method, &mut params, &None)
+            p.enforce_constraints("sheets", "update", &method, &mut params, &None)
                 .is_err()
         );
     }
@@ -1045,7 +1050,7 @@ mod tests {
         let mut params = serde_json::Map::new();
         let body = Some(serde_json::json!({ "name": "test.txt" }));
         assert!(
-            p.enforce_constraints("gmail", &method, &mut params, &body)
+            p.enforce_constraints("gmail", "update", &method, &mut params, &body)
                 .is_ok()
         );
     }
@@ -1055,7 +1060,7 @@ mod tests {
         let p = test_policy();
         let method = get_method();
         let mut params = serde_json::Map::new();
-        p.enforce_constraints("gmail", &method, &mut params, &None)
+        p.enforce_constraints("gmail", "update", &method, &mut params, &None)
             .unwrap();
         assert!(params.get("q").is_none());
     }
@@ -1148,7 +1153,7 @@ mod tests {
             serde_json::Value::String("any-presentation".to_string()),
         );
         assert!(
-            p.enforce_constraints("slides", &method, &mut params, &None)
+            p.enforce_constraints("slides", "update", &method, &mut params, &None)
                 .is_ok()
         );
     }
@@ -1163,7 +1168,7 @@ mod tests {
             serde_json::Value::String("template-123".to_string()),
         );
         assert!(
-            p.enforce_constraints("slides", &method, &mut params, &None)
+            p.enforce_constraints("slides", "update", &method, &mut params, &None)
                 .is_ok()
         );
     }
@@ -1178,7 +1183,7 @@ mod tests {
             serde_json::Value::String("template-123".to_string()),
         );
         let err = p
-            .enforce_constraints("slides", &method, &mut params, &None)
+            .enforce_constraints("slides", "update", &method, &mut params, &None)
             .unwrap_err();
         assert!(err.to_string().contains("protected as read-only"));
     }
@@ -1193,7 +1198,7 @@ mod tests {
             serde_json::Value::String("my-presentation".to_string()),
         );
         assert!(
-            p.enforce_constraints("slides", &method, &mut params, &None)
+            p.enforce_constraints("slides", "update", &method, &mut params, &None)
                 .is_ok()
         );
     }
@@ -1203,7 +1208,7 @@ mod tests {
         let p = protect_policy();
         let method = get_method();
         let mut params = serde_json::Map::new();
-        p.enforce_constraints("drive", &method, &mut params, &None)
+        p.enforce_constraints("drive", "update", &method, &mut params, &None)
             .unwrap();
         assert!(params.get("q").is_none());
     }
@@ -1218,7 +1223,7 @@ mod tests {
             "name": "test.txt"
         }));
         let err = p
-            .enforce_constraints("drive", &method, &mut params, &body)
+            .enforce_constraints("drive", "update", &method, &mut params, &body)
             .unwrap_err();
         assert!(err.to_string().contains("protected as read-only"));
     }
@@ -1233,7 +1238,7 @@ mod tests {
             "name": "test.txt"
         }));
         assert!(
-            p.enforce_constraints("drive", &method, &mut params, &body)
+            p.enforce_constraints("drive", "update", &method, &mut params, &body)
                 .is_ok()
         );
     }
@@ -1259,7 +1264,7 @@ mod tests {
             serde_json::Value::String("unknown".to_string()),
         );
         assert!(
-            p.enforce_constraints("drive", &get_method(), &mut params, &None)
+            p.enforce_constraints("drive", "get", &get_method(), &mut params, &None)
                 .is_err()
         );
 
@@ -1270,7 +1275,7 @@ mod tests {
             serde_json::Value::String("allowed-file".to_string()),
         );
         assert!(
-            p.enforce_constraints("drive", &post_method(), &mut params, &None)
+            p.enforce_constraints("drive", "update", &post_method(), &mut params, &None)
                 .is_ok()
         );
 
@@ -1281,9 +1286,53 @@ mod tests {
             serde_json::Value::String("template-file".to_string()),
         );
         assert!(
-            p.enforce_constraints("drive", &get_method(), &mut params, &None)
+            p.enforce_constraints("drive", "get", &get_method(), &mut params, &None)
                 .is_err(), // not in restrict allowlist
         );
+    }
+
+    #[test]
+    fn protect_allows_copy_on_protected_file() {
+        let p = protect_policy();
+        // Copy reads the source file — should be allowed even though it's protected
+        let mut params = serde_json::Map::new();
+        params.insert(
+            "presentationId".to_string(),
+            serde_json::Value::String("template-123".to_string()),
+        );
+        assert!(
+            p.enforce_constraints("slides", "copy", &post_method(), &mut params, &None)
+                .is_ok()
+        );
+
+        // But a direct update on the protected file should still be blocked
+        let mut params = serde_json::Map::new();
+        params.insert(
+            "presentationId".to_string(),
+            serde_json::Value::String("template-123".to_string()),
+        );
+        assert!(
+            p.enforce_constraints("slides", "batchUpdate", &post_method(), &mut params, &None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn protect_copy_still_enforces_body_constraints() {
+        let p = protect_policy();
+        // Copy should still check body constraints (parents)
+        let mut params = serde_json::Map::new();
+        params.insert(
+            "fileId".to_string(),
+            serde_json::Value::String("any-file".to_string()),
+        );
+        let body = Some(serde_json::json!({
+            "parents": ["protected-folder"],
+            "name": "Copy"
+        }));
+        let result = p.enforce_constraints("drive", "copy", &post_method(), &mut params, &body);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("protected as read-only"));
     }
 
     // -- Security config tests --

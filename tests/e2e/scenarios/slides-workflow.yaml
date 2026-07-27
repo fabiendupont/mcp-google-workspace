@@ -1,0 +1,80 @@
+name: slides-workflow
+description: "Slides: create, read, add, delete, reorder, duplicate, update, verify final state"
+prompt_file: prompts/test-slides-workflow.md
+timeout_seconds: 300
+test_folder_id: "1VkrXx3bhkQaLJEmnY_t5VxVmBETfsbY1"
+
+rubric:
+  - id: presentation_created
+    criterion: "Presentation 'Quarterly Review' exists in the test folder"
+    check: "gws_drive_list the test folder, look for 'Quarterly Review' with presentation mimeType"
+    weight: 1.0
+
+  - id: title_slide
+    criterion: "Slide 1 has title 'Quarterly Review'"
+    check: "gws_slides_read slide_number=1, verify title contains 'Quarterly Review'"
+    weight: 1.0
+
+  - id: revenue_slide_content
+    criterion: "A slide has title 'Revenue Summary' with body text mentioning $4.2M and 15% YoY"
+    check: "gws_slides_read all slides, find one with title 'Revenue Summary', verify body contains '$4.2M' and '15%'"
+    weight: 1.0
+
+  - id: speaker_notes
+    criterion: "Revenue Summary slide has speaker notes about forecast"
+    check: "gws_slides_read the revenue slide, verify speaker_notes is present and mentions 'forecast'"
+    weight: 0.5
+
+  - id: read_single_slide
+    criterion: "Model read a single slide using slide_number parameter"
+    check: "Model called gws_slides_read with slide_number parameter"
+    weight: 0.5
+
+  - id: read_markdown
+    criterion: "Model read the presentation in markdown format"
+    check: "Model called gws_slides_read with format=markdown"
+    weight: 0.5
+
+  - id: slide_added
+    criterion: "Customer Satisfaction slide exists with NPS score content"
+    check: "gws_slides_read all slides, find one with title 'Customer Satisfaction' containing 'NPS'"
+    weight: 1.0
+
+  - id: slide_deleted
+    criterion: "Challenges slide was deleted"
+    check: "gws_slides_read all slides, verify none has title 'Challenges'"
+    weight: 1.0
+
+  - id: slides_reordered
+    criterion: "Next Quarter Goals is at slide position 2"
+    check: "gws_slides_read slide_number=2, verify title is 'Next Quarter Goals'"
+    weight: 1.0
+
+  - id: slide_duplicated
+    criterion: "Revenue Summary was duplicated — two slides with 'Revenue Summary' in the title"
+    check: "gws_slides_read all slides, verify two slides have 'Revenue Summary' in their title"
+    weight: 1.0
+
+  - id: slide_updated
+    criterion: "Duplicated slide was renamed to 'Revenue Summary (Backup)'"
+    check: "gws_slides_read all slides, find one with title containing 'Backup'"
+    weight: 1.0
+
+  - id: final_slide_count
+    criterion: "Final presentation has exactly 6 slides"
+    check: "gws_slides_read, verify slide_count is 6"
+    weight: 1.0
+
+  - id: final_order
+    criterion: "Final slide order: Quarterly Review, Next Quarter Goals, Revenue Summary, Revenue Summary (Backup), Key Wins, Customer Satisfaction"
+    check: "gws_slides_read all slides, verify titles match expected order"
+    weight: 1.0
+
+  - id: data_quality
+    criterion: "Slide content has specific data (dollar amounts, percentages, metrics) not placeholder text"
+    check: "gws_slides_read multiple slides, verify body text contains concrete numbers"
+    weight: 0.5
+
+cleanup:
+  - action: trash
+    name_pattern: "Quarterly Review"

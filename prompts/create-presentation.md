@@ -1,6 +1,6 @@
 ---
 name: create-presentation
-description: Full workflow for creating a Google Slides presentation from Marp Markdown
+description: Full workflow for creating and editing Google Slides presentations
 arguments:
   - name: title
     description: Presentation title
@@ -79,6 +79,60 @@ Templates should be listed in the policy file with `"mode": "protect"` and `"acc
 - Omit `presentation_id` and provide `title` to create a new presentation (or update an existing one with the same title in the same folder).
 - Provide `presentation_id` to replace all slides in an existing presentation.
 - The response includes the `presentation_id` and a `url` to open it in Google Slides.
+
+## Reading presentations
+
+Use `gws_slides_read` to inspect an existing presentation:
+
+```json
+{"name": "gws_slides_read", "arguments": {"presentation_id": "PRES_ID"}}
+```
+
+Returns each slide's title, body, speaker notes, layout name, and structural hints (has_bullets, has_table, has_image, has_code).
+
+For a Marp-formatted view: `{"presentation_id": "PRES_ID", "format": "markdown"}`.
+For a single slide: `{"presentation_id": "PRES_ID", "slide_number": 3}`.
+
+## Editing slides
+
+### Update slide content
+
+Use `gws_slides_update` to replace a slide's title, body, or notes without recreating it:
+
+```json
+{"name": "gws_slides_update", "arguments": {
+  "presentation_id": "PRES_ID",
+  "slide_number": 2,
+  "title": "Updated Revenue Summary",
+  "body": "- Total revenue: **$5.1M** (up 21% YoY)\n- Enterprise: $3.4M\n- SMB: $1.7M"
+}}
+```
+
+The `body` param accepts Marp-formatted text (bullets, bold, code blocks). Do not include `# Heading` in body — use `title` for that.
+
+### Duplicate a slide
+
+```json
+{"name": "gws_slides_duplicate", "arguments": {
+  "presentation_id": "PRES_ID",
+  "slide_number": 3,
+  "position": 5
+}}
+```
+
+### Add, delete, reorder
+
+- `gws_slides_add` — Add a single slide from Marp Markdown at a position
+- `gws_slides_delete` — Delete slides by number: `{"slide_numbers": [2, 4]}`
+- `gws_slides_reorder` — Move slides: `{"slide_numbers": [5], "position": 2}`
+
+All mutation tools return the updated slide list with titles and positions.
+
+## Read → Modify → Verify workflow
+
+1. `gws_slides_read` — understand current state
+2. `gws_slides_update` / `gws_slides_add` / `gws_slides_delete` / `gws_slides_reorder` — make changes
+3. `gws_slides_read` — verify the result
 
 ## Image workflow
 
