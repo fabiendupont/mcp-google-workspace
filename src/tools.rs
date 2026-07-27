@@ -123,10 +123,10 @@ pub async fn build_tools_list(
             )
         };
 
-        if policy.compact_schemas {
-            if let Some(hints) = method_hints(svc_name) {
-                description.push_str(&format!(". Common: {hints}"));
-            }
+        if policy.compact_schemas
+            && let Some(hints) = method_hints(svc_name)
+        {
+            description.push_str(&format!(". Common: {hints}"));
         }
 
         let annotations = ToolAnnotations::new()
@@ -349,11 +349,20 @@ pub async fn build_tools_list(
     // Lazy mode: filter to meta tools + helpers for activated services
     let meta_tools = ["gws_discover", "gws_batch"];
     let service_for_tool = |name: &str| -> Option<&str> {
-        if name.starts_with("gws_drive_") { Some("drive") }
-        else if name.starts_with("gws_docs_") { Some("docs") }
-        else if name.starts_with("gws_sheets_") { Some("sheets") }
-        else if name.starts_with("gws_slides_") || name == "gws_templates" || name == "gws_generate_image" { Some("slides") }
-        else { None }
+        if name.starts_with("gws_drive_") {
+            Some("drive")
+        } else if name.starts_with("gws_docs_") {
+            Some("docs")
+        } else if name.starts_with("gws_sheets_") {
+            Some("sheets")
+        } else if name.starts_with("gws_slides_")
+            || name == "gws_templates"
+            || name == "gws_generate_image"
+        {
+            Some("slides")
+        } else {
+            None
+        }
     };
 
     let filtered: Vec<Tool> = tools

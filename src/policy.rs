@@ -19,15 +19,11 @@ fn default_read_write() -> Access {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum ConstraintMode {
+    #[default]
     Restrict,
     Protect,
-}
-
-impl Default for ConstraintMode {
-    fn default() -> Self {
-        ConstraintMode::Restrict
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -205,10 +201,11 @@ impl Policy {
         let mut clone = self.clone();
         if let Some(svc) = clone.services.get_mut(service) {
             for c in &mut svc.constraints {
-                if c.param == "parents" && c.mode == ConstraintMode::Restrict {
-                    if !c.values.contains(&folder_id.to_string()) {
-                        c.values.push(folder_id.to_string());
-                    }
+                if c.param == "parents"
+                    && c.mode == ConstraintMode::Restrict
+                    && !c.values.contains(&folder_id.to_string())
+                {
+                    c.values.push(folder_id.to_string());
                 }
             }
         }
@@ -560,14 +557,14 @@ impl Policy {
         protect_ro_values: &[&str],
         params: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<(), GwsError> {
-        if let Some(serde_json::Value::String(value)) = params.get(param) {
-            if protect_ro_values.contains(&value.as_str()) {
-                return Err(GwsError::Validation(format!(
-                    "'{param}' value '{value}' is protected as read-only; write operations \
+        if let Some(serde_json::Value::String(value)) = params.get(param)
+            && protect_ro_values.contains(&value.as_str())
+        {
+            return Err(GwsError::Validation(format!(
+                "'{param}' value '{value}' is protected as read-only; write operations \
                      are not allowed. \
                      Fix: change its access to \"read-write\" or remove the protect constraint"
-                )));
-            }
+            )));
         }
         Ok(())
     }
@@ -1332,7 +1329,12 @@ mod tests {
         }));
         let result = p.enforce_constraints("drive", "copy", &post_method(), &mut params, &body);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("protected as read-only"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("protected as read-only")
+        );
     }
 
     // -- Security config tests --

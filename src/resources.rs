@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use google_workspace::discovery::{RestDescription, RestResource};
-use rmcp::model::{AnnotateAble, RawResource, RawResourceTemplate, ResourceTemplate};
+use rmcp::model::{AnnotateAble, RawResourceTemplate, ResourceTemplate};
 
 use crate::policy::Policy;
 
@@ -68,23 +68,22 @@ fn collect_templates(
             format!("{prefix}.{name}")
         };
 
-        if let Some(get_method) = resource.methods.get("get") {
-            if let Some(id_param) = get_method
+        if let Some(get_method) = resource.methods.get("get")
+            && let Some(id_param) = get_method
                 .parameters
                 .iter()
                 .find(|(_, p)| p.required && p.location.as_deref() == Some("path"))
                 .map(|(n, _)| n.as_str())
-            {
-                let uri_template = format!("gws://{service}/{resource_path}/{{{id_param}}}");
-                let description = get_method.description.as_deref().unwrap_or("").to_string();
+        {
+            let uri_template = format!("gws://{service}/{resource_path}/{{{id_param}}}");
+            let description = get_method.description.as_deref().unwrap_or("").to_string();
 
-                let template = RawResourceTemplate::new(&uri_template, &resource_path)
-                    .with_description(format!("{service}.{resource_path}.get: {description}"))
-                    .with_mime_type("application/json")
-                    .no_annotation();
+            let template = RawResourceTemplate::new(&uri_template, &resource_path)
+                .with_description(format!("{service}.{resource_path}.get: {description}"))
+                .with_mime_type("application/json")
+                .no_annotation();
 
-                out.push(template);
-            }
+            out.push(template);
         }
 
         if !resource.resources.is_empty() {

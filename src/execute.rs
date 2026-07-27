@@ -72,9 +72,18 @@ static FIELD_DEFAULTS: LazyLock<HashMap<(&str, &str, &str), &str>> = LazyLock::n
     m.insert(("calendar", "events", "get"), "id,summary,description,start,end,status,location,organizer,attendees,conferenceData,htmlLink");
     // Sheets
     m.insert(("sheets", "spreadsheets", "get"), "spreadsheetId,properties(title),sheets(properties(sheetId,title,index),data(rowData(values(formattedValue))))");
-    m.insert(("sheets", "spreadsheets.values", "get"), "range,values,majorDimension");
-    m.insert(("sheets", "spreadsheets.values", "update"), "updatedRange,updatedRows,updatedColumns,updatedCells");
-    m.insert(("sheets", "spreadsheets.values", "append"), "updates(updatedRange,updatedRows,updatedColumns,updatedCells)");
+    m.insert(
+        ("sheets", "spreadsheets.values", "get"),
+        "range,values,majorDimension",
+    );
+    m.insert(
+        ("sheets", "spreadsheets.values", "update"),
+        "updatedRange,updatedRows,updatedColumns,updatedCells",
+    );
+    m.insert(
+        ("sheets", "spreadsheets.values", "append"),
+        "updates(updatedRange,updatedRows,updatedColumns,updatedCells)",
+    );
     m
 });
 

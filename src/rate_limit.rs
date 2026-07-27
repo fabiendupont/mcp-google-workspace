@@ -67,10 +67,7 @@ fn default_limits() -> HashMap<String, u32> {
 }
 
 impl ServiceRateLimiter {
-    pub fn new(
-        global_fallback: Option<u32>,
-        overrides: Option<HashMap<String, u32>>,
-    ) -> Arc<Self> {
+    pub fn new(global_fallback: Option<u32>, overrides: Option<HashMap<String, u32>>) -> Arc<Self> {
         let mut defaults = default_limits();
         if let Some(ovr) = overrides {
             for (k, v) in ovr {

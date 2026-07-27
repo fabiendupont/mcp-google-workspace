@@ -344,7 +344,7 @@ fn parse_slide_body(content: &str) -> (Option<String>, Vec<SlideBlock>) {
     let flush_list = |items: &mut Vec<ListItem>, blocks: &mut Vec<SlideBlock>, ordered: bool| {
         if !items.is_empty() {
             blocks.push(SlideBlock::BulletList {
-                items: items.drain(..).collect(),
+                items: std::mem::take(items),
                 ordered,
             });
         }

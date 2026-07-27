@@ -109,11 +109,12 @@ async fn handle_tool_call_inner_concurrent(
     if tool_name == "gws_discover" {
         let mut st = state.lock().await;
         // Activate service for lazy tool discovery
-        if let Some(svc) = arguments.get("service").and_then(|v| v.as_str()) {
-            if !st.eager_tools && st.activated_services.insert(svc.to_string()) {
-                st.tools = None; // Force rebuild on next list_tools
-                tracing::info!(service = svc, "Lazy discovery: service activated");
-            }
+        if let Some(svc) = arguments.get("service").and_then(|v| v.as_str())
+            && !st.eager_tools
+            && st.activated_services.insert(svc.to_string())
+        {
+            st.tools = None; // Force rebuild on next list_tools
+            tracing::info!(service = svc, "Lazy discovery: service activated");
         }
         let result = tools::handle_discover(arguments, policy, &mut st.docs).await?;
         return Ok(result);
@@ -456,10 +457,10 @@ async fn format_execute_result(
     resource_path: &str,
     method_name: &str,
     arguments: &Value,
-    doc: &RestDescription,
-    policy: &Policy,
-    meta: &RequestMeta,
-    tc: &mut Option<crate::auth::TokenCache>,
+    _doc: &RestDescription,
+    _policy: &Policy,
+    _meta: &RequestMeta,
+    _tc: &mut Option<crate::auth::TokenCache>,
     state: &mut ServerState,
 ) -> Result<Value, GwsError> {
     if result.get("_mcp_content").is_some() {
@@ -605,9 +606,21 @@ async fn is_descendant_of(
         }
         let args = json!({"params": {"fileId": current}, "fields": "parents"});
         match crate::execute::execute_tool(
-            &drive_doc, get_method, "files", "get", &args, "drive",
-            policy, meta, None, None, false, &mut state.token_cache,
-        ).await {
+            &drive_doc,
+            get_method,
+            "files",
+            "get",
+            &args,
+            "drive",
+            policy,
+            meta,
+            None,
+            None,
+            false,
+            &mut state.token_cache,
+        )
+        .await
+        {
             Ok(result) => {
                 let parent = result
                     .get("parents")
@@ -1837,26 +1850,25 @@ async fn revoke_image_sharing(
     meta: &RequestMeta,
     state: &mut ServerState,
 ) {
-    if let Ok(drive_doc) = state.get_doc("drive").await {
-        if let Some(resource) = tools::find_resource(&drive_doc.resources, "permissions") {
-            if let Some(delete_method) = resource.methods.get("delete") {
-                let _ = crate::execute::execute_tool(
-                    &drive_doc,
-                    delete_method,
-                    "permissions",
-                    "delete",
-                    &json!({"params": {"fileId": file_id, "permissionId": permission_id}}),
-                    "drive",
-                    policy,
-                    meta,
-                    None,
-                    None,
-                    false,
-                    &mut state.token_cache,
-                )
-                .await;
-            }
-        }
+    if let Ok(drive_doc) = state.get_doc("drive").await
+        && let Some(resource) = tools::find_resource(&drive_doc.resources, "permissions")
+        && let Some(delete_method) = resource.methods.get("delete")
+    {
+        let _ = crate::execute::execute_tool(
+            &drive_doc,
+            delete_method,
+            "permissions",
+            "delete",
+            &json!({"params": {"fileId": file_id, "permissionId": permission_id}}),
+            "drive",
+            policy,
+            meta,
+            None,
+            None,
+            false,
+            &mut state.token_cache,
+        )
+        .await;
     }
 }
 
@@ -1878,10 +1890,10 @@ fn shift_request_indexes(requests: &[Value], shift: i32) -> Vec<Value> {
                 "/createParagraphBullets/range/startIndex",
                 "/createParagraphBullets/range/endIndex",
             ] {
-                if let Some(idx) = r.pointer_mut(path) {
-                    if let Some(v) = idx.as_i64() {
-                        *idx = json!(v + shift as i64);
-                    }
+                if let Some(idx) = r.pointer_mut(path)
+                    && let Some(v) = idx.as_i64()
+                {
+                    *idx = json!(v + shift as i64);
                 }
             }
             r
@@ -2343,10 +2355,20 @@ async fn execute_docs_write(
                         "body": { "requests": chunk }
                     });
                     result = crate::execute::execute_tool(
-                        &docs_doc, batch_method, "documents", "batchUpdate",
-                        &chunk_args, "docs", policy, meta, None, None, dry_run,
+                        &docs_doc,
+                        batch_method,
+                        "documents",
+                        "batchUpdate",
+                        &chunk_args,
+                        "docs",
+                        policy,
+                        meta,
+                        None,
+                        None,
+                        dry_run,
                         &mut state.token_cache,
-                    ).await;
+                    )
+                    .await;
                     match &result {
                         Ok(r) if check_api_result(r).is_err() => break,
                         Err(_) => break,
@@ -2363,49 +2385,49 @@ async fn execute_docs_write(
         }
 
         // Populate table cells after inserting the table
-        if let Some(data) = table_data {
-            if !dry_run {
-                let doc_now = crate::execute::execute_tool(
-                    &docs_doc,
-                    get_method,
-                    "documents",
-                    "get",
-                    &json!({"params": {"documentId": &doc_id}}),
-                    "docs",
-                    policy,
-                    meta,
-                    None,
-                    None,
-                    false,
-                    &mut state.token_cache,
-                )
-                .await?;
-                let rows: Vec<Vec<String>> = data
-                    .get("rows")
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-                    .unwrap_or_default();
-                let is_header = data
-                    .get("header")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                if !rows.is_empty() {
-                    let (headers, data_rows) = if is_header && rows.len() > 1 {
-                        (Some(rows[0].clone()), rows[1..].to_vec())
-                    } else {
-                        (None, rows)
-                    };
-                    let populate_reqs = helpers::build_table_populate_requests(
-                        &doc_now,
-                        headers.as_deref(),
-                        &data_rows,
-                    );
-                    if !populate_reqs.is_empty() {
-                        let _ = crate::execute::execute_tool(
+        if let Some(data) = table_data
+            && !dry_run
+        {
+            let doc_now = crate::execute::execute_tool(
+                &docs_doc,
+                get_method,
+                "documents",
+                "get",
+                &json!({"params": {"documentId": &doc_id}}),
+                "docs",
+                policy,
+                meta,
+                None,
+                None,
+                false,
+                &mut state.token_cache,
+            )
+            .await?;
+            let rows: Vec<Vec<String>> = data
+                .get("rows")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            let is_header = data
+                .get("header")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !rows.is_empty() {
+                let (headers, data_rows) = if is_header && rows.len() > 1 {
+                    (Some(rows[0].clone()), rows[1..].to_vec())
+                } else {
+                    (None, rows)
+                };
+                let populate_reqs = helpers::build_table_populate_requests(
+                    &doc_now,
+                    headers.as_deref(),
+                    &data_rows,
+                );
+                if !populate_reqs.is_empty() {
+                    let _ = crate::execute::execute_tool(
                             &docs_doc, batch_method, "documents", "batchUpdate",
                             &json!({"params": {"documentId": doc_id}, "body": {"requests": populate_reqs}}),
                             "docs", policy, meta, None, None, false, &mut state.token_cache,
                         ).await;
-                    }
                 }
             }
         }
@@ -2416,30 +2438,29 @@ async fn execute_docs_write(
         Err(_) => true,
     };
 
-    if failed && created_new_doc {
-        if let Ok(drive_doc) = state.get_doc("drive").await {
-            if let Some(resource) = tools::find_resource(&drive_doc.resources, "files") {
-                if let Some(delete_method) = resource.methods.get("delete") {
-                    let args = json!({"params": {"fileId": &doc_id}});
-                    let _ = crate::execute::execute_tool(
-                        &drive_doc,
-                        delete_method,
-                        "files",
-                        "delete",
-                        &args,
-                        "drive",
-                        policy,
-                        meta,
-                        None,
-                        None,
-                        false,
-                        &mut state.token_cache,
-                    )
-                    .await;
-                    tracing::info!(doc_id = %doc_id, "Cleaned up empty doc after failed write");
-                }
-            }
-        }
+    if failed
+        && created_new_doc
+        && let Ok(drive_doc) = state.get_doc("drive").await
+        && let Some(resource) = tools::find_resource(&drive_doc.resources, "files")
+        && let Some(delete_method) = resource.methods.get("delete")
+    {
+        let args = json!({"params": {"fileId": &doc_id}});
+        let _ = crate::execute::execute_tool(
+            &drive_doc,
+            delete_method,
+            "files",
+            "delete",
+            &args,
+            "drive",
+            policy,
+            meta,
+            None,
+            None,
+            false,
+            &mut state.token_cache,
+        )
+        .await;
+        tracing::info!(doc_id = %doc_id, "Cleaned up empty doc after failed write");
     }
 
     let result = match result {
@@ -2493,10 +2514,10 @@ async fn execute_list_templates(
     let mut templates: Vec<Value> = Vec::new();
 
     for t in policy.templates() {
-        if let Some(filter) = name_filter {
-            if !t.name.to_lowercase().contains(&filter.to_lowercase()) {
-                continue;
-            }
+        if let Some(filter) = name_filter
+            && !t.name.to_lowercase().contains(&filter.to_lowercase())
+        {
+            continue;
         }
 
         let mut entry = json!({
@@ -2506,72 +2527,68 @@ async fn execute_list_templates(
         if let Some(ref desc) = t.description {
             entry["description"] = json!(desc);
         }
-        if let Ok(slides_doc) = state.get_doc("slides").await {
-            if let Some(pres_resource) =
+        if let Ok(slides_doc) = state.get_doc("slides").await
+            && let Some(pres_resource) =
                 tools::find_resource(&slides_doc.resources, "presentations")
+            && let Some(get_method) = pres_resource.methods.get("get")
+        {
+            let args = json!({ "params": { "presentationId": &t.id } });
+            let mut tc = state.token_cache.take();
+            if let Ok(pres_data) = crate::execute::execute_tool(
+                &slides_doc,
+                get_method,
+                "presentations",
+                "get",
+                &args,
+                "slides",
+                policy,
+                meta,
+                None,
+                None,
+                false,
+                &mut tc,
+            )
+            .await
             {
-                if let Some(get_method) = pres_resource.methods.get("get") {
-                    let args = json!({ "params": { "presentationId": &t.id } });
-                    let mut tc = state.token_cache.take();
-                    if let Ok(pres_data) = crate::execute::execute_tool(
-                        &slides_doc,
-                        get_method,
-                        "presentations",
-                        "get",
-                        &args,
-                        "slides",
-                        policy,
-                        meta,
-                        None,
-                        None,
-                        false,
-                        &mut tc,
-                    )
-                    .await
-                    {
-                        let raw_layouts = pres_data
-                            .get("layouts")
-                            .and_then(|l| l.as_array())
-                            .cloned()
-                            .unwrap_or_default();
+                let raw_layouts = pres_data
+                    .get("layouts")
+                    .and_then(|l| l.as_array())
+                    .cloned()
+                    .unwrap_or_default();
 
-                        let active_master = pres_data
-                            .get("slides")
-                            .and_then(|s| s.as_array())
-                            .and_then(|slides| slides.last())
-                            .and_then(|s| s.get("slideProperties"))
-                            .and_then(|sp| sp.get("masterObjectId"))
-                            .and_then(|m| m.as_str())
-                            .unwrap_or("");
+                let active_master = pres_data
+                    .get("slides")
+                    .and_then(|s| s.as_array())
+                    .and_then(|slides| slides.last())
+                    .and_then(|s| s.get("slideProperties"))
+                    .and_then(|sp| sp.get("masterObjectId"))
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("");
 
-                        let mut seen = std::collections::HashSet::new();
-                        let mut layout_details = Vec::new();
-                        for layout in &raw_layouts {
-                            let master = layout
-                                .get("layoutProperties")
-                                .and_then(|lp| lp.get("masterObjectId"))
-                                .and_then(|m| m.as_str())
-                                .unwrap_or("");
-                            if !active_master.is_empty() && master != active_master {
-                                continue;
-                            }
-                            let name = layout
-                                .get("layoutProperties")
-                                .and_then(|lp| lp.get("displayName"))
-                                .and_then(|dn| dn.as_str())
-                                .unwrap_or("");
-                            if name.is_empty() || !seen.insert(name.to_string()) {
-                                continue;
-                            }
-                            layout_details.push(
-                                crate::slides_helpers::extract_layout_details(layout),
-                            );
-                        }
-                        entry["layouts"] = json!(layout_details);
+                let mut seen = std::collections::HashSet::new();
+                let mut layout_details = Vec::new();
+                for layout in &raw_layouts {
+                    let master = layout
+                        .get("layoutProperties")
+                        .and_then(|lp| lp.get("masterObjectId"))
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("");
+                    if !active_master.is_empty() && master != active_master {
+                        continue;
                     }
-                    state.token_cache = tc;
+                    let name = layout
+                        .get("layoutProperties")
+                        .and_then(|lp| lp.get("displayName"))
+                        .and_then(|dn| dn.as_str())
+                        .unwrap_or("");
+                    if name.is_empty() || !seen.insert(name.to_string()) {
+                        continue;
+                    }
+                    layout_details.push(crate::slides_helpers::extract_layout_details(layout));
                 }
+                entry["layouts"] = json!(layout_details);
             }
+            state.token_cache = tc;
         }
         templates.push(entry);
     }
@@ -2620,13 +2637,28 @@ async fn execute_sheets_helper(
                     if let Some(gm) = res.methods.get("get") {
                         let args = json!({"params": {"fileId": id}, "fields": "mimeType"});
                         if let Ok(meta_result) = crate::execute::execute_tool(
-                            &drive_doc, gm, "files", "get", &args, "drive",
-                            policy, meta, None, None, false, &mut state.token_cache,
-                        ).await {
+                            &drive_doc,
+                            gm,
+                            "files",
+                            "get",
+                            &args,
+                            "drive",
+                            policy,
+                            meta,
+                            None,
+                            None,
+                            false,
+                            &mut state.token_cache,
+                        )
+                        .await
+                        {
                             if meta_result["mimeType"].as_str()
                                 == Some("application/vnd.google-apps.folder")
                             {
-                                tracing::info!(provided_id = id, "spreadsheet_id is a folder — treating as folder_id");
+                                tracing::info!(
+                                    provided_id = id,
+                                    "spreadsheet_id is a folder — treating as folder_id"
+                                );
                                 folder_id = Some(id.to_string());
                                 None
                             } else {
@@ -2635,9 +2667,15 @@ async fn execute_sheets_helper(
                         } else {
                             Some(id)
                         }
-                    } else { Some(id) }
-                } else { Some(id) }
-            } else { Some(id) }
+                    } else {
+                        Some(id)
+                    }
+                } else {
+                    Some(id)
+                }
+            } else {
+                Some(id)
+            }
         } else {
             Some(id)
         }
@@ -2651,7 +2689,8 @@ async fn execute_sheets_helper(
         if spreadsheet_id_opt.is_none() {
             return Err(GwsError::Validation(
                 "Missing 'spreadsheet_id'. Pass the Google Sheets spreadsheet ID \
-                 (the long string from the spreadsheet URL).".into()
+                 (the long string from the spreadsheet URL)."
+                    .into(),
             ));
         }
         crate::sheets_helpers::validate_spreadsheet_id(spreadsheet_id_opt.unwrap())
@@ -2678,8 +2717,10 @@ async fn execute_sheets_helper(
 
             let effective_policy = policy_for_folder(folder_id, policy, meta, state).await?;
             let drive_doc = state.get_doc("drive").await?;
-            let files_resource = tools::find_resource(&drive_doc.resources, "files")
-                .ok_or_else(|| GwsError::Validation("files resource not found in drive API".into()))?;
+            let files_resource =
+                tools::find_resource(&drive_doc.resources, "files").ok_or_else(|| {
+                    GwsError::Validation("files resource not found in drive API".into())
+                })?;
             let create_method = files_resource
                 .methods
                 .get("create")
@@ -2692,10 +2733,20 @@ async fn execute_sheets_helper(
                 body["parents"] = json!([fid]);
             }
             let created = crate::execute::execute_tool(
-                &drive_doc, create_method, "files", "create",
-                &json!({"body": body}), "drive", &effective_policy, meta, None, None, false,
+                &drive_doc,
+                create_method,
+                "files",
+                "create",
+                &json!({"body": body}),
+                "drive",
+                &effective_policy,
+                meta,
+                None,
+                None,
+                false,
                 &mut state.token_cache,
-            ).await?;
+            )
+            .await?;
 
             let new_id = created.get("id").and_then(|v| v.as_str()).unwrap_or("");
             let url = format!("https://docs.google.com/spreadsheets/d/{new_id}/edit");
@@ -2706,10 +2757,9 @@ async fn execute_sheets_helper(
 
             if !new_id.is_empty() && normalized_data.is_array() {
                 let values_resource =
-                    tools::find_resource(&sheets_doc.resources, "spreadsheets.values")
-                        .ok_or_else(|| {
-                            GwsError::Validation("spreadsheets.values resource not found".into())
-                        })?;
+                    tools::find_resource(&sheets_doc.resources, "spreadsheets.values").ok_or_else(
+                        || GwsError::Validation("spreadsheets.values resource not found".into()),
+                    )?;
                 let update_method = values_resource
                     .methods
                     .get("update")
@@ -2724,19 +2774,41 @@ async fn execute_sheets_helper(
                     "body": { "range": full_range, "values": normalized_data }
                 });
                 let mut write_result = crate::execute::execute_tool(
-                    &sheets_doc, update_method, "spreadsheets.values", "update",
-                    &write_args, "sheets", policy, meta, None, None, false,
+                    &sheets_doc,
+                    update_method,
+                    "spreadsheets.values",
+                    "update",
+                    &write_args,
+                    "sheets",
+                    policy,
+                    meta,
+                    None,
+                    None,
+                    false,
                     &mut state.token_cache,
-                ).await?;
+                )
+                .await?;
 
                 if write_result.get("updatedRows").is_none() {
-                    tracing::info!("sheets create-on-write: first write returned no updatedRows, retrying after 1s");
+                    tracing::info!(
+                        "sheets create-on-write: first write returned no updatedRows, retrying after 1s"
+                    );
                     tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
                     write_result = crate::execute::execute_tool(
-                        &sheets_doc, update_method, "spreadsheets.values", "update",
-                        &write_args, "sheets", policy, meta, None, None, false,
+                        &sheets_doc,
+                        update_method,
+                        "spreadsheets.values",
+                        "update",
+                        &write_args,
+                        "sheets",
+                        policy,
+                        meta,
+                        None,
+                        None,
+                        false,
                         &mut state.token_cache,
-                    ).await?;
+                    )
+                    .await?;
                 }
 
                 tracing::info!(
@@ -2784,7 +2856,10 @@ async fn execute_sheets_helper(
                 _ => "FORMATTED_VALUE",
             };
 
-            if let Some(cached) = state.sheet_cache.get(spreadsheet_id, &full_range, render_option) {
+            if let Some(cached) = state
+                .sheet_cache
+                .get(spreadsheet_id, &full_range, render_option)
+            {
                 tracing::debug!(spreadsheet_id, range = %full_range, "sheets cache hit");
                 let result = cached.clone();
                 return Ok(json!({
@@ -2794,10 +2869,10 @@ async fn execute_sheets_helper(
                 }));
             }
 
-            let values_resource = tools::find_resource(&sheets_doc.resources, "spreadsheets.values")
-                .ok_or_else(|| {
-                    GwsError::Validation("spreadsheets.values resource not found".into())
-                })?;
+            let values_resource =
+                tools::find_resource(&sheets_doc.resources, "spreadsheets.values").ok_or_else(
+                    || GwsError::Validation("spreadsheets.values resource not found".into()),
+                )?;
             let get_method = values_resource
                 .methods
                 .get("get")
@@ -2821,7 +2896,9 @@ async fn execute_sheets_helper(
             )
             .await?;
 
-            state.sheet_cache.put(spreadsheet_id, &full_range, render_option, result.clone());
+            state
+                .sheet_cache
+                .put(spreadsheet_id, &full_range, render_option, result.clone());
 
             Ok(json!({
                 "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
@@ -2843,10 +2920,10 @@ async fn execute_sheets_helper(
                 ))?;
             let normalized_data = crate::sheets_helpers::normalize_data(data);
             let sheet = arguments.get("sheet").and_then(|v| v.as_str());
-            let values_resource = tools::find_resource(&sheets_doc.resources, "spreadsheets.values")
-                .ok_or_else(|| {
-                    GwsError::Validation("spreadsheets.values resource not found".into())
-                })?;
+            let values_resource =
+                tools::find_resource(&sheets_doc.resources, "spreadsheets.values").ok_or_else(
+                    || GwsError::Validation("spreadsheets.values resource not found".into()),
+                )?;
             let update_method = values_resource
                 .methods
                 .get("update")
@@ -2887,10 +2964,10 @@ async fn execute_sheets_helper(
                 .get("data")
                 .ok_or_else(|| GwsError::Validation("Missing 'data'".into()))?;
             let sheet = arguments.get("sheet").and_then(|v| v.as_str());
-            let values_resource = tools::find_resource(&sheets_doc.resources, "spreadsheets.values")
-                .ok_or_else(|| {
-                    GwsError::Validation("spreadsheets.values resource not found".into())
-                })?;
+            let values_resource =
+                tools::find_resource(&sheets_doc.resources, "spreadsheets.values").ok_or_else(
+                    || GwsError::Validation("spreadsheets.values resource not found".into()),
+                )?;
             let append_method = values_resource
                 .methods
                 .get("append")
@@ -2923,10 +3000,8 @@ async fn execute_sheets_helper(
 
         "gws_sheets_info" => {
             let spreadsheet_id = spreadsheet_id_opt.unwrap();
-            let spreadsheets_resource =
-                tools::find_resource(&sheets_doc.resources, "spreadsheets").ok_or_else(|| {
-                    GwsError::Validation("spreadsheets resource not found".into())
-                })?;
+            let spreadsheets_resource = tools::find_resource(&sheets_doc.resources, "spreadsheets")
+                .ok_or_else(|| GwsError::Validation("spreadsheets resource not found".into()))?;
             let get_method = spreadsheets_resource
                 .methods
                 .get("get")
@@ -2963,10 +3038,10 @@ async fn execute_sheets_helper(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| GwsError::Validation("Missing 'range'".into()))?;
             let sheet = arguments.get("sheet").and_then(|v| v.as_str());
-            let values_resource = tools::find_resource(&sheets_doc.resources, "spreadsheets.values")
-                .ok_or_else(|| {
-                    GwsError::Validation("spreadsheets.values resource not found".into())
-                })?;
+            let values_resource =
+                tools::find_resource(&sheets_doc.resources, "spreadsheets.values").ok_or_else(
+                    || GwsError::Validation("spreadsheets.values resource not found".into()),
+                )?;
             let clear_method = values_resource
                 .methods
                 .get("clear")
@@ -3007,10 +3082,8 @@ async fn execute_sheets_helper(
             let sheet_id = arguments.get("sheet_id").and_then(|v| v.as_i64());
             let batch_args = crate::sheets_helpers::build_tab_request(action, title, sheet_id)
                 .map_err(GwsError::Validation)?;
-            let spreadsheets_resource =
-                tools::find_resource(&sheets_doc.resources, "spreadsheets").ok_or_else(|| {
-                    GwsError::Validation("spreadsheets resource not found".into())
-                })?;
+            let spreadsheets_resource = tools::find_resource(&sheets_doc.resources, "spreadsheets")
+                .ok_or_else(|| GwsError::Validation("spreadsheets resource not found".into()))?;
             let batch_method = spreadsheets_resource
                 .methods
                 .get("batchUpdate")
@@ -3039,9 +3112,14 @@ async fn execute_sheets_helper(
             }))
         }
 
-        "gws_sheets_format" | "gws_sheets_validate" | "gws_sheets_named_range" | "gws_sheets_dimensions" => {
+        "gws_sheets_format"
+        | "gws_sheets_validate"
+        | "gws_sheets_named_range"
+        | "gws_sheets_dimensions" => {
             let spreadsheet_id = spreadsheet_id_opt.unwrap();
-            let action = arguments.get("action").and_then(|v| v.as_str())
+            let action = arguments
+                .get("action")
+                .and_then(|v| v.as_str())
                 .ok_or_else(|| GwsError::Validation("Missing 'action'".into()))?;
             let mut sheet_id = arguments.get("sheet_id").and_then(|v| v.as_i64());
             let sheet_name = arguments.get("sheet").and_then(|v| v.as_str());
@@ -3049,20 +3127,28 @@ async fn execute_sheets_helper(
             // Resolve sheet name to sheet_id if not provided
             if sheet_id.is_none() {
                 if let Some(name) = sheet_name {
-                    let spreadsheets_resource = tools::find_resource(&sheets_doc.resources, "spreadsheets")
-                        .ok_or_else(|| GwsError::Validation("spreadsheets resource not found".into()))?;
-                    let get_method = spreadsheets_resource.methods.get("get")
+                    let spreadsheets_resource =
+                        tools::find_resource(&sheets_doc.resources, "spreadsheets").ok_or_else(
+                            || GwsError::Validation("spreadsheets resource not found".into()),
+                        )?;
+                    let get_method = spreadsheets_resource
+                        .methods
+                        .get("get")
                         .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
                     let meta_result = crate::execute::execute_tool(
                         &sheets_doc, get_method, "spreadsheets", "get",
                         &json!({"params": {"spreadsheetId": spreadsheet_id}, "fields": "sheets(properties(sheetId,title))"}),
                         "sheets", policy, meta, None, None, false, &mut state.token_cache,
                     ).await?;
-                    sheet_id = meta_result.get("sheets")
+                    sheet_id = meta_result
+                        .get("sheets")
                         .and_then(|v| v.as_array())
-                        .and_then(|sheets| sheets.iter().find(|s| {
-                            s.pointer("/properties/title").and_then(|t| t.as_str()) == Some(name)
-                        }))
+                        .and_then(|sheets| {
+                            sheets.iter().find(|s| {
+                                s.pointer("/properties/title").and_then(|t| t.as_str())
+                                    == Some(name)
+                            })
+                        })
                         .and_then(|s| s.pointer("/properties/sheetId"))
                         .and_then(|v| v.as_i64());
                     if sheet_id.is_none() {
@@ -3088,9 +3174,13 @@ async fn execute_sheets_helper(
 
             // List actions: read from spreadsheet metadata
             if action == "list" {
-                let spreadsheets_resource = tools::find_resource(&sheets_doc.resources, "spreadsheets")
-                    .ok_or_else(|| GwsError::Validation("spreadsheets resource not found".into()))?;
-                let get_method = spreadsheets_resource.methods.get("get")
+                let spreadsheets_resource =
+                    tools::find_resource(&sheets_doc.resources, "spreadsheets").ok_or_else(
+                        || GwsError::Validation("spreadsheets resource not found".into()),
+                    )?;
+                let get_method = spreadsheets_resource
+                    .methods
+                    .get("get")
                     .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
                 let fields = match tool_name {
                     "gws_sheets_format" => "sheets(conditionalFormats)",
@@ -3100,10 +3190,20 @@ async fn execute_sheets_helper(
                 };
                 let args = json!({"params": {"spreadsheetId": spreadsheet_id}, "fields": fields});
                 let result = crate::execute::execute_tool(
-                    &sheets_doc, get_method, "spreadsheets", "get",
-                    &args, "sheets", policy, meta, None, None, false,
+                    &sheets_doc,
+                    get_method,
+                    "spreadsheets",
+                    "get",
+                    &args,
+                    "sheets",
+                    policy,
+                    meta,
+                    None,
+                    None,
+                    false,
                     &mut state.token_cache,
-                ).await?;
+                )
+                .await?;
                 return Ok(json!({
                     "content": [{"type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default()}],
                     "structuredContent": result,
@@ -3113,10 +3213,15 @@ async fn execute_sheets_helper(
 
             // Read action for named ranges
             if tool_name == "gws_sheets_named_range" && action == "read" {
-                let n = name.ok_or_else(|| GwsError::Validation("Missing 'name' for read".into()))?;
-                let spreadsheets_resource = tools::find_resource(&sheets_doc.resources, "spreadsheets")
-                    .ok_or_else(|| GwsError::Validation("spreadsheets resource not found".into()))?;
-                let get_method = spreadsheets_resource.methods.get("get")
+                let n =
+                    name.ok_or_else(|| GwsError::Validation("Missing 'name' for read".into()))?;
+                let spreadsheets_resource =
+                    tools::find_resource(&sheets_doc.resources, "spreadsheets").ok_or_else(
+                        || GwsError::Validation("spreadsheets resource not found".into()),
+                    )?;
+                let get_method = spreadsheets_resource
+                    .methods
+                    .get("get")
                     .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
                 let meta_result = crate::execute::execute_tool(
                     &sheets_doc, get_method, "spreadsheets", "get",
@@ -3125,7 +3230,10 @@ async fn execute_sheets_helper(
                 ).await?;
                 // Find the named range and read its values
                 let named_ranges = meta_result.get("namedRanges").and_then(|v| v.as_array());
-                let found = named_ranges.and_then(|nrs| nrs.iter().find(|nr| nr.get("name").and_then(|v| v.as_str()) == Some(n)));
+                let found = named_ranges.and_then(|nrs| {
+                    nrs.iter()
+                        .find(|nr| nr.get("name").and_then(|v| v.as_str()) == Some(n))
+                });
                 if let Some(nr) = found {
                     let nr_range = nr.get("range");
                     let result = json!({"name": n, "namedRange": nr, "range": nr_range});
@@ -3140,24 +3248,56 @@ async fn execute_sheets_helper(
 
             // Build batchUpdate request
             let batch_args = match tool_name {
-                "gws_sheets_format" => crate::sheets_helpers::build_conditional_format_request(action, sheet_id, range, rule, index),
-                "gws_sheets_validate" => crate::sheets_helpers::build_data_validation_request(action, sheet_id, range, rule),
-                "gws_sheets_named_range" => crate::sheets_helpers::build_named_range_request(action, name, sheet_id, range, named_range_id),
-                "gws_sheets_dimensions" => crate::sheets_helpers::build_dimension_request(action, sheet_id, dimension, start, end, count, size, destination),
+                "gws_sheets_format" => crate::sheets_helpers::build_conditional_format_request(
+                    action, sheet_id, range, rule, index,
+                ),
+                "gws_sheets_validate" => crate::sheets_helpers::build_data_validation_request(
+                    action, sheet_id, range, rule,
+                ),
+                "gws_sheets_named_range" => crate::sheets_helpers::build_named_range_request(
+                    action,
+                    name,
+                    sheet_id,
+                    range,
+                    named_range_id,
+                ),
+                "gws_sheets_dimensions" => crate::sheets_helpers::build_dimension_request(
+                    action,
+                    sheet_id,
+                    dimension,
+                    start,
+                    end,
+                    count,
+                    size,
+                    destination,
+                ),
                 _ => unreachable!(),
-            }.map_err(GwsError::Validation)?;
+            }
+            .map_err(GwsError::Validation)?;
 
             let spreadsheets_resource = tools::find_resource(&sheets_doc.resources, "spreadsheets")
                 .ok_or_else(|| GwsError::Validation("spreadsheets resource not found".into()))?;
-            let batch_method = spreadsheets_resource.methods.get("batchUpdate")
+            let batch_method = spreadsheets_resource
+                .methods
+                .get("batchUpdate")
                 .ok_or_else(|| GwsError::Validation("batchUpdate method not found".into()))?;
             let mut args = batch_args;
             args["params"] = json!({"spreadsheetId": spreadsheet_id});
             let result = crate::execute::execute_tool(
-                &sheets_doc, batch_method, "spreadsheets", "batchUpdate",
-                &args, "sheets", policy, meta, None, None, false,
+                &sheets_doc,
+                batch_method,
+                "spreadsheets",
+                "batchUpdate",
+                &args,
+                "sheets",
+                policy,
+                meta,
+                None,
+                None,
+                false,
                 &mut state.token_cache,
-            ).await?;
+            )
+            .await?;
             state.sheet_cache.invalidate(spreadsheet_id);
             Ok(json!({
                 "content": [{"type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default()}],
@@ -3168,30 +3308,66 @@ async fn execute_sheets_helper(
 
         "gws_sheets_csv" => {
             let spreadsheet_id = spreadsheet_id_opt.unwrap();
-            let action = arguments.get("action").and_then(|v| v.as_str())
-                .ok_or_else(|| GwsError::Validation("Missing 'action' (export or import)".into()))?;
-            let sheet = arguments.get("sheet").and_then(|v| v.as_str()).unwrap_or("Sheet1");
-            let separator = arguments.get("separator").and_then(|v| v.as_str())
-                .and_then(|s| s.chars().next()).unwrap_or(',');
+            let action = arguments
+                .get("action")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    GwsError::Validation("Missing 'action' (export or import)".into())
+                })?;
+            let sheet = arguments
+                .get("sheet")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Sheet1");
+            let separator = arguments
+                .get("separator")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.chars().next())
+                .unwrap_or(',');
 
-            let values_resource = tools::find_resource(&sheets_doc.resources, "spreadsheets.values")
-                .ok_or_else(|| GwsError::Validation("spreadsheets.values resource not found".into()))?;
+            let values_resource =
+                tools::find_resource(&sheets_doc.resources, "spreadsheets.values").ok_or_else(
+                    || GwsError::Validation("spreadsheets.values resource not found".into()),
+                )?;
 
             if action == "export" {
-                let get_method = values_resource.methods.get("get")
+                let get_method = values_resource
+                    .methods
+                    .get("get")
                     .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
                 let full_range = crate::sheets_helpers::build_range(sheet, None);
                 let args = json!({"params": {"spreadsheetId": spreadsheet_id, "range": full_range, "valueRenderOption": "FORMATTED_VALUE"}});
                 let result = crate::execute::execute_tool(
-                    &sheets_doc, get_method, "spreadsheets.values", "get",
-                    &args, "sheets", policy, meta, None, None, false,
+                    &sheets_doc,
+                    get_method,
+                    "spreadsheets.values",
+                    "get",
+                    &args,
+                    "sheets",
+                    policy,
+                    meta,
+                    None,
+                    None,
+                    false,
                     &mut state.token_cache,
-                ).await?;
-                let values: Vec<Vec<String>> = result.get("values")
+                )
+                .await?;
+                let values: Vec<Vec<String>> = result
+                    .get("values")
                     .and_then(|v| v.as_array())
-                    .map(|rows| rows.iter().map(|row| {
-                        row.as_array().map(|cells| cells.iter().map(|c| c.as_str().unwrap_or("").to_string()).collect()).unwrap_or_default()
-                    }).collect())
+                    .map(|rows| {
+                        rows.iter()
+                            .map(|row| {
+                                row.as_array()
+                                    .map(|cells| {
+                                        cells
+                                            .iter()
+                                            .map(|c| c.as_str().unwrap_or("").to_string())
+                                            .collect()
+                                    })
+                                    .unwrap_or_default()
+                            })
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let csv = crate::sheets_helpers::values_to_csv(&values, separator);
                 Ok(json!({
@@ -3199,10 +3375,16 @@ async fn execute_sheets_helper(
                     "isError": false
                 }))
             } else if action == "import" {
-                let csv_data = arguments.get("data").and_then(|v| v.as_str())
-                    .ok_or_else(|| GwsError::Validation("Missing 'data' (CSV string) for import".into()))?;
+                let csv_data = arguments
+                    .get("data")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        GwsError::Validation("Missing 'data' (CSV string) for import".into())
+                    })?;
                 let values = crate::sheets_helpers::csv_to_values(csv_data, separator);
-                let update_method = values_resource.methods.get("update")
+                let update_method = values_resource
+                    .methods
+                    .get("update")
                     .ok_or_else(|| GwsError::Validation("update method not found".into()))?;
                 let full_range = crate::sheets_helpers::build_range(sheet, None);
                 let data_json: Vec<Value> = values.iter().map(|row| json!(row)).collect();
@@ -3211,10 +3393,20 @@ async fn execute_sheets_helper(
                     "body": {"range": full_range, "values": data_json}
                 });
                 let result = crate::execute::execute_tool(
-                    &sheets_doc, update_method, "spreadsheets.values", "update",
-                    &args, "sheets", policy, meta, None, None, false,
+                    &sheets_doc,
+                    update_method,
+                    "spreadsheets.values",
+                    "update",
+                    &args,
+                    "sheets",
+                    policy,
+                    meta,
+                    None,
+                    None,
+                    false,
                     &mut state.token_cache,
-                ).await?;
+                )
+                .await?;
                 state.sheet_cache.invalidate(spreadsheet_id);
                 Ok(json!({
                     "content": [{"type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default()}],
@@ -3222,40 +3414,77 @@ async fn execute_sheets_helper(
                     "isError": false
                 }))
             } else {
-                Err(GwsError::Validation("action must be 'export' or 'import'".into()))
+                Err(GwsError::Validation(
+                    "action must be 'export' or 'import'".into(),
+                ))
             }
         }
 
         "gws_sheets_formulas" => {
             let spreadsheet_id = spreadsheet_id_opt.unwrap();
-            let sheet = arguments.get("sheet").and_then(|v| v.as_str()).unwrap_or("Sheet1");
-            let range = arguments.get("range").and_then(|v| v.as_str()).unwrap_or(sheet);
+            let sheet = arguments
+                .get("sheet")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Sheet1");
+            let range = arguments
+                .get("range")
+                .and_then(|v| v.as_str())
+                .unwrap_or(sheet);
             let full_range = crate::sheets_helpers::build_range(range, Some(sheet));
 
-            let values_resource = tools::find_resource(&sheets_doc.resources, "spreadsheets.values")
-                .ok_or_else(|| GwsError::Validation("spreadsheets.values resource not found".into()))?;
-            let get_method = values_resource.methods.get("get")
+            let values_resource =
+                tools::find_resource(&sheets_doc.resources, "spreadsheets.values").ok_or_else(
+                    || GwsError::Validation("spreadsheets.values resource not found".into()),
+                )?;
+            let get_method = values_resource
+                .methods
+                .get("get")
                 .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
 
             // Read formulas
             let formula_args = json!({"params": {"spreadsheetId": spreadsheet_id, "range": full_range, "valueRenderOption": "FORMULA"}});
             let formula_result = crate::execute::execute_tool(
-                &sheets_doc, get_method, "spreadsheets.values", "get",
-                &formula_args, "sheets", policy, meta, None, None, false,
+                &sheets_doc,
+                get_method,
+                "spreadsheets.values",
+                "get",
+                &formula_args,
+                "sheets",
+                policy,
+                meta,
+                None,
+                None,
+                false,
                 &mut state.token_cache,
-            ).await?;
+            )
+            .await?;
 
             // Read headers
             let header_range = crate::sheets_helpers::build_range("1:1", Some(sheet));
             let header_args = json!({"params": {"spreadsheetId": spreadsheet_id, "range": header_range, "valueRenderOption": "FORMATTED_VALUE"}});
             let header_result = crate::execute::execute_tool(
-                &sheets_doc, get_method, "spreadsheets.values", "get",
-                &header_args, "sheets", policy, meta, None, None, false,
+                &sheets_doc,
+                get_method,
+                "spreadsheets.values",
+                "get",
+                &header_args,
+                "sheets",
+                policy,
+                meta,
+                None,
+                None,
+                false,
                 &mut state.token_cache,
-            ).await?;
-            let headers: Vec<String> = header_result.pointer("/values/0")
+            )
+            .await?;
+            let headers: Vec<String> = header_result
+                .pointer("/values/0")
                 .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
 
             let rows = formula_result.get("values").and_then(|v| v.as_array());
@@ -3263,28 +3492,53 @@ async fn execute_sheets_helper(
             let mut all_formulas: Vec<Value> = Vec::new();
 
             if let Some(rows) = rows {
-                let col_count = rows.iter().map(|r| r.as_array().map(|a| a.len()).unwrap_or(0)).max().unwrap_or(0);
+                let col_count = rows
+                    .iter()
+                    .map(|r| r.as_array().map(|a| a.len()).unwrap_or(0))
+                    .max()
+                    .unwrap_or(0);
                 for col_idx in 0..col_count {
                     let header = headers.get(col_idx).cloned().unwrap_or_else(|| {
                         let mut s = String::new();
                         let mut c = col_idx;
-                        loop { s.insert(0, (b'A' + (c % 26) as u8) as char); if c < 26 { break; } c = c / 26 - 1; }
+                        loop {
+                            s.insert(0, (b'A' + (c % 26) as u8) as char);
+                            if c < 26 {
+                                break;
+                            }
+                            c = c / 26 - 1;
+                        }
                         s
                     });
                     let mut formula_count = 0;
                     let mut samples = Vec::new();
                     for (row_idx, row) in rows.iter().enumerate() {
-                        if let Some(cell) = row.as_array().and_then(|a| a.get(col_idx)).and_then(|v| v.as_str()) {
-                            if cell.starts_with('=') {
-                                formula_count += 1;
-                                let cell_ref = format!("{}{}", {
+                        if let Some(cell) = row
+                            .as_array()
+                            .and_then(|a| a.get(col_idx))
+                            .and_then(|v| v.as_str())
+                            && cell.starts_with('=')
+                        {
+                            formula_count += 1;
+                            let cell_ref = format!(
+                                "{}{}",
+                                {
                                     let mut s = String::new();
                                     let mut c = col_idx;
-                                    loop { s.insert(0, (b'A' + (c % 26) as u8) as char); if c < 26 { break; } c = c / 26 - 1; }
+                                    loop {
+                                        s.insert(0, (b'A' + (c % 26) as u8) as char);
+                                        if c < 26 {
+                                            break;
+                                        }
+                                        c = c / 26 - 1;
+                                    }
                                     s
-                                }, row_idx + 1);
-                                all_formulas.push(json!({"cell": cell_ref, "formula": cell}));
-                                if samples.len() < 3 { samples.push(cell.to_string()); }
+                                },
+                                row_idx + 1
+                            );
+                            all_formulas.push(json!({"cell": cell_ref, "formula": cell}));
+                            if samples.len() < 3 {
+                                samples.push(cell.to_string());
                             }
                         }
                     }
@@ -3320,10 +3574,10 @@ async fn execute_sheets_helper(
                 .get("sheet")
                 .and_then(|v| v.as_str())
                 .unwrap_or("Sheet1");
-            let values_resource = tools::find_resource(&sheets_doc.resources, "spreadsheets.values")
-                .ok_or_else(|| {
-                    GwsError::Validation("spreadsheets.values resource not found".into())
-                })?;
+            let values_resource =
+                tools::find_resource(&sheets_doc.resources, "spreadsheets.values").ok_or_else(
+                    || GwsError::Validation("spreadsheets.values resource not found".into()),
+                )?;
             let get_method = values_resource
                 .methods
                 .get("get")
@@ -3339,10 +3593,20 @@ async fn execute_sheets_helper(
                 }
             });
             let cell_result = crate::execute::execute_tool(
-                &sheets_doc, get_method, "spreadsheets.values", "get",
-                &cell_args, "sheets", policy, meta, None, None, false,
+                &sheets_doc,
+                get_method,
+                "spreadsheets.values",
+                "get",
+                &cell_args,
+                "sheets",
+                policy,
+                meta,
+                None,
+                None,
+                false,
                 &mut state.token_cache,
-            ).await?;
+            )
+            .await?;
 
             let formula = cell_result
                 .pointer("/values/0/0")
@@ -3360,14 +3624,28 @@ async fn execute_sheets_helper(
                     }
                 });
                 let header_result = crate::execute::execute_tool(
-                    &sheets_doc, get_method, "spreadsheets.values", "get",
-                    &header_args, "sheets", policy, meta, None, None, false,
+                    &sheets_doc,
+                    get_method,
+                    "spreadsheets.values",
+                    "get",
+                    &header_args,
+                    "sheets",
+                    policy,
+                    meta,
+                    None,
+                    None,
+                    false,
                     &mut state.token_cache,
-                ).await?;
+                )
+                .await?;
                 let headers: Vec<String> = header_result
                     .pointer("/values/0")
                     .and_then(|v| v.as_array())
-                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
                     .unwrap_or_default();
 
                 let label_args = json!({
@@ -3378,14 +3656,28 @@ async fn execute_sheets_helper(
                     }
                 });
                 let label_result = crate::execute::execute_tool(
-                    &sheets_doc, get_method, "spreadsheets.values", "get",
-                    &label_args, "sheets", policy, meta, None, None, false,
+                    &sheets_doc,
+                    get_method,
+                    "spreadsheets.values",
+                    "get",
+                    &label_args,
+                    "sheets",
+                    policy,
+                    meta,
+                    None,
+                    None,
+                    false,
                     &mut state.token_cache,
-                ).await?;
+                )
+                .await?;
                 let row_labels: Vec<String> = label_result
                     .get("values")
                     .and_then(|v| v.as_array())
-                    .map(|arr| arr.iter().filter_map(|row| row.get(0).and_then(|v| v.as_str()).map(String::from)).collect())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|row| row.get(0).and_then(|v| v.as_str()).map(String::from))
+                            .collect()
+                    })
                     .unwrap_or_default();
 
                 let explanation = if is_formula {
@@ -3395,14 +3687,18 @@ async fn execute_sheets_helper(
                 };
 
                 let refs = crate::sheets_helpers::extract_cell_references(formula);
-                let referenced: Vec<Value> = refs.iter().map(|r| {
-                    let name = crate::sheets_helpers::resolve_cell_name(r, &headers, &row_labels);
-                    json!({
-                        "ref": r,
-                        "column": name.as_ref().map(|(c, _)| c.as_str()).unwrap_or(""),
-                        "row_label": name.as_ref().map(|(_, r)| r.as_str()).unwrap_or(""),
+                let referenced: Vec<Value> = refs
+                    .iter()
+                    .map(|r| {
+                        let name =
+                            crate::sheets_helpers::resolve_cell_name(r, &headers, &row_labels);
+                        json!({
+                            "ref": r,
+                            "column": name.as_ref().map(|(c, _)| c.as_str()).unwrap_or(""),
+                            "row_label": name.as_ref().map(|(_, r)| r.as_str()).unwrap_or(""),
+                        })
                     })
-                }).collect();
+                    .collect();
 
                 let output = json!({
                     "cell": cell,
@@ -3417,11 +3713,7 @@ async fn execute_sheets_helper(
                 }))
             } else {
                 // gws_sheets_trace — single-level dependency extraction
-                fn build_trace_tree(
-                    cell: &str,
-                    formula: &str,
-                    is_formula: bool,
-                ) -> Value {
+                fn build_trace_tree(cell: &str, formula: &str, is_formula: bool) -> Value {
                     if !is_formula {
                         return json!({
                             "cell": cell,
@@ -3438,7 +3730,7 @@ async fn execute_sheets_helper(
                     })
                 }
 
-                let tree = build_trace_tree(cell, formula, is_formula);
+                let _tree = build_trace_tree(cell, formula, is_formula);
 
                 let output = json!({
                     "cell": cell,
@@ -3667,7 +3959,10 @@ async fn execute_slides_import_marp(
                 .get("presentationId")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| {
-                    let keys: Vec<_> = create_result.as_object().map(|o| o.keys().collect()).unwrap_or_default();
+                    let keys: Vec<_> = create_result
+                        .as_object()
+                        .map(|o| o.keys().collect())
+                        .unwrap_or_default();
                     GwsError::Validation(format!(
                         "Create did not return presentationId. Response keys: {:?}",
                         keys
@@ -3678,10 +3973,8 @@ async fn execute_slides_import_marp(
 
             if let Some(fid) = folder_id {
                 let drive_doc = state.get_doc("drive").await?;
-                let files_resource =
-                    tools::find_resource(&drive_doc.resources, "files").ok_or_else(|| {
-                        GwsError::Validation("Drive files resource not found".into())
-                    })?;
+                let files_resource = tools::find_resource(&drive_doc.resources, "files")
+                    .ok_or_else(|| GwsError::Validation("Drive files resource not found".into()))?;
                 let update_method = files_resource
                     .methods
                     .get("update")
@@ -3913,12 +4206,11 @@ async fn execute_slides_import_marp(
             crate::slides_helpers::marp_to_slide_requests(&pres, Some(&notes_ids), None);
         // Only add notes-related requests (insertText targeting notes IDs)
         for req in notes_content_reqs {
-            if let Some(insert) = req.get("insertText") {
-                if let Some(obj_id) = insert.get("objectId").and_then(|v| v.as_str()) {
-                    if notes_ids.contains(&obj_id.to_string()) {
-                        content_reqs.push(req);
-                    }
-                }
+            if let Some(insert) = req.get("insertText")
+                && let Some(obj_id) = insert.get("objectId").and_then(|v| v.as_str())
+                && notes_ids.contains(&obj_id.to_string())
+            {
+                content_reqs.push(req);
             }
         }
     }
@@ -3941,16 +4233,12 @@ async fn execute_slides_import_marp(
                 .cloned()
                 .unwrap_or_default();
             if let Some(real_title) = crate::slides_helpers::find_title_object_id(&elements) {
-                content_json = content_json.replace(
-                    &format!("\"title_{idx}\""),
-                    &format!("\"{}\"", real_title),
-                );
+                content_json = content_json
+                    .replace(&format!("\"title_{idx}\""), &format!("\"{}\"", real_title));
             }
             if let Some(real_body) = crate::slides_helpers::find_body_object_id(&elements) {
-                content_json = content_json.replace(
-                    &format!("\"body_{idx}\""),
-                    &format!("\"{}\"", real_body),
-                );
+                content_json =
+                    content_json.replace(&format!("\"body_{idx}\""), &format!("\"{}\"", real_body));
             }
         }
         if let Ok(fixed) = serde_json::from_str::<Vec<Value>>(&content_json) {
@@ -4052,7 +4340,11 @@ fn extract_slide_object_ids(presentation: &Value) -> Vec<String> {
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|s| s.get("objectId").and_then(|id| id.as_str()).map(String::from))
+                .filter_map(|s| {
+                    s.get("objectId")
+                        .and_then(|id| id.as_str())
+                        .map(String::from)
+                })
                 .collect()
         })
         .unwrap_or_default()
@@ -4119,32 +4411,57 @@ async fn fetch_slide_summary(
     });
     let mut tc = state.token_cache.take();
     let result = crate::execute::execute_tool(
-        &slides_doc, get_method, "presentations", "get", &args, "slides",
-        policy, meta, None, None, false, &mut tc,
+        &slides_doc,
+        get_method,
+        "presentations",
+        "get",
+        &args,
+        "slides",
+        policy,
+        meta,
+        None,
+        None,
+        false,
+        &mut tc,
     )
     .await?;
     state.token_cache = tc;
     check_api_result(&result)?;
 
-    let slides = result.get("slides").and_then(|s| s.as_array()).cloned().unwrap_or_default();
+    let slides = result
+        .get("slides")
+        .and_then(|s| s.as_array())
+        .cloned()
+        .unwrap_or_default();
     let mut summary = Vec::new();
     for (i, slide) in slides.iter().enumerate() {
-        let elements = slide.get("pageElements").and_then(|pe| pe.as_array()).cloned().unwrap_or_default();
+        let elements = slide
+            .get("pageElements")
+            .and_then(|pe| pe.as_array())
+            .cloned()
+            .unwrap_or_default();
         let title = {
             let t = crate::slides_helpers::extract_slide_text(&elements, "TITLE");
             if t.is_empty() {
                 let t2 = crate::slides_helpers::extract_slide_text(&elements, "CENTERED_TITLE");
                 if t2.is_empty() {
                     if let Some(title_id) = crate::slides_helpers::find_title_object_id(&elements) {
-                        elements.iter()
-                            .find(|e| e.get("objectId").and_then(|id| id.as_str()) == Some(&title_id))
-                            .map(|e| crate::slides_helpers::extract_text_from_shape(e))
+                        elements
+                            .iter()
+                            .find(|e| {
+                                e.get("objectId").and_then(|id| id.as_str()) == Some(&title_id)
+                            })
+                            .map(crate::slides_helpers::extract_text_from_shape)
                             .unwrap_or_default()
                     } else {
                         String::new()
                     }
-                } else { t2 }
-            } else { t }
+                } else {
+                    t2
+                }
+            } else {
+                t
+            }
         };
         summary.push(json!({
             "slide_number": i + 1,
@@ -4187,7 +4504,7 @@ async fn execute_slides_read(
     }
 
     let structured = crate::slides_helpers::presentation_to_structured(&pres_data, slide_number)
-        .map_err(|e| GwsError::Validation(e))?;
+        .map_err(GwsError::Validation)?;
 
     Ok(json!({
         "content": [{ "type": "text", "text": serde_json::to_string_pretty(&structured).unwrap_or_default() }],
@@ -4316,7 +4633,10 @@ async fn execute_slides_reorder(
         )));
     }
 
-    let move_ids: Vec<String> = slide_numbers.iter().map(|&n| slide_ids[n - 1].clone()).collect();
+    let move_ids: Vec<String> = slide_numbers
+        .iter()
+        .map(|&n| slide_ids[n - 1].clone())
+        .collect();
     let reqs = vec![json!({
         "updateSlidesPosition": {
             "slideObjectIds": move_ids,
@@ -4381,35 +4701,33 @@ async fn execute_slides_add(
         )));
     }
 
-    let has_content = !is_blank
-        && (pres.slides[0].title.is_some() || !pres.slides[0].body_blocks.is_empty());
+    let has_content =
+        !is_blank && (pres.slides[0].title.is_some() || !pres.slides[0].body_blocks.is_empty());
 
     let pres_data = fetch_presentation(presentation_id, state, policy, meta).await?;
     let slide_ids = extract_slide_object_ids(&pres_data);
     let slide_count = slide_ids.len();
 
-    if let Some(pos) = position {
-        if pos < 1 || pos > slide_count + 1 {
-            return Err(GwsError::Validation(format!(
-                "Position {pos} is out of range. Must be 1-{}.",
-                slide_count + 1
-            )));
-        }
+    if let Some(pos) = position
+        && (pos < 1 || pos > slide_count + 1)
+    {
+        return Err(GwsError::Validation(format!(
+            "Position {pos} is out of range. Must be 1-{}.",
+            slide_count + 1
+        )));
     }
 
-    let suffix = format!("_{:08x}", std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u32)
-        .unwrap_or(0));
+    let suffix = format!(
+        "_{:08x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u32)
+            .unwrap_or(0)
+    );
     let new_slide_id = format!("slide_0{suffix}");
 
     if has_content {
-        let template_name = arguments.get("template").and_then(|v| v.as_str());
-        let layouts = if template_name.is_some() {
-            crate::slides_helpers::extract_layouts(&pres_data)
-        } else {
-            crate::slides_helpers::extract_layouts(&pres_data)
-        };
+        let layouts = crate::slides_helpers::extract_layouts(&pres_data);
         let layouts_ref = if layouts.is_empty() {
             None
         } else {
@@ -4437,72 +4755,80 @@ async fn execute_slides_add(
         rewrite_ids(&mut create_reqs);
         rewrite_ids(&mut content_reqs);
 
-        if let Some(pos) = position {
-            if let Some(req) = create_reqs.get_mut(0) {
-                if let Some(create_slide) = req.get_mut("createSlide") {
-                    create_slide["insertionIndex"] = json!(pos - 1);
-                }
-            }
+        if let Some(pos) = position
+            && let Some(req) = create_reqs.get_mut(0)
+            && let Some(create_slide) = req.get_mut("createSlide")
+        {
+            create_slide["insertionIndex"] = json!(pos - 1);
         }
 
         slides_batch_update(presentation_id, create_reqs, state, policy, meta, dry_run).await?;
 
-    if !content_reqs.is_empty() {
-        // Re-fetch the slide to discover actual placeholder IDs (mapped IDs may differ
-        // from server-assigned ones when placeholderIdMappings don't match exactly)
-        let refreshed = fetch_presentation(presentation_id, state, policy, meta).await?;
-        let refreshed_slides = refreshed
-            .get("slides")
-            .and_then(|s| s.as_array())
-            .cloned()
-            .unwrap_or_default();
-        let target_idx = position.map(|p| p - 1).unwrap_or(refreshed_slides.len().saturating_sub(1));
-        if let Some(new_slide) = refreshed_slides.get(target_idx) {
-            let elements = new_slide
-                .get("pageElements")
-                .and_then(|pe| pe.as_array())
+        if !content_reqs.is_empty() {
+            // Re-fetch the slide to discover actual placeholder IDs (mapped IDs may differ
+            // from server-assigned ones when placeholderIdMappings don't match exactly)
+            let refreshed = fetch_presentation(presentation_id, state, policy, meta).await?;
+            let refreshed_slides = refreshed
+                .get("slides")
+                .and_then(|s| s.as_array())
                 .cloned()
                 .unwrap_or_default();
-            let actual_title = crate::slides_helpers::find_title_object_id(&elements);
-            let actual_body = crate::slides_helpers::find_body_object_id(&elements);
+            let target_idx = position
+                .map(|p| p - 1)
+                .unwrap_or(refreshed_slides.len().saturating_sub(1));
+            if let Some(new_slide) = refreshed_slides.get(target_idx) {
+                let elements = new_slide
+                    .get("pageElements")
+                    .and_then(|pe| pe.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let actual_title = crate::slides_helpers::find_title_object_id(&elements);
+                let actual_body = crate::slides_helpers::find_body_object_id(&elements);
 
-            // Rewrite content requests to use actual IDs instead of generated ones
-            let content_json = serde_json::to_string(&content_reqs).unwrap_or_default();
-            let mut replaced = content_json;
-            if let Some(ref real_title) = actual_title {
-                replaced = replaced.replace(
-                    &format!("\"title_0{suffix}\""),
-                    &format!("\"{}\"", real_title),
-                );
-            }
-            if let Some(ref real_body) = actual_body {
-                replaced = replaced.replace(
-                    &format!("\"body_0{suffix}\""),
-                    &format!("\"{}\"", real_body),
-                );
-            }
-            if let Ok(fixed) = serde_json::from_str::<Vec<Value>>(&replaced) {
-                content_reqs = fixed;
+                // Rewrite content requests to use actual IDs instead of generated ones
+                let content_json = serde_json::to_string(&content_reqs).unwrap_or_default();
+                let mut replaced = content_json;
+                if let Some(ref real_title) = actual_title {
+                    replaced = replaced.replace(
+                        &format!("\"title_0{suffix}\""),
+                        &format!("\"{}\"", real_title),
+                    );
+                }
+                if let Some(ref real_body) = actual_body {
+                    replaced = replaced.replace(
+                        &format!("\"body_0{suffix}\""),
+                        &format!("\"{}\"", real_body),
+                    );
+                }
+                if let Ok(fixed) = serde_json::from_str::<Vec<Value>>(&replaced) {
+                    content_reqs = fixed;
+                }
+
+                // Filter content requests to only those targeting existing elements
+                let existing_ids: std::collections::HashSet<String> = elements
+                    .iter()
+                    .filter_map(|e| {
+                        e.get("objectId")
+                            .and_then(|id| id.as_str())
+                            .map(String::from)
+                    })
+                    .collect();
+                content_reqs.retain(|req| {
+                    let obj_id = req
+                        .as_object()
+                        .and_then(|m| m.values().next())
+                        .and_then(|v| v.get("objectId"))
+                        .and_then(|id| id.as_str())
+                        .unwrap_or("");
+                    obj_id.is_empty() || existing_ids.contains(obj_id)
+                });
             }
 
-            // Filter content requests to only those targeting existing elements
-            let existing_ids: std::collections::HashSet<String> = elements.iter()
-                .filter_map(|e| e.get("objectId").and_then(|id| id.as_str()).map(String::from))
-                .collect();
-            content_reqs.retain(|req| {
-                let obj_id = req.as_object()
-                    .and_then(|m| m.values().next())
-                    .and_then(|v| v.get("objectId"))
-                    .and_then(|id| id.as_str())
-                    .unwrap_or("");
-                obj_id.is_empty() || existing_ids.contains(obj_id)
-            });
+            if !content_reqs.is_empty() {
+                slides_batch_update(presentation_id, content_reqs, state, policy, meta, dry_run)
+                    .await?;
+            }
         }
-
-        if !content_reqs.is_empty() {
-            slides_batch_update(presentation_id, content_reqs, state, policy, meta, dry_run).await?;
-        }
-    }
 
         if pres.slides[0].speaker_notes.is_some() {
             let updated_pres = fetch_presentation(presentation_id, state, policy, meta).await?;
@@ -4512,7 +4838,9 @@ async fn execute_slides_add(
                 .cloned()
                 .unwrap_or_default();
 
-            let target_idx = position.map(|p| p - 1).unwrap_or(updated_slides.len().saturating_sub(1));
+            let target_idx = position
+                .map(|p| p - 1)
+                .unwrap_or(updated_slides.len().saturating_sub(1));
             if let Some(slide) = updated_slides.get(target_idx) {
                 let notes_obj_id = slide
                     .get("slideProperties")
@@ -4520,14 +4848,17 @@ async fn execute_slides_add(
                     .and_then(|np| np.get("notesProperties"))
                     .and_then(|np| np.get("speakerNotesObjectId"))
                     .and_then(|id| id.as_str());
-                if let (Some(notes_id), Some(notes_text)) = (notes_obj_id, &pres.slides[0].speaker_notes) {
+                if let (Some(notes_id), Some(notes_text)) =
+                    (notes_obj_id, &pres.slides[0].speaker_notes)
+                {
                     let notes_reqs = vec![json!({
                         "insertText": {
                             "objectId": notes_id,
                             "text": notes_text
                         }
                     })];
-                    slides_batch_update(presentation_id, notes_reqs, state, policy, meta, dry_run).await?;
+                    slides_batch_update(presentation_id, notes_reqs, state, policy, meta, dry_run)
+                        .await?;
                 }
             }
         }
@@ -4537,7 +4868,15 @@ async fn execute_slides_add(
         if let Some(pos) = position {
             create_req["createSlide"]["insertionIndex"] = json!(pos - 1);
         }
-        slides_batch_update(presentation_id, vec![create_req], state, policy, meta, dry_run).await?;
+        slides_batch_update(
+            presentation_id,
+            vec![create_req],
+            state,
+            policy,
+            meta,
+            dry_run,
+        )
+        .await?;
     }
 
     if let Some(bg) = arguments.get("background_image").and_then(|v| v.as_str()) {
@@ -4676,7 +5015,11 @@ async fn execute_slides_update(
     let new_notes = arguments.get("notes").and_then(|v| v.as_str());
     let placeholders_map = arguments.get("placeholders").and_then(|v| v.as_object());
 
-    if new_title.is_none() && new_body.is_none() && new_notes.is_none() && placeholders_map.is_none() {
+    if new_title.is_none()
+        && new_body.is_none()
+        && new_notes.is_none()
+        && placeholders_map.is_none()
+    {
         return Err(GwsError::Validation(
             "At least one of 'title', 'body', 'notes', or 'placeholders' must be provided".into(),
         ));
@@ -4708,13 +5051,16 @@ async fn execute_slides_update(
         let title_id = crate::slides_helpers::find_title_object_id(&page_elements);
         if let Some(obj_id) = title_id {
             let existing_title = crate::slides_helpers::extract_slide_text(&page_elements, "TITLE");
-            let existing_centered = crate::slides_helpers::extract_slide_text(&page_elements, "CENTERED_TITLE");
+            let existing_centered =
+                crate::slides_helpers::extract_slide_text(&page_elements, "CENTERED_TITLE");
             let existing_fallback = if existing_title.is_empty() && existing_centered.is_empty() {
                 crate::slides_helpers::extract_all_body_text(&page_elements)
             } else {
                 String::new()
             };
-            let has_existing = !existing_title.is_empty() || !existing_centered.is_empty() || !existing_fallback.is_empty();
+            let has_existing = !existing_title.is_empty()
+                || !existing_centered.is_empty()
+                || !existing_fallback.is_empty();
             if has_existing {
                 update_reqs.push(json!({
                     "deleteText": { "objectId": &obj_id, "textRange": { "type": "ALL" } }
@@ -4784,7 +5130,8 @@ async fn execute_slides_update(
                         "Placeholder '{label}' not found on slide {slide_number}. Use gws_templates to see available placeholders."
                     ))
                 })?;
-            let has_text = page_elements.iter()
+            let has_text = page_elements
+                .iter()
                 .find(|e| e.get("objectId").and_then(|id| id.as_str()) == Some(&obj_id))
                 .map(|e| !crate::slides_helpers::extract_text_from_shape(e).is_empty())
                 .unwrap_or(false);
@@ -5098,7 +5445,8 @@ async fn execute_batch(
             policy_errors.push(json!({"index": i, "error": e.to_string()}));
             continue;
         }
-        if let Err(e) = policy.enforce_constraints(service, method_name, method, &mut params, &body) {
+        if let Err(e) = policy.enforce_constraints(service, method_name, method, &mut params, &body)
+        {
             policy_errors.push(json!({"index": i, "error": e.to_string()}));
         }
     }

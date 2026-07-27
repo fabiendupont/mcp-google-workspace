@@ -10,7 +10,7 @@ pub fn complete_request(
     reference: &Reference,
     argument: &ArgumentInfo,
     policy: &Policy,
-    docs: &HashMap<String, Arc<RestDescription>>,
+    _docs: &HashMap<String, Arc<RestDescription>>,
     prompts: &[crate::prompts::Prompt],
 ) -> CompletionInfo {
     match reference {

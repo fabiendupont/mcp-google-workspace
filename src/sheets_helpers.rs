@@ -308,7 +308,7 @@ pub fn extract_cell_references(formula: &str) -> Vec<String> {
                 if i < len && chars[i] == ':' {
                     let colon = i;
                     i += 1;
-                    let range_start = i;
+                    let _range_start = i;
                     while i < len && chars[i].is_ascii_uppercase() {
                         i += 1;
                     }
@@ -324,7 +324,9 @@ pub fn extract_cell_references(formula: &str) -> Vec<String> {
                     }
                 } else {
                     // Skip function names (all-alpha followed by open paren)
-                    if !cell_ref.chars().all(|c| c.is_ascii_alphabetic()) || (i < len && chars[i] != '(') {
+                    if !cell_ref.chars().all(|c| c.is_ascii_alphabetic())
+                        || (i < len && chars[i] != '(')
+                    {
                         refs.push(cell_ref);
                     }
                 }
@@ -414,9 +416,16 @@ pub fn explain_formula(formula: &str, headers: &[String], row_labels: &[String])
     explanation
 }
 
-pub fn resolve_cell_name(cell_ref: &str, headers: &[String], row_labels: &[String]) -> Option<(String, String)> {
+pub fn resolve_cell_name(
+    cell_ref: &str,
+    headers: &[String],
+    row_labels: &[String],
+) -> Option<(String, String)> {
     // Parse column letters and row number from e.g. "B5"
-    let col_end = cell_ref.chars().take_while(|c| c.is_ascii_uppercase()).count();
+    let col_end = cell_ref
+        .chars()
+        .take_while(|c| c.is_ascii_uppercase())
+        .count();
     if col_end == 0 || col_end >= cell_ref.len() {
         return None;
     }
@@ -429,7 +438,10 @@ pub fn resolve_cell_name(cell_ref: &str, headers: &[String], row_labels: &[Strin
         .fold(0usize, |acc, b| acc * 26 + (b - b'A') as usize + 1)
         .checked_sub(1)?;
 
-    let col_name = headers.get(col_idx).cloned().unwrap_or_else(|| col_letters.to_string());
+    let col_name = headers
+        .get(col_idx)
+        .cloned()
+        .unwrap_or_else(|| col_letters.to_string());
 
     let row_name = if row_num >= 2 {
         row_labels
@@ -693,8 +705,12 @@ pub fn build_conditional_format_request(
             let r = range.ok_or("Missing range for add")?;
             let rl = rule.ok_or("Missing rule for add")?;
             let grid = a1_to_grid_range(r, sid);
-            let condition_type = rl.get("type").and_then(|v| v.as_str()).unwrap_or("CUSTOM_FORMULA");
-            let values: Vec<Value> = rl.get("values")
+            let condition_type = rl
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("CUSTOM_FORMULA");
+            let values: Vec<Value> = rl
+                .get("values")
                 .and_then(|v| v.as_array())
                 .map(|a| a.iter().map(|v| json!({"userEnteredValue": v})).collect())
                 .unwrap_or_default();
@@ -723,7 +739,9 @@ pub fn build_conditional_format_request(
                 }]}
             }))
         }
-        _ => Err(format!("Use action 'add', 'delete', or 'list'. Got: {action}")),
+        _ => Err(format!(
+            "Use action 'add', 'delete', or 'list'. Got: {action}"
+        )),
     }
 }
 
@@ -739,8 +757,12 @@ pub fn build_data_validation_request(
             let r = range.ok_or("Missing range for set")?;
             let rl = rule.ok_or("Missing rule for set")?;
             let grid = a1_to_grid_range(r, sid);
-            let condition_type = rl.get("type").and_then(|v| v.as_str()).unwrap_or("ONE_OF_LIST");
-            let values: Vec<Value> = rl.get("values")
+            let condition_type = rl
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("ONE_OF_LIST");
+            let values: Vec<Value> = rl
+                .get("values")
                 .and_then(|v| v.as_array())
                 .map(|a| a.iter().map(|v| json!({"userEnteredValue": v})).collect())
                 .unwrap_or_default();
@@ -773,7 +795,9 @@ pub fn build_data_validation_request(
                 }]}
             }))
         }
-        _ => Err(format!("Use action 'set', 'clear', or 'list'. Got: {action}")),
+        _ => Err(format!(
+            "Use action 'set', 'clear', or 'list'. Got: {action}"
+        )),
     }
 }
 
@@ -806,7 +830,9 @@ pub fn build_named_range_request(
                 }]}
             }))
         }
-        _ => Err(format!("Use action 'create', 'delete', 'list', or 'read'. Got: {action}")),
+        _ => Err(format!(
+            "Use action 'create', 'delete', 'list', or 'read'. Got: {action}"
+        )),
     }
 }
 
@@ -881,7 +907,9 @@ pub fn build_dimension_request(
                 }]}
             }))
         }
-        _ => Err(format!("Use action 'insert', 'append', 'delete', 'move', or 'resize'. Got: {action}")),
+        _ => Err(format!(
+            "Use action 'insert', 'append', 'delete', 'move', or 'resize'. Got: {action}"
+        )),
     }
 }
 
@@ -1040,7 +1068,11 @@ pub fn format_info_result(raw: &Value) -> Value {
     })
 }
 
-pub fn build_tab_request(action: &str, title: Option<&str>, sheet_id: Option<i64>) -> Result<Value, String> {
+pub fn build_tab_request(
+    action: &str,
+    title: Option<&str>,
+    sheet_id: Option<i64>,
+) -> Result<Value, String> {
     match action {
         "create" => {
             let name = title.ok_or("Missing 'title' for create action")?;
@@ -1083,7 +1115,10 @@ pub fn build_tab_request(action: &str, title: Option<&str>, sheet_id: Option<i64
                 }
             }))
         }
-        _ => Err(format!("Unknown action '{}'. Use: create, rename, delete", action)),
+        _ => Err(format!(
+            "Unknown action '{}'. Use: create, rename, delete",
+            action
+        )),
     }
 }
 
@@ -1122,10 +1157,7 @@ mod tests {
     #[test]
     fn build_read_args_default_format() {
         let args = build_read_args("A1:B2", None, None);
-        assert_eq!(
-            args["params"]["valueRenderOption"],
-            "FORMATTED_VALUE"
-        );
+        assert_eq!(args["params"]["valueRenderOption"], "FORMATTED_VALUE");
     }
 
     #[test]
@@ -1338,7 +1370,17 @@ mod tests {
 
     #[test]
     fn build_dimension_insert() {
-        let req = build_dimension_request("insert", Some(0), Some("ROWS"), Some(5), None, Some(3), None, None).unwrap();
+        let req = build_dimension_request(
+            "insert",
+            Some(0),
+            Some("ROWS"),
+            Some(5),
+            None,
+            Some(3),
+            None,
+            None,
+        )
+        .unwrap();
         let insert = &req["body"]["requests"][0]["insertDimension"];
         assert_eq!(insert["range"]["startIndex"], 5);
         assert_eq!(insert["range"]["endIndex"], 8);
@@ -1348,14 +1390,17 @@ mod tests {
     #[test]
     fn build_cond_format_add() {
         let rule = json!({"type": "NUMBER_GREATER", "values": ["90"], "format": {"backgroundColor": {"red": 0, "green": 1, "blue": 0}}});
-        let req = build_conditional_format_request("add", Some(0), Some("A1:A10"), Some(&rule), None).unwrap();
+        let req =
+            build_conditional_format_request("add", Some(0), Some("A1:A10"), Some(&rule), None)
+                .unwrap();
         assert!(req["body"]["requests"][0]["addConditionalFormatRule"].is_object());
     }
 
     #[test]
     fn build_data_validation_set() {
         let rule = json!({"type": "ONE_OF_LIST", "values": ["Yes", "No"], "strict": true});
-        let req = build_data_validation_request("set", Some(0), Some("B2:B100"), Some(&rule)).unwrap();
+        let req =
+            build_data_validation_request("set", Some(0), Some("B2:B100"), Some(&rule)).unwrap();
         assert!(req["body"]["requests"][0]["setDataValidation"].is_object());
     }
 

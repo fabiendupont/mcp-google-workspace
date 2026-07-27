@@ -211,10 +211,10 @@ pub fn marp_to_slide_requests(
             if has_title && layout.has_title {
                 let title_ph = layout.placeholders.iter().find(|p| p.ph_type == "TITLE");
                 let mut lp = json!({ "type": "TITLE" });
-                if let Some(ph) = title_ph {
-                    if let Some(idx) = ph.index {
-                        lp["index"] = json!(idx);
-                    }
+                if let Some(ph) = title_ph
+                    && let Some(idx) = ph.index
+                {
+                    lp["index"] = json!(idx);
                 }
                 mappings.push(json!({
                     "layoutPlaceholder": lp,
@@ -224,10 +224,10 @@ pub fn marp_to_slide_requests(
             if has_body && layout.has_body {
                 let body_ph = layout.placeholders.iter().find(|p| p.ph_type == "BODY");
                 let mut lp = json!({ "type": "BODY" });
-                if let Some(ph) = body_ph {
-                    if let Some(idx) = ph.index {
-                        lp["index"] = json!(idx);
-                    }
+                if let Some(ph) = body_ph
+                    && let Some(idx) = ph.index
+                {
+                    lp["index"] = json!(idx);
                 }
                 mappings.push(json!({
                     "layoutPlaceholder": lp,
@@ -335,17 +335,16 @@ pub fn marp_to_slide_requests(
             &mut content_requests,
         );
 
-        if let Some(ref notes_text) = slide.speaker_notes {
-            if let Some(ids) = notes_object_ids {
-                if let Some(notes_id) = ids.get(idx) {
-                    content_requests.push(json!({
-                        "insertText": {
-                            "objectId": notes_id,
-                            "text": notes_text
-                        }
-                    }));
+        if let Some(ref notes_text) = slide.speaker_notes
+            && let Some(ids) = notes_object_ids
+            && let Some(notes_id) = ids.get(idx)
+        {
+            content_requests.push(json!({
+                "insertText": {
+                    "objectId": notes_id,
+                    "text": notes_text
                 }
-            }
+            }));
         }
     }
 
@@ -666,7 +665,10 @@ fn needs_light_override(slide: &MarpSlide, has_template: bool) -> bool {
     ) && slide.directives.background_color.is_none()
 }
 
-pub fn build_body_content(blocks: &[SlideBlock], target_id: &str) -> (String, Vec<Value>, Vec<Value>) {
+pub fn build_body_content(
+    blocks: &[SlideBlock],
+    target_id: &str,
+) -> (String, Vec<Value>, Vec<Value>) {
     let mut full_text = String::new();
     let mut char_count: usize = 0;
     let mut style_requests: Vec<Value> = Vec::new();
@@ -955,7 +957,11 @@ pub fn extract_text_from_shape(elem: &Value) -> String {
     };
     let mut result = String::new();
     for te in elements {
-        if let Some(content) = te.get("textRun").and_then(|tr| tr.get("content")).and_then(|c| c.as_str()) {
+        if let Some(content) = te
+            .get("textRun")
+            .and_then(|tr| tr.get("content"))
+            .and_then(|c| c.as_str())
+        {
             result.push_str(content);
         }
     }
@@ -974,7 +980,10 @@ pub fn extract_notes_text(slide: &Value) -> Option<String> {
         .get("pageElements")
         .and_then(|pe| pe.as_array())?;
     for elem in elements {
-        let obj_id = elem.get("objectId").and_then(|id| id.as_str()).unwrap_or("");
+        let obj_id = elem
+            .get("objectId")
+            .and_then(|id| id.as_str())
+            .unwrap_or("");
         if obj_id == notes_obj_id {
             let text = extract_text_from_shape(elem);
             if !text.is_empty() {
@@ -988,7 +997,10 @@ pub fn extract_notes_text(slide: &Value) -> Option<String> {
 pub fn resolve_layout_name(presentation: &Value, layout_id: &str) -> Option<String> {
     let layouts = presentation.get("layouts").and_then(|l| l.as_array())?;
     for layout in layouts {
-        let obj_id = layout.get("objectId").and_then(|id| id.as_str()).unwrap_or("");
+        let obj_id = layout
+            .get("objectId")
+            .and_then(|id| id.as_str())
+            .unwrap_or("");
         if obj_id == layout_id {
             return layout
                 .get("layoutProperties")
@@ -1019,21 +1031,21 @@ pub fn presentation_to_structured(
         .unwrap_or_default();
     let slide_count = slides.len();
 
-    if let Some(num) = slide_number {
-        if num < 1 || num > slide_count {
-            return Err(format!(
-                "slide_number {num} is out of range. Presentation has {slide_count} slides (1-{slide_count})."
-            ));
-        }
+    if let Some(num) = slide_number
+        && (num < 1 || num > slide_count)
+    {
+        return Err(format!(
+            "slide_number {num} is out of range. Presentation has {slide_count} slides (1-{slide_count})."
+        ));
     }
 
     let mut slide_data = Vec::new();
     for (idx, slide) in slides.iter().enumerate() {
         let num = idx + 1;
-        if let Some(target) = slide_number {
-            if num != target {
-                continue;
-            }
+        if let Some(target) = slide_number
+            && num != target
+        {
+            continue;
         }
 
         let object_id = slide
@@ -1060,9 +1072,12 @@ pub fn presentation_to_structured(
                 if t2.is_empty() {
                     // Marp import creates plain text boxes — title is in the first one
                     if let Some(title_id) = find_title_object_id(&page_elements) {
-                        page_elements.iter()
-                            .find(|e| e.get("objectId").and_then(|id| id.as_str()) == Some(&title_id))
-                            .map(|e| extract_text_from_shape(e))
+                        page_elements
+                            .iter()
+                            .find(|e| {
+                                e.get("objectId").and_then(|id| id.as_str()) == Some(&title_id)
+                            })
+                            .map(extract_text_from_shape)
                             .unwrap_or_default()
                     } else {
                         String::new()
@@ -1079,20 +1094,32 @@ pub fn presentation_to_structured(
             let title_obj_id = find_title_object_id(&page_elements);
             let mut parts = Vec::new();
             for elem in &page_elements {
-                let ph_type = elem.get("shape").and_then(|s| s.get("placeholder")).and_then(|p| p.get("type")).and_then(|t| t.as_str()).unwrap_or("");
+                let ph_type = elem
+                    .get("shape")
+                    .and_then(|s| s.get("placeholder"))
+                    .and_then(|p| p.get("type"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("");
                 match ph_type {
                     "TITLE" | "CENTERED_TITLE" => continue,
                     "BODY" | "SUBTITLE" => {
                         let text = extract_text_from_shape(elem);
-                        if !text.is_empty() { parts.push(text); }
+                        if !text.is_empty() {
+                            parts.push(text);
+                        }
                     }
                     _ => {
                         if elem.get("shape").and_then(|s| s.get("text")).is_some() {
-                            let has_ph = elem.get("shape").and_then(|s| s.get("placeholder")).is_some();
+                            let has_ph = elem
+                                .get("shape")
+                                .and_then(|s| s.get("placeholder"))
+                                .is_some();
                             let obj_id = elem.get("objectId").and_then(|id| id.as_str());
                             if !has_ph && obj_id != title_obj_id.as_deref() {
                                 let text = extract_text_from_shape(elem);
-                                if !text.is_empty() { parts.push(text); }
+                                if !text.is_empty() {
+                                    parts.push(text);
+                                }
                             }
                         }
                     }
@@ -1144,11 +1171,7 @@ fn extract_styled_text_from_shape(elem: &Value) -> String {
 
     for te in elements {
         if let Some(pm) = te.get("paragraphMarker") {
-            if pm.get("bullet").is_some() {
-                in_bullet = true;
-            } else {
-                in_bullet = false;
-            }
+            in_bullet = pm.get("bullet").is_some();
             continue;
         }
 
@@ -1256,7 +1279,9 @@ fn extract_body_as_markdown(page_elements: &[Value]) -> String {
 
 fn extract_table_as_markdown(table: &Value) -> String {
     let rows = table.get("tableRows").and_then(|r| r.as_array());
-    let Some(rows) = rows else { return String::new() };
+    let Some(rows) = rows else {
+        return String::new();
+    };
     if rows.is_empty() {
         return String::new();
     }
@@ -1268,9 +1293,17 @@ fn extract_table_as_markdown(table: &Value) -> String {
         let mut md_cells = Vec::new();
         for cell in cells {
             let mut text = String::new();
-            if let Some(content) = cell.get("text").and_then(|t| t.get("textElements")).and_then(|te| te.as_array()) {
+            if let Some(content) = cell
+                .get("text")
+                .and_then(|t| t.get("textElements"))
+                .and_then(|te| te.as_array())
+            {
                 for te in content {
-                    if let Some(c) = te.get("textRun").and_then(|tr| tr.get("content")).and_then(|c| c.as_str()) {
+                    if let Some(c) = te
+                        .get("textRun")
+                        .and_then(|tr| tr.get("content"))
+                        .and_then(|c| c.as_str())
+                    {
                         text.push_str(c.trim_end_matches('\n'));
                     }
                 }
@@ -1303,9 +1336,18 @@ fn extract_table_as_markdown(table: &Value) -> String {
 
 pub fn slide_has_bullets(page_elements: &[Value]) -> bool {
     for elem in page_elements {
-        if let Some(text_elements) = elem.get("shape").and_then(|s| s.get("text")).and_then(|t| t.get("textElements")).and_then(|te| te.as_array()) {
+        if let Some(text_elements) = elem
+            .get("shape")
+            .and_then(|s| s.get("text"))
+            .and_then(|t| t.get("textElements"))
+            .and_then(|te| te.as_array())
+        {
             for te in text_elements {
-                if te.get("paragraphMarker").and_then(|pm| pm.get("bullet")).is_some() {
+                if te
+                    .get("paragraphMarker")
+                    .and_then(|pm| pm.get("bullet"))
+                    .is_some()
+                {
                     return true;
                 }
             }
@@ -1324,9 +1366,19 @@ pub fn slide_has_image(page_elements: &[Value]) -> bool {
 
 pub fn slide_has_code(page_elements: &[Value]) -> bool {
     for elem in page_elements {
-        if let Some(text_elements) = elem.get("shape").and_then(|s| s.get("text")).and_then(|t| t.get("textElements")).and_then(|te| te.as_array()) {
+        if let Some(text_elements) = elem
+            .get("shape")
+            .and_then(|s| s.get("text"))
+            .and_then(|t| t.get("textElements"))
+            .and_then(|te| te.as_array())
+        {
             for te in text_elements {
-                let font = te.get("textRun").and_then(|tr| tr.get("style")).and_then(|s| s.get("fontFamily")).and_then(|f| f.as_str()).unwrap_or("");
+                let font = te
+                    .get("textRun")
+                    .and_then(|tr| tr.get("style"))
+                    .and_then(|s| s.get("fontFamily"))
+                    .and_then(|f| f.as_str())
+                    .unwrap_or("");
                 if font.contains("Courier") || font.contains("mono") {
                     return true;
                 }
@@ -1541,7 +1593,10 @@ pub fn slides_reorder_tool_schema() -> Value {
     })
 }
 
-pub fn find_placeholder_object_id(page_elements: &[Value], placeholder_type: &str) -> Option<String> {
+pub fn find_placeholder_object_id(
+    page_elements: &[Value],
+    placeholder_type: &str,
+) -> Option<String> {
     for elem in page_elements {
         let ph = elem
             .get("shape")
@@ -1550,7 +1605,10 @@ pub fn find_placeholder_object_id(page_elements: &[Value], placeholder_type: &st
             .and_then(|t| t.as_str())
             .unwrap_or("");
         if ph == placeholder_type {
-            return elem.get("objectId").and_then(|id| id.as_str()).map(String::from);
+            return elem
+                .get("objectId")
+                .and_then(|id| id.as_str())
+                .map(String::from);
         }
     }
     None
@@ -1571,7 +1629,10 @@ pub fn find_title_object_id(page_elements: &[Value]) -> Option<String> {
                 .and_then(|s| s.get("placeholder"))
                 .is_some();
             if !has_placeholder {
-                return elem.get("objectId").and_then(|id| id.as_str()).map(String::from);
+                return elem
+                    .get("objectId")
+                    .and_then(|id| id.as_str())
+                    .map(String::from);
             }
         }
     }
@@ -1620,15 +1681,16 @@ pub fn find_placeholder_by_label(page_elements: &[Value], label: &str) -> Option
     };
 
     for elem in page_elements {
-        let ph = elem
-            .get("shape")
-            .and_then(|s| s.get("placeholder"));
+        let ph = elem.get("shape").and_then(|s| s.get("placeholder"));
         let Some(ph) = ph else { continue };
         let elem_type = ph.get("type").and_then(|t| t.as_str()).unwrap_or("");
         let elem_index = ph.get("index").and_then(|i| i.as_i64());
 
         if elem_type == ph_type && elem_index == ph_index {
-            return elem.get("objectId").and_then(|id| id.as_str()).map(String::from);
+            return elem
+                .get("objectId")
+                .and_then(|id| id.as_str())
+                .map(String::from);
         }
     }
     None
@@ -1683,10 +1745,22 @@ pub fn extract_layout_details(layout: &Value) -> Value {
             .and_then(|h| h.get("magnitude"))
             .and_then(|m| m.as_f64())
             .unwrap_or(0.0);
-        let scale_x = transform.get("scaleX").and_then(|s| s.as_f64()).unwrap_or(1.0);
-        let scale_y = transform.get("scaleY").and_then(|s| s.as_f64()).unwrap_or(1.0);
-        let translate_x = transform.get("translateX").and_then(|t| t.as_f64()).unwrap_or(0.0);
-        let translate_y = transform.get("translateY").and_then(|t| t.as_f64()).unwrap_or(0.0);
+        let scale_x = transform
+            .get("scaleX")
+            .and_then(|s| s.as_f64())
+            .unwrap_or(1.0);
+        let scale_y = transform
+            .get("scaleY")
+            .and_then(|s| s.as_f64())
+            .unwrap_or(1.0);
+        let translate_x = transform
+            .get("translateX")
+            .and_then(|t| t.as_f64())
+            .unwrap_or(0.0);
+        let translate_y = transform
+            .get("translateY")
+            .and_then(|t| t.as_f64())
+            .unwrap_or(0.0);
 
         let w_pt = (base_w * scale_x.abs()) / EMU_PER_PT;
         let h_pt = (base_h * scale_y.abs()) / EMU_PER_PT;
@@ -2245,7 +2319,10 @@ mod tests {
                 }
             }
         });
-        assert_eq!(extract_notes_text(&slide), Some("Speaker notes here".to_string()));
+        assert_eq!(
+            extract_notes_text(&slide),
+            Some("Speaker notes here".to_string())
+        );
     }
 
     #[test]
@@ -2262,7 +2339,10 @@ mod tests {
                 "layoutProperties": { "displayName": "Title Slide" }
             }]
         });
-        assert_eq!(resolve_layout_name(&pres, "layout_abc"), Some("Title Slide".to_string()));
+        assert_eq!(
+            resolve_layout_name(&pres, "layout_abc"),
+            Some("Title Slide".to_string())
+        );
         assert_eq!(resolve_layout_name(&pres, "nonexistent"), None);
     }
 
@@ -2401,8 +2481,14 @@ mod tests {
                 "shape": { "placeholder": { "type": "BODY" }, "text": {} }
             }),
         ];
-        assert_eq!(find_placeholder_object_id(&elements, "TITLE"), Some("title_shape".to_string()));
-        assert_eq!(find_placeholder_object_id(&elements, "BODY"), Some("body_shape".to_string()));
+        assert_eq!(
+            find_placeholder_object_id(&elements, "TITLE"),
+            Some("title_shape".to_string())
+        );
+        assert_eq!(
+            find_placeholder_object_id(&elements, "BODY"),
+            Some("body_shape".to_string())
+        );
         assert_eq!(find_placeholder_object_id(&elements, "SUBTITLE"), None);
     }
 
@@ -2422,7 +2508,10 @@ mod tests {
             json!({ "objectId": "title_box", "shape": { "text": { "textElements": [] } } }),
             json!({ "objectId": "body_box", "shape": { "text": { "textElements": [] } } }),
         ];
-        assert_eq!(find_title_object_id(&elements), Some("title_box".to_string()));
+        assert_eq!(
+            find_title_object_id(&elements),
+            Some("title_box".to_string())
+        );
         assert_eq!(find_body_object_id(&elements), Some("body_box".to_string()));
     }
 
@@ -2432,7 +2521,10 @@ mod tests {
             "objectId": "textbox_1",
             "shape": { "text": { "textElements": [] } }
         })];
-        assert_eq!(find_title_object_id(&elements), Some("textbox_1".to_string()));
+        assert_eq!(
+            find_title_object_id(&elements),
+            Some("textbox_1".to_string())
+        );
     }
 
     #[test]
@@ -2516,11 +2608,20 @@ mod tests {
 
     #[test]
     fn test_placeholder_label() {
-        let ph = PlaceholderInfo { ph_type: "TITLE".to_string(), index: None };
+        let ph = PlaceholderInfo {
+            ph_type: "TITLE".to_string(),
+            index: None,
+        };
         assert_eq!(placeholder_label(&ph), "TITLE");
-        let ph = PlaceholderInfo { ph_type: "SUBTITLE".to_string(), index: Some(3) };
+        let ph = PlaceholderInfo {
+            ph_type: "SUBTITLE".to_string(),
+            index: Some(3),
+        };
         assert_eq!(placeholder_label(&ph), "SUBTITLE[3]");
-        let ph = PlaceholderInfo { ph_type: "BODY".to_string(), index: Some(1) };
+        let ph = PlaceholderInfo {
+            ph_type: "BODY".to_string(),
+            index: Some(1),
+        };
         assert_eq!(placeholder_label(&ph), "BODY[1]");
     }
 
@@ -2544,10 +2645,22 @@ mod tests {
                 "shape": { "placeholder": { "type": "TITLE" } }
             }),
         ];
-        assert_eq!(find_placeholder_by_label(&elements, "SUBTITLE[3]"), Some("sub_3".to_string()));
-        assert_eq!(find_placeholder_by_label(&elements, "SUBTITLE[8]"), Some("sub_8".to_string()));
-        assert_eq!(find_placeholder_by_label(&elements, "SUBTITLE"), Some("sub_0".to_string()));
-        assert_eq!(find_placeholder_by_label(&elements, "TITLE"), Some("title_0".to_string()));
+        assert_eq!(
+            find_placeholder_by_label(&elements, "SUBTITLE[3]"),
+            Some("sub_3".to_string())
+        );
+        assert_eq!(
+            find_placeholder_by_label(&elements, "SUBTITLE[8]"),
+            Some("sub_8".to_string())
+        );
+        assert_eq!(
+            find_placeholder_by_label(&elements, "SUBTITLE"),
+            Some("sub_0".to_string())
+        );
+        assert_eq!(
+            find_placeholder_by_label(&elements, "TITLE"),
+            Some("title_0".to_string())
+        );
         assert_eq!(find_placeholder_by_label(&elements, "SUBTITLE[99]"), None);
         assert_eq!(find_placeholder_by_label(&elements, "BODY"), None);
     }

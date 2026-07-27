@@ -78,25 +78,25 @@ fn plain_to_batch_requests(content: &str, start_index: i32) -> Vec<Value> {
 }
 
 fn strip_plain_prefix(line: &str) -> (&str, Option<&'static str>) {
-    if let Some(rest) = line.strip_prefix("#### ") {
-        if !rest.is_empty() {
-            return (rest, Some("HEADING_3"));
-        }
+    if let Some(rest) = line.strip_prefix("#### ")
+        && !rest.is_empty()
+    {
+        return (rest, Some("HEADING_3"));
     }
-    if let Some(rest) = line.strip_prefix("### ") {
-        if !rest.is_empty() {
-            return (rest, Some("HEADING_2"));
-        }
+    if let Some(rest) = line.strip_prefix("### ")
+        && !rest.is_empty()
+    {
+        return (rest, Some("HEADING_2"));
     }
-    if let Some(rest) = line.strip_prefix("## ") {
-        if !rest.is_empty() {
-            return (rest, Some("HEADING_1"));
-        }
+    if let Some(rest) = line.strip_prefix("## ")
+        && !rest.is_empty()
+    {
+        return (rest, Some("HEADING_1"));
     }
-    if let Some(rest) = line.strip_prefix("# ") {
-        if !rest.is_empty() {
-            return (rest, Some("TITLE"));
-        }
+    if let Some(rest) = line.strip_prefix("# ")
+        && !rest.is_empty()
+    {
+        return (rest, Some("TITLE"));
     }
     (line, None)
 }
@@ -172,48 +172,48 @@ pub fn doc_to_markdown(doc: &Value) -> String {
                 }
                 _ => output.push_str(&format!("{text}\n\n")),
             }
-        } else if let Some(table) = elem.get("table") {
-            if let Some(rows) = table.get("tableRows").and_then(|v| v.as_array()) {
-                for (i, row) in rows.iter().enumerate() {
-                    if let Some(cells) = row.get("tableCells").and_then(|v| v.as_array()) {
-                        let cell_texts: Vec<String> = cells
-                            .iter()
-                            .map(|cell| {
-                                cell.get("content")
-                                    .and_then(|v| v.as_array())
-                                    .map(|paras| {
-                                        paras
-                                            .iter()
-                                            .filter_map(|p| {
-                                                p.pointer("/paragraph/elements")
-                                                    .and_then(|v| v.as_array())
-                                                    .map(|elems| {
-                                                        elems
-                                                            .iter()
-                                                            .filter_map(|e| {
-                                                                e.pointer("/textRun/content")
-                                                                    .and_then(|v| v.as_str())
-                                                            })
-                                                            .collect::<String>()
-                                                            .trim()
-                                                            .to_string()
-                                                    })
-                                            })
-                                            .collect::<Vec<_>>()
-                                            .join(" ")
-                                    })
-                                    .unwrap_or_default()
-                            })
-                            .collect();
-                        output.push_str(&format!("| {} |\n", cell_texts.join(" | ")));
-                        if i == 0 {
-                            let sep: Vec<&str> = cell_texts.iter().map(|_| "---").collect();
-                            output.push_str(&format!("| {} |\n", sep.join(" | ")));
-                        }
+        } else if let Some(table) = elem.get("table")
+            && let Some(rows) = table.get("tableRows").and_then(|v| v.as_array())
+        {
+            for (i, row) in rows.iter().enumerate() {
+                if let Some(cells) = row.get("tableCells").and_then(|v| v.as_array()) {
+                    let cell_texts: Vec<String> = cells
+                        .iter()
+                        .map(|cell| {
+                            cell.get("content")
+                                .and_then(|v| v.as_array())
+                                .map(|paras| {
+                                    paras
+                                        .iter()
+                                        .filter_map(|p| {
+                                            p.pointer("/paragraph/elements")
+                                                .and_then(|v| v.as_array())
+                                                .map(|elems| {
+                                                    elems
+                                                        .iter()
+                                                        .filter_map(|e| {
+                                                            e.pointer("/textRun/content")
+                                                                .and_then(|v| v.as_str())
+                                                        })
+                                                        .collect::<String>()
+                                                        .trim()
+                                                        .to_string()
+                                                })
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join(" ")
+                                })
+                                .unwrap_or_default()
+                        })
+                        .collect();
+                    output.push_str(&format!("| {} |\n", cell_texts.join(" | ")));
+                    if i == 0 {
+                        let sep: Vec<&str> = cell_texts.iter().map(|_| "---").collect();
+                        output.push_str(&format!("| {} |\n", sep.join(" | ")));
                     }
                 }
-                output.push('\n');
             }
+            output.push('\n');
         }
     }
 
@@ -228,12 +228,12 @@ pub fn doc_to_plain(doc: &Value) -> String {
     };
 
     for elem in content {
-        if let Some(paragraph) = elem.get("paragraph") {
-            if let Some(elements) = paragraph.get("elements").and_then(|v| v.as_array()) {
-                for pe in elements {
-                    if let Some(text) = pe.pointer("/textRun/content").and_then(|v| v.as_str()) {
-                        output.push_str(text);
-                    }
+        if let Some(paragraph) = elem.get("paragraph")
+            && let Some(elements) = paragraph.get("elements").and_then(|v| v.as_array())
+        {
+            for pe in elements {
+                if let Some(text) = pe.pointer("/textRun/content").and_then(|v| v.as_str()) {
+                    output.push_str(text);
                 }
             }
         }

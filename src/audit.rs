@@ -33,7 +33,15 @@ impl AuditLogger {
         status: u16,
         duration_ms: u64,
     ) {
-        self.log_allowed_with_tool(None, service, resource, method, http_method, status, duration_ms);
+        self.log_allowed_with_tool(
+            None,
+            service,
+            resource,
+            method,
+            http_method,
+            status,
+            duration_ms,
+        );
     }
 
     pub fn log_allowed_with_tool(

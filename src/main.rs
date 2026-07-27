@@ -1,3 +1,5 @@
+#![allow(dead_code, clippy::too_many_arguments, clippy::manual_async_fn)]
+
 mod audit;
 mod auth;
 mod cache;

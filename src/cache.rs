@@ -61,24 +61,19 @@ impl SheetCache {
         None
     }
 
-    pub fn put(
-        &mut self,
-        spreadsheet_id: &str,
-        range: &str,
-        render_option: &str,
-        data: Value,
-    ) {
+    pub fn put(&mut self, spreadsheet_id: &str, range: &str, render_option: &str, data: Value) {
         let key = CacheKey {
             spreadsheet_id: spreadsheet_id.to_string(),
             range: range.to_string(),
             render_option: render_option.to_string(),
         };
         self.order.retain(|k| k != &key);
-        if self.entries.len() >= self.max_entries && !self.entries.contains_key(&key) {
-            if let Some(evict_key) = self.order.first().cloned() {
-                self.entries.remove(&evict_key);
-                self.order.remove(0);
-            }
+        if self.entries.len() >= self.max_entries
+            && !self.entries.contains_key(&key)
+            && let Some(evict_key) = self.order.first().cloned()
+        {
+            self.entries.remove(&evict_key);
+            self.order.remove(0);
         }
         self.entries.insert(
             key.clone(),
@@ -93,8 +88,7 @@ impl SheetCache {
     pub fn invalidate(&mut self, spreadsheet_id: &str) {
         self.entries
             .retain(|k, _| k.spreadsheet_id != spreadsheet_id);
-        self.order
-            .retain(|k| k.spreadsheet_id != spreadsheet_id);
+        self.order.retain(|k| k.spreadsheet_id != spreadsheet_id);
     }
 
     pub fn clear(&mut self) {
@@ -115,7 +109,12 @@ mod tests {
     #[test]
     fn put_and_get() {
         let mut cache = SheetCache::new(10, 300);
-        cache.put("abc", "A1:B2", "FORMATTED_VALUE", json!({"values": [["a"]]}));
+        cache.put(
+            "abc",
+            "A1:B2",
+            "FORMATTED_VALUE",
+            json!({"values": [["a"]]}),
+        );
         assert!(cache.get("abc", "A1:B2", "FORMATTED_VALUE").is_some());
     }
 
@@ -130,8 +129,14 @@ mod tests {
         let mut cache = SheetCache::new(10, 300);
         cache.put("abc", "A1", "FORMATTED_VALUE", json!("formatted"));
         cache.put("abc", "A1", "FORMULA", json!("=SUM(B1)"));
-        assert_eq!(cache.get("abc", "A1", "FORMATTED_VALUE").unwrap(), &json!("formatted"));
-        assert_eq!(cache.get("abc", "A1", "FORMULA").unwrap(), &json!("=SUM(B1)"));
+        assert_eq!(
+            cache.get("abc", "A1", "FORMATTED_VALUE").unwrap(),
+            &json!("formatted")
+        );
+        assert_eq!(
+            cache.get("abc", "A1", "FORMULA").unwrap(),
+            &json!("=SUM(B1)")
+        );
     }
 
     #[test]

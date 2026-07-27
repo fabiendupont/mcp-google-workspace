@@ -6,7 +6,6 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
-use serde_json::json;
 use tokio::sync::{Mutex, RwLock};
 
 use google_workspace::error::GwsError;

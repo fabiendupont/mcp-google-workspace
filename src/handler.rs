@@ -75,16 +75,12 @@ impl ServerHandler for GwsHandler {
             if st.tools.is_none() {
                 let activated = st.activated_services.clone();
                 let eager = st.eager_tools;
-                let tools = crate::tools::build_tools_list(
-                    &policy,
-                    &mut st.docs,
-                    Some(&activated),
-                    eager,
-                )
-                .await
-                .map_err(|e| {
-                    McpError::internal_error(format!("Failed to build tools: {e}"), None)
-                })?;
+                let tools =
+                    crate::tools::build_tools_list(&policy, &mut st.docs, Some(&activated), eager)
+                        .await
+                        .map_err(|e| {
+                            McpError::internal_error(format!("Failed to build tools: {e}"), None)
+                        })?;
                 st.tools = Some(tools);
             }
             let tools = st.tools.as_ref().unwrap().clone();
@@ -137,18 +133,24 @@ impl ServerHandler for GwsHandler {
             };
             if tools_invalidated {
                 let _ = peer
-                    .send_notification(rmcp::model::ServerNotification::ToolListChangedNotification(
-                        rmcp::model::NotificationNoParam::default(),
-                    ))
+                    .send_notification(
+                        rmcp::model::ServerNotification::ToolListChangedNotification(
+                            rmcp::model::NotificationNoParam::default(),
+                        ),
+                    )
                     .await;
                 tracing::info!("Sent tools/list_changed notification");
             }
 
             match result {
                 Ok(ref value) => {
-                    let is_tool_error = value.get("isError").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let is_tool_error = value
+                        .get("isError")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                     if is_tool_error {
-                        let err_text = value.get("content")
+                        let err_text = value
+                            .get("content")
                             .and_then(|c| c.as_array())
                             .and_then(|a| a.first())
                             .and_then(|e| e.get("text"))
@@ -655,12 +657,12 @@ fn value_to_call_tool_result(value: Value) -> CallToolResult {
 
     let content: Vec<Content> = if let Some(arr) = value.get("content").and_then(|v| v.as_array()) {
         arr.iter()
-            .filter_map(|item| {
+            .map(|item| {
                 let content_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("text");
                 match content_type {
                     "text" => {
                         let text = item.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                        Some(Content::text(text))
+                        Content::text(text)
                     }
                     "image" => {
                         let data = item.get("data").and_then(|v| v.as_str()).unwrap_or("");
@@ -668,11 +670,11 @@ fn value_to_call_tool_result(value: Value) -> CallToolResult {
                             .get("mimeType")
                             .and_then(|v| v.as_str())
                             .unwrap_or("image/png");
-                        Some(Content::image(data, mime))
+                        Content::image(data, mime)
                     }
                     _ => {
                         let text = serde_json::to_string(item).unwrap_or_else(|_| "{}".to_string());
-                        Some(Content::text(text))
+                        Content::text(text)
                     }
                 }
             })

@@ -1156,32 +1156,32 @@ pub fn find_text_in_doc(doc: &Value, needle: &str, occurrence: usize) -> Value {
 
     if let Some(content) = doc.pointer("/body/content").and_then(|v| v.as_array()) {
         for elem in content {
-            if let Some(paragraph) = elem.get("paragraph") {
-                if let Some(elements) = paragraph.get("elements").and_then(|v| v.as_array()) {
-                    for pe in elements {
-                        if let Some(text_run) = pe.get("textRun") {
-                            let text = text_run
-                                .get("content")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            let element_start =
-                                pe.get("startIndex").and_then(|v| v.as_i64()).unwrap_or(0);
+            if let Some(paragraph) = elem.get("paragraph")
+                && let Some(elements) = paragraph.get("elements").and_then(|v| v.as_array())
+            {
+                for pe in elements {
+                    if let Some(text_run) = pe.get("textRun") {
+                        let text = text_run
+                            .get("content")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let element_start =
+                            pe.get("startIndex").and_then(|v| v.as_i64()).unwrap_or(0);
 
-                            let mut search_from = 0;
-                            while let Some(pos) = text[search_from..].find(needle) {
-                                found_count += 1;
-                                if found_count == occurrence {
-                                    let abs_start = element_start + (search_from + pos) as i64;
-                                    let abs_end = abs_start + needle.len() as i64;
-                                    return json!({
-                                        "found": true,
-                                        "startIndex": abs_start,
-                                        "endIndex": abs_end,
-                                        "occurrence": found_count
-                                    });
-                                }
-                                search_from += pos + 1;
+                        let mut search_from = 0;
+                        while let Some(pos) = text[search_from..].find(needle) {
+                            found_count += 1;
+                            if found_count == occurrence {
+                                let abs_start = element_start + (search_from + pos) as i64;
+                                let abs_end = abs_start + needle.len() as i64;
+                                return json!({
+                                    "found": true,
+                                    "startIndex": abs_start,
+                                    "endIndex": abs_end,
+                                    "occurrence": found_count
+                                });
                             }
+                            search_from += pos + 1;
                         }
                     }
                 }
@@ -1233,22 +1233,22 @@ pub fn build_append_section_requests(
         }));
     }
 
-    if let Some(items) = items {
-        if !items.is_empty() {
-            let bullet_text: String = items.iter().map(|i| format!("{i}\n")).collect();
-            requests.push(json!({
-                "insertText": {
-                    "text": bullet_text,
-                    "endOfSegmentLocation": { "segmentId": "" }
-                }
-            }));
-            requests.push(json!({
-                "createParagraphBullets": {
-                    "range": { "startIndex": null, "endIndex": null },
-                    "bulletPreset": bullet_preset
-                }
-            }));
-        }
+    if let Some(items) = items
+        && !items.is_empty()
+    {
+        let bullet_text: String = items.iter().map(|i| format!("{i}\n")).collect();
+        requests.push(json!({
+            "insertText": {
+                "text": bullet_text,
+                "endOfSegmentLocation": { "segmentId": "" }
+            }
+        }));
+        requests.push(json!({
+            "createParagraphBullets": {
+                "range": { "startIndex": null, "endIndex": null },
+                "bulletPreset": bullet_preset
+            }
+        }));
     }
 
     requests
@@ -1382,7 +1382,7 @@ pub fn build_table_populate_requests(
         }
     }
 
-    inserts.sort_by(|a, b| b.index.cmp(&a.index));
+    inserts.sort_by_key(|a| std::cmp::Reverse(a.index));
 
     let mut requests = Vec::new();
     for insert in &inserts {
