@@ -16,6 +16,7 @@ pub fn complete_request(
     match reference {
         Reference::Resource(rr) => complete_resource_uri(&rr.uri, argument, policy),
         Reference::Prompt(pr) => complete_prompt_arg(&pr.name, argument, prompts),
+        _ => CompletionInfo::default(),
     }
 }
 
@@ -37,11 +38,7 @@ fn complete_resource_uri(_uri: &str, argument: &ArgumentInfo, policy: &Policy) -
         } else {
             vec![]
         };
-        CompletionInfo {
-            values: suggestions,
-            total: None,
-            has_more: None,
-        }
+        CompletionInfo::new(suggestions).unwrap_or_default()
     } else {
         CompletionInfo::default()
     }
@@ -86,11 +83,7 @@ fn prefix_filter(prefix: &str, options: &[&str]) -> CompletionInfo {
         .filter(|o| o.to_lowercase().starts_with(&lower))
         .map(|o| o.to_string())
         .collect();
-    CompletionInfo {
-        total: Some(values.len() as u32),
-        values,
-        has_more: Some(false),
-    }
+    CompletionInfo::with_all_values(values).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -119,10 +112,7 @@ mod tests {
     fn test_complete_resource_uri_empty() {
         let policy =
             crate::policy::Policy::from_services(&["drive".to_string(), "docs".to_string()]);
-        let arg = ArgumentInfo {
-            name: "uri".to_string(),
-            value: "".to_string(),
-        };
+        let arg = ArgumentInfo::new("uri", "");
         let result = complete_resource_uri("", &arg, &policy);
         assert!(result.values.iter().any(|v| v.contains("drive")));
         assert!(result.values.iter().any(|v| v.contains("docs")));
@@ -132,10 +122,7 @@ mod tests {
     fn test_complete_resource_uri_partial() {
         let policy =
             crate::policy::Policy::from_services(&["drive".to_string(), "docs".to_string()]);
-        let arg = ArgumentInfo {
-            name: "uri".to_string(),
-            value: "gws://dr".to_string(),
-        };
+        let arg = ArgumentInfo::new("uri", "gws://dr");
         let result = complete_resource_uri("", &arg, &policy);
         assert_eq!(result.values, vec!["gws://drive/"]);
     }

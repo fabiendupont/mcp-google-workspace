@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use google_workspace::discovery::{RestDescription, RestResource};
-use rmcp::model::{AnnotateAble, RawResourceTemplate, ResourceTemplate};
+use rmcp::model::ResourceTemplate;
 
 use crate::policy::Policy;
 
@@ -51,7 +51,7 @@ pub fn build_resource_templates(
         collect_templates(svc_name, &doc.resources, "", &mut templates);
     }
 
-    templates.sort_by(|a, b| a.raw.uri_template.cmp(&b.raw.uri_template));
+    templates.sort_by(|a, b| a.uri_template.cmp(&b.uri_template));
     templates
 }
 
@@ -78,10 +78,9 @@ fn collect_templates(
             let uri_template = format!("gws://{service}/{resource_path}/{{{id_param}}}");
             let description = get_method.description.as_deref().unwrap_or("").to_string();
 
-            let template = RawResourceTemplate::new(&uri_template, &resource_path)
+            let template = ResourceTemplate::new(&uri_template, &resource_path)
                 .with_description(format!("{service}.{resource_path}.get: {description}"))
-                .with_mime_type("application/json")
-                .no_annotation();
+                .with_mime_type("application/json");
 
             out.push(template);
         }
