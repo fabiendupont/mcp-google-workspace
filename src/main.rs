@@ -8,6 +8,7 @@ mod drive_helpers;
 mod elicitation;
 mod execute;
 mod format;
+mod gmail_helpers;
 mod handler;
 mod helpers;
 mod http;
@@ -575,7 +576,7 @@ fn configure_drive() -> Result<serde_json::Value, GwsError> {
 }
 
 fn configure_gmail() -> Result<serde_json::Value, GwsError> {
-    use dialoguer::Confirm;
+    use dialoguer::{Confirm, Input};
 
     eprintln!();
     let block_delete = Confirm::new()
@@ -587,6 +588,12 @@ fn configure_gmail() -> Result<serde_json::Value, GwsError> {
     let block_forwarding = Confirm::new()
         .with_prompt("Gmail: Block auto-forwarding and delegate changes? (recommended)")
         .default(true)
+        .interact()
+        .map_err(|e| GwsError::Validation(format!("Prompt failed: {e}")))?;
+
+    let restrict_labels = Confirm::new()
+        .with_prompt("Gmail: Restrict access to specific labels only?")
+        .default(false)
         .interact()
         .map_err(|e| GwsError::Validation(format!("Prompt failed: {e}")))?;
 
@@ -602,11 +609,27 @@ fn configure_gmail() -> Result<serde_json::Value, GwsError> {
         ]);
     }
 
-    if denied.is_empty() {
-        Ok(serde_json::json!({ "name": "gmail" }))
-    } else {
-        Ok(serde_json::json!({ "name": "gmail", "denied_methods": denied }))
+    let mut policy = serde_json::json!({ "name": "gmail" });
+    if !denied.is_empty() {
+        policy["denied_methods"] = serde_json::json!(denied);
     }
+
+    if restrict_labels {
+        let labels_input: String = Input::new()
+            .with_prompt("Allowed label names (comma-separated)")
+            .interact_text()
+            .map_err(|e| GwsError::Validation(format!("Prompt failed: {e}")))?;
+        let labels: Vec<String> = labels_input
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !labels.is_empty() {
+            policy["allowed_labels"] = serde_json::json!(labels);
+        }
+    }
+
+    Ok(policy)
 }
 
 fn configure_calendar() -> Result<serde_json::Value, GwsError> {

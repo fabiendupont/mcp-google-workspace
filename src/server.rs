@@ -155,6 +155,12 @@ async fn handle_tool_call_inner_concurrent(
         return Ok(result);
     }
 
+    if tool_name.starts_with("gws_gmail_") {
+        let mut st = state.lock().await;
+        let result = execute_gmail_helper(tool_name, arguments, policy, meta, &mut st).await?;
+        return Ok(result);
+    }
+
     if tool_name == "gws_templates" {
         let mut st = state.lock().await;
         let result = execute_list_templates(Some(arguments), policy, meta, &mut st).await;
@@ -186,6 +192,19 @@ async fn handle_tool_call_inner_concurrent(
     }
 
     let svc_alias = tool_name;
+
+    const HELPER_ONLY_SERVICES: &[&str] = &["drive", "docs", "sheets", "slides", "gmail"];
+    if HELPER_ONLY_SERVICES.contains(&svc_alias) {
+        tracing::warn!(
+            service = svc_alias,
+            "Generic tool blocked — use helper tools instead"
+        );
+        return Err(GwsError::Validation(format!(
+            "Service '{svc_alias}' uses helper tools (gws_{svc_alias}_*). \
+             Use gws_discover to see available tools."
+        )));
+    }
+
     if !policy.is_service_allowed(svc_alias) {
         tracing::warn!(service = svc_alias, "Policy denied: service not enabled");
         return Err(GwsError::Validation(
@@ -5374,6 +5393,1275 @@ fn chrono_free_timestamp() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+async fn resolve_allowed_label_ids(
+    allowed_labels: &[String],
+    gmail_doc: &Arc<google_workspace::discovery::RestDescription>,
+    policy: &Policy,
+    meta: &RequestMeta,
+    state: &mut ServerState,
+) -> Result<Vec<String>, GwsError> {
+    if allowed_labels.is_empty() {
+        return Ok(vec![]);
+    }
+    let labels_resource = tools::find_resource(&gmail_doc.resources, "users.labels")
+        .ok_or_else(|| GwsError::Validation("users.labels resource not found".into()))?;
+    let list_method = labels_resource
+        .methods
+        .get("list")
+        .ok_or_else(|| GwsError::Validation("labels.list method not found".into()))?;
+    let args = json!({ "params": { "userId": "me" } });
+    let labels_result = crate::execute::execute_tool(
+        gmail_doc,
+        list_method,
+        "users.labels",
+        "list",
+        &args,
+        "gmail",
+        policy,
+        meta,
+        None,
+        None,
+        false,
+        &mut state.token_cache,
+    )
+    .await?;
+
+    let mut ids = Vec::new();
+    for name in allowed_labels {
+        if let Some(id) = crate::gmail_helpers::resolve_label_id(name, &labels_result) {
+            ids.push(id);
+        } else {
+            tracing::warn!(label = %name, "Allowed label not found in Gmail — skipped");
+        }
+    }
+    Ok(ids)
+}
+
+async fn execute_gmail_helper(
+    tool_name: &str,
+    arguments: &Value,
+    policy: &Policy,
+    meta: &RequestMeta,
+    state: &mut ServerState,
+) -> Result<Value, GwsError> {
+    let gmail_doc = state.get_doc("gmail").await?;
+
+    let allowed_labels = policy.allowed_labels("gmail");
+    let allowed_label_ids =
+        resolve_allowed_label_ids(allowed_labels, &gmail_doc, policy, meta, state).await?;
+
+    match tool_name {
+        "gws_gmail_search" => {
+            let raw_query = arguments
+                .get("query")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let query_string = crate::gmail_helpers::inject_label_query(raw_query, allowed_labels);
+            let query = &query_string;
+            let max_results = arguments
+                .get("max_results")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(20);
+
+            let messages_resource = tools::find_resource(&gmail_doc.resources, "users.messages")
+                .ok_or_else(|| {
+                    GwsError::Validation("users.messages resource not found in gmail API".into())
+                })?;
+            let list_method = messages_resource
+                .methods
+                .get("list")
+                .ok_or_else(|| GwsError::Validation("list method not found".into()))?;
+
+            let args = json!({
+                "params": { "userId": "me", "q": query, "maxResults": max_results },
+                "fields": "messages(id,threadId),resultSizeEstimate,nextPageToken"
+            });
+            let list_result = crate::execute::execute_tool(
+                &gmail_doc,
+                list_method,
+                "users.messages",
+                "list",
+                &args,
+                "gmail",
+                policy,
+                meta,
+                None,
+                None,
+                false,
+                &mut state.token_cache,
+            )
+            .await?;
+
+            let empty_vec = vec![];
+            let message_ids = list_result
+                .get("messages")
+                .and_then(|m| m.as_array())
+                .unwrap_or(&empty_vec);
+            let result_size = list_result
+                .get("resultSizeEstimate")
+                .and_then(|r| r.as_u64())
+                .unwrap_or(0);
+
+            if message_ids.is_empty() {
+                return Ok(json!({
+                    "content": [{ "type": "text", "text": "No messages found" }],
+                    "structuredContent": { "messages": [], "resultSizeEstimate": 0 },
+                    "isError": false
+                }));
+            }
+
+            let get_method = messages_resource
+                .methods
+                .get("get")
+                .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
+
+            let mut enriched = Vec::new();
+            for msg_ref in message_ids.iter().take(max_results as usize) {
+                let msg_id = msg_ref.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                let thread_id = msg_ref
+                    .get("threadId")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("");
+                let get_args = json!({
+                    "params": { "userId": "me", "id": msg_id, "format": "metadata" },
+                    "fields": "id,threadId,snippet,labelIds,payload(headers)"
+                });
+                match crate::execute::execute_tool(
+                    &gmail_doc,
+                    get_method,
+                    "users.messages",
+                    "get",
+                    &get_args,
+                    "gmail",
+                    policy,
+                    meta,
+                    None,
+                    None,
+                    false,
+                    &mut state.token_cache,
+                )
+                .await
+                {
+                    Ok(msg) => {
+                        let empty_headers = json!([]);
+                        let headers = msg
+                            .get("payload")
+                            .and_then(|p| p.get("headers"))
+                            .unwrap_or(&empty_headers);
+                        let hdr_map = crate::gmail_helpers::extract_headers(
+                            headers,
+                            &["From", "To", "Subject", "Date"],
+                        );
+                        enriched.push(json!({
+                            "id": msg.get("id").unwrap_or(&json!(msg_id)),
+                            "threadId": msg.get("threadId").unwrap_or(&json!(thread_id)),
+                            "subject": hdr_map.get("subject").unwrap_or(&json!("")),
+                            "from": hdr_map.get("from").unwrap_or(&json!("")),
+                            "to": hdr_map.get("to").unwrap_or(&json!("")),
+                            "date": hdr_map.get("date").unwrap_or(&json!("")),
+                            "snippet": msg.get("snippet").unwrap_or(&json!("")),
+                            "labelIds": msg.get("labelIds").unwrap_or(&json!([]))
+                        }));
+                    }
+                    Err(e) => {
+                        tracing::warn!(message_id = msg_id, error = %e, "Failed to fetch message metadata");
+                    }
+                }
+            }
+
+            let result = json!({ "messages": enriched, "resultSizeEstimate": result_size });
+            Ok(json!({
+                "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
+                "structuredContent": result,
+                "isError": false
+            }))
+        }
+
+        "gws_gmail_read" => {
+            let message_id = arguments
+                .get("message_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| GwsError::Validation("Missing 'message_id'".into()))?;
+            let format = arguments
+                .get("format")
+                .and_then(|v| v.as_str())
+                .unwrap_or("full");
+
+            let messages_resource = tools::find_resource(&gmail_doc.resources, "users.messages")
+                .ok_or_else(|| GwsError::Validation("users.messages resource not found".into()))?;
+            let get_method = messages_resource
+                .methods
+                .get("get")
+                .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
+
+            let args = json!({
+                "params": { "userId": "me", "id": message_id, "format": format }
+            });
+            let msg = crate::execute::execute_tool(
+                &gmail_doc,
+                get_method,
+                "users.messages",
+                "get",
+                &args,
+                "gmail",
+                policy,
+                meta,
+                None,
+                None,
+                false,
+                &mut state.token_cache,
+            )
+            .await?;
+
+            if !allowed_label_ids.is_empty() {
+                let msg_labels = crate::gmail_helpers::extract_label_ids(&msg);
+                crate::gmail_helpers::check_label_policy(&msg_labels, &allowed_label_ids)
+                    .map_err(GwsError::Validation)?;
+            }
+
+            let empty_headers = json!([]);
+            let empty_payload = json!({});
+            let headers = msg
+                .get("payload")
+                .and_then(|p| p.get("headers"))
+                .unwrap_or(&empty_headers);
+            let hdr_map = crate::gmail_helpers::extract_headers(
+                headers,
+                &["From", "To", "Cc", "Subject", "Date", "Message-ID"],
+            );
+
+            let body_text = if format == "full" {
+                let payload = msg.get("payload").unwrap_or(&empty_payload);
+                crate::gmail_helpers::decode_message_body(payload)
+            } else {
+                String::new()
+            };
+
+            let attachments = if format == "full" {
+                let payload = msg.get("payload").unwrap_or(&empty_payload);
+                crate::gmail_helpers::list_attachments(payload)
+            } else {
+                vec![]
+            };
+
+            let result = json!({
+                "id": msg.get("id"),
+                "threadId": msg.get("threadId"),
+                "labelIds": msg.get("labelIds"),
+                "snippet": msg.get("snippet"),
+                "headers": hdr_map,
+                "body": body_text,
+                "attachments": attachments
+            });
+            Ok(json!({
+                "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
+                "structuredContent": result,
+                "isError": false
+            }))
+        }
+
+        "gws_gmail_draft" => {
+            let to = arguments
+                .get("to")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| GwsError::Validation("Missing 'to'".into()))?;
+            let subject = arguments
+                .get("subject")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| GwsError::Validation("Missing 'subject'".into()))?;
+            let body = arguments
+                .get("body")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| GwsError::Validation("Missing 'body'".into()))?;
+            let cc = arguments.get("cc").and_then(|v| v.as_str());
+            let bcc = arguments.get("bcc").and_then(|v| v.as_str());
+            let is_markdown = arguments.get("format").and_then(|v| v.as_str()) == Some("markdown");
+
+            let html_body = if is_markdown {
+                let html = crate::gmail_helpers::markdown_to_html(body);
+                Some(crate::gmail_helpers::build_html_email_body(&html))
+            } else {
+                None
+            };
+            let raw = crate::gmail_helpers::build_rfc2822_message(
+                to,
+                cc,
+                bcc,
+                subject,
+                body,
+                None,
+                None,
+                html_body.as_deref(),
+            );
+
+            let drafts_resource = tools::find_resource(&gmail_doc.resources, "users.drafts")
+                .ok_or_else(|| GwsError::Validation("users.drafts resource not found".into()))?;
+            let create_method = drafts_resource
+                .methods
+                .get("create")
+                .ok_or_else(|| GwsError::Validation("create method not found".into()))?;
+
+            let args = json!({
+                "params": { "userId": "me" },
+                "body": { "message": { "raw": raw } }
+            });
+            let result = crate::execute::execute_tool(
+                &gmail_doc,
+                create_method,
+                "users.drafts",
+                "create",
+                &args,
+                "gmail",
+                policy,
+                meta,
+                None,
+                None,
+                false,
+                &mut state.token_cache,
+            )
+            .await?;
+
+            Ok(json!({
+                "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
+                "structuredContent": result,
+                "isError": false
+            }))
+        }
+
+        "gws_gmail_send" => {
+            let draft_id = arguments.get("draft_id").and_then(|v| v.as_str());
+
+            if let Some(did) = draft_id {
+                let drafts_resource = tools::find_resource(&gmail_doc.resources, "users.drafts")
+                    .ok_or_else(|| {
+                        GwsError::Validation("users.drafts resource not found".into())
+                    })?;
+                let send_method = drafts_resource
+                    .methods
+                    .get("send")
+                    .ok_or_else(|| GwsError::Validation("drafts.send method not found".into()))?;
+                let args = json!({
+                    "params": { "userId": "me" },
+                    "body": { "id": did }
+                });
+                let result = crate::execute::execute_tool(
+                    &gmail_doc,
+                    send_method,
+                    "users.drafts",
+                    "send",
+                    &args,
+                    "gmail",
+                    policy,
+                    meta,
+                    None,
+                    None,
+                    false,
+                    &mut state.token_cache,
+                )
+                .await?;
+                return Ok(json!({
+                    "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
+                    "structuredContent": result,
+                    "isError": false
+                }));
+            }
+
+            let to = arguments
+                .get("to")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    GwsError::Validation(
+                        "Missing 'to' (or provide 'draft_id' to send an existing draft)".into(),
+                    )
+                })?;
+            let subject = arguments
+                .get("subject")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| GwsError::Validation("Missing 'subject'".into()))?;
+            let body = arguments
+                .get("body")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| GwsError::Validation("Missing 'body'".into()))?;
+            let cc = arguments.get("cc").and_then(|v| v.as_str());
+            let bcc = arguments.get("bcc").and_then(|v| v.as_str());
+            let is_markdown = arguments.get("format").and_then(|v| v.as_str()) == Some("markdown");
+
+            let html_body = if is_markdown {
+                let html = crate::gmail_helpers::markdown_to_html(body);
+                Some(crate::gmail_helpers::build_html_email_body(&html))
+            } else {
+                None
+            };
+            let raw = crate::gmail_helpers::build_rfc2822_message(
+                to,
+                cc,
+                bcc,
+                subject,
+                body,
+                None,
+                None,
+                html_body.as_deref(),
+            );
+
+            let messages_resource = tools::find_resource(&gmail_doc.resources, "users.messages")
+                .ok_or_else(|| GwsError::Validation("users.messages resource not found".into()))?;
+            let send_method = messages_resource
+                .methods
+                .get("send")
+                .ok_or_else(|| GwsError::Validation("messages.send method not found".into()))?;
+
+            let args = json!({
+                "params": { "userId": "me" },
+                "body": { "raw": raw }
+            });
+            let result = crate::execute::execute_tool(
+                &gmail_doc,
+                send_method,
+                "users.messages",
+                "send",
+                &args,
+                "gmail",
+                policy,
+                meta,
+                None,
+                None,
+                false,
+                &mut state.token_cache,
+            )
+            .await?;
+
+            Ok(json!({
+                "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
+                "structuredContent": result,
+                "isError": false
+            }))
+        }
+
+        "gws_gmail_reply" => {
+            let message_id = arguments
+                .get("message_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| GwsError::Validation("Missing 'message_id'".into()))?;
+            let reply_body = arguments
+                .get("body")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| GwsError::Validation("Missing 'body'".into()))?;
+            let override_to = arguments.get("to").and_then(|v| v.as_str());
+            let cc = arguments.get("cc").and_then(|v| v.as_str());
+
+            let messages_resource = tools::find_resource(&gmail_doc.resources, "users.messages")
+                .ok_or_else(|| GwsError::Validation("users.messages resource not found".into()))?;
+            let get_method = messages_resource
+                .methods
+                .get("get")
+                .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
+
+            let get_args = json!({
+                "params": { "userId": "me", "id": message_id, "format": "metadata" },
+                "fields": "id,threadId,labelIds,payload(headers)"
+            });
+            let original = crate::execute::execute_tool(
+                &gmail_doc,
+                get_method,
+                "users.messages",
+                "get",
+                &get_args,
+                "gmail",
+                policy,
+                meta,
+                None,
+                None,
+                false,
+                &mut state.token_cache,
+            )
+            .await?;
+
+            if !allowed_label_ids.is_empty() {
+                let msg_labels = crate::gmail_helpers::extract_label_ids(&original);
+                crate::gmail_helpers::check_label_policy(&msg_labels, &allowed_label_ids)
+                    .map_err(GwsError::Validation)?;
+            }
+
+            let empty_headers = json!([]);
+            let orig_headers = original
+                .get("payload")
+                .and_then(|p| p.get("headers"))
+                .unwrap_or(&empty_headers);
+            let hdr_map = crate::gmail_helpers::extract_headers(
+                orig_headers,
+                &["From", "Subject", "Message-ID"],
+            );
+
+            let to = override_to
+                .unwrap_or_else(|| hdr_map.get("from").and_then(|v| v.as_str()).unwrap_or(""));
+            let orig_subject = hdr_map
+                .get("subject")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let subject = if orig_subject.to_lowercase().starts_with("re:") {
+                orig_subject.to_string()
+            } else {
+                format!("Re: {orig_subject}")
+            };
+            let message_id_header = hdr_map.get("message-id").and_then(|v| v.as_str());
+            let thread_id = original
+                .get("threadId")
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
+
+            let is_markdown = arguments.get("format").and_then(|v| v.as_str()) == Some("markdown");
+            let html_body = if is_markdown {
+                let html = crate::gmail_helpers::markdown_to_html(reply_body);
+                Some(crate::gmail_helpers::build_html_email_body(&html))
+            } else {
+                None
+            };
+            let raw = crate::gmail_helpers::build_rfc2822_message(
+                to,
+                cc,
+                None,
+                &subject,
+                reply_body,
+                message_id_header,
+                message_id_header,
+                html_body.as_deref(),
+            );
+
+            let send_method = messages_resource
+                .methods
+                .get("send")
+                .ok_or_else(|| GwsError::Validation("messages.send method not found".into()))?;
+
+            let args = json!({
+                "params": { "userId": "me" },
+                "body": { "raw": raw, "threadId": thread_id }
+            });
+            let result = crate::execute::execute_tool(
+                &gmail_doc,
+                send_method,
+                "users.messages",
+                "send",
+                &args,
+                "gmail",
+                policy,
+                meta,
+                None,
+                None,
+                false,
+                &mut state.token_cache,
+            )
+            .await?;
+
+            Ok(json!({
+                "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
+                "structuredContent": result,
+                "isError": false
+            }))
+        }
+
+        "gws_gmail_thread" => {
+            let thread_id = arguments
+                .get("thread_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| GwsError::Validation("Missing 'thread_id'".into()))?;
+
+            let threads_resource = tools::find_resource(&gmail_doc.resources, "users.threads")
+                .ok_or_else(|| GwsError::Validation("users.threads resource not found".into()))?;
+            let get_method = threads_resource
+                .methods
+                .get("get")
+                .ok_or_else(|| GwsError::Validation("threads.get method not found".into()))?;
+
+            let args = json!({
+                "params": { "userId": "me", "id": thread_id, "format": "full" }
+            });
+            let thread = crate::execute::execute_tool(
+                &gmail_doc,
+                get_method,
+                "users.threads",
+                "get",
+                &args,
+                "gmail",
+                policy,
+                meta,
+                None,
+                None,
+                false,
+                &mut state.token_cache,
+            )
+            .await?;
+
+            if !allowed_label_ids.is_empty() {
+                let empty_msg = json!({});
+                let first_msg = thread
+                    .get("messages")
+                    .and_then(|m| m.as_array())
+                    .and_then(|a| a.first())
+                    .unwrap_or(&empty_msg);
+                let msg_labels = crate::gmail_helpers::extract_label_ids(first_msg);
+                crate::gmail_helpers::check_label_policy(&msg_labels, &allowed_label_ids)
+                    .map_err(GwsError::Validation)?;
+            }
+
+            let empty_arr = vec![];
+            let messages = thread
+                .get("messages")
+                .and_then(|m| m.as_array())
+                .unwrap_or(&empty_arr);
+
+            let mut conversation = Vec::new();
+            for msg in messages {
+                let empty_headers = json!([]);
+                let headers = msg
+                    .get("payload")
+                    .and_then(|p| p.get("headers"))
+                    .unwrap_or(&empty_headers);
+                let hdr_map = crate::gmail_helpers::extract_headers(
+                    headers,
+                    &["From", "To", "Cc", "Subject", "Date"],
+                );
+                let empty_payload = json!({});
+                let payload = msg.get("payload").unwrap_or(&empty_payload);
+                let raw_body = crate::gmail_helpers::decode_message_body(payload);
+                let body = crate::gmail_helpers::strip_quoted_text(&raw_body);
+                let attachments = crate::gmail_helpers::list_attachments(payload);
+
+                conversation.push(json!({
+                    "id": msg.get("id"),
+                    "from": hdr_map.get("from"),
+                    "to": hdr_map.get("to"),
+                    "cc": hdr_map.get("cc"),
+                    "subject": hdr_map.get("subject"),
+                    "date": hdr_map.get("date"),
+                    "body": body,
+                    "attachments": attachments
+                }));
+            }
+
+            let result = json!({
+                "threadId": thread.get("id"),
+                "messageCount": messages.len(),
+                "messages": conversation
+            });
+            Ok(json!({
+                "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
+                "structuredContent": result,
+                "isError": false
+            }))
+        }
+
+        "gws_gmail_attachment" => {
+            let message_id = arguments
+                .get("message_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| GwsError::Validation("Missing 'message_id'".into()))?;
+            let attachment_id = arguments
+                .get("attachment_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| GwsError::Validation("Missing 'attachment_id'".into()))?;
+
+            if !allowed_label_ids.is_empty() {
+                let messages_resource =
+                    tools::find_resource(&gmail_doc.resources, "users.messages").ok_or_else(
+                        || GwsError::Validation("users.messages resource not found".into()),
+                    )?;
+                let get_method = messages_resource
+                    .methods
+                    .get("get")
+                    .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
+                let get_args = json!({
+                    "params": { "userId": "me", "id": message_id, "format": "minimal" },
+                    "fields": "id,labelIds"
+                });
+                let msg = crate::execute::execute_tool(
+                    &gmail_doc,
+                    get_method,
+                    "users.messages",
+                    "get",
+                    &get_args,
+                    "gmail",
+                    policy,
+                    meta,
+                    None,
+                    None,
+                    false,
+                    &mut state.token_cache,
+                )
+                .await?;
+                let msg_labels = crate::gmail_helpers::extract_label_ids(&msg);
+                crate::gmail_helpers::check_label_policy(&msg_labels, &allowed_label_ids)
+                    .map_err(GwsError::Validation)?;
+            }
+
+            let attachments_resource =
+                tools::find_resource(&gmail_doc.resources, "users.messages.attachments")
+                    .ok_or_else(|| {
+                        GwsError::Validation("users.messages.attachments resource not found".into())
+                    })?;
+            let get_method = attachments_resource
+                .methods
+                .get("get")
+                .ok_or_else(|| GwsError::Validation("attachments.get method not found".into()))?;
+
+            let args = json!({
+                "params": { "userId": "me", "messageId": message_id, "id": attachment_id }
+            });
+            let att_result = crate::execute::execute_tool(
+                &gmail_doc,
+                get_method,
+                "users.messages.attachments",
+                "get",
+                &args,
+                "gmail",
+                policy,
+                meta,
+                None,
+                None,
+                false,
+                &mut state.token_cache,
+            )
+            .await?;
+
+            let data = att_result
+                .get("data")
+                .and_then(|d| d.as_str())
+                .unwrap_or("");
+            let size = att_result.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
+
+            let messages_resource = tools::find_resource(&gmail_doc.resources, "users.messages")
+                .ok_or_else(|| GwsError::Validation("users.messages resource not found".into()))?;
+            let msg_get = messages_resource
+                .methods
+                .get("get")
+                .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
+            let msg_args = json!({
+                "params": { "userId": "me", "id": message_id, "format": "full" },
+                "fields": "payload"
+            });
+            let msg = crate::execute::execute_tool(
+                &gmail_doc,
+                msg_get,
+                "users.messages",
+                "get",
+                &msg_args,
+                "gmail",
+                policy,
+                meta,
+                None,
+                None,
+                false,
+                &mut state.token_cache,
+            )
+            .await?;
+            let empty_payload = json!({});
+            let payload = msg.get("payload").unwrap_or(&empty_payload);
+            let attachments = crate::gmail_helpers::list_attachments(payload);
+            let mime = attachments
+                .iter()
+                .find(|a| a.get("attachmentId").and_then(|i| i.as_str()) == Some(attachment_id))
+                .and_then(|a| a.get("mimeType").and_then(|m| m.as_str()))
+                .unwrap_or("application/octet-stream");
+            let filename = attachments
+                .iter()
+                .find(|a| a.get("attachmentId").and_then(|i| i.as_str()) == Some(attachment_id))
+                .and_then(|a| a.get("filename").and_then(|f| f.as_str()))
+                .unwrap_or("attachment");
+
+            let folder_id = arguments.get("folder_id").and_then(|v| v.as_str());
+
+            if let Some(fid) = folder_id {
+                let raw_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(data)
+                    .map_err(|_| GwsError::Validation("Failed to decode attachment data".into()))?;
+                let standard_b64 = base64::engine::general_purpose::STANDARD.encode(&raw_bytes);
+
+                let drive_doc = state.get_doc("drive").await?;
+                let files_resource = tools::find_resource(&drive_doc.resources, "files")
+                    .ok_or_else(|| GwsError::Validation("Drive files resource not found".into()))?;
+                let create_method = files_resource
+                    .methods
+                    .get("create")
+                    .ok_or_else(|| GwsError::Validation("Drive files.create not found".into()))?;
+
+                let upload_args = json!({
+                    "body": { "name": filename, "parents": [fid] },
+                    "media_data": standard_b64,
+                    "media_content_type": mime
+                });
+                let upload_result = crate::execute::execute_tool(
+                    &drive_doc,
+                    create_method,
+                    "files",
+                    "create",
+                    &upload_args,
+                    "drive",
+                    policy,
+                    meta,
+                    None,
+                    None,
+                    false,
+                    &mut state.token_cache,
+                )
+                .await?;
+
+                let file_id = upload_result
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let result = json!({
+                    "filename": filename,
+                    "mimeType": mime,
+                    "size": size,
+                    "savedToDrive": true,
+                    "driveFileId": file_id,
+                    "folderId": fid
+                });
+                return Ok(json!({
+                    "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
+                    "structuredContent": result,
+                    "isError": false
+                }));
+            }
+
+            if crate::gmail_helpers::is_text_mime(mime) {
+                if let Ok(decoded) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(data) {
+                    if let Ok(text) = String::from_utf8(decoded) {
+                        let result = json!({
+                            "filename": filename,
+                            "mimeType": mime,
+                            "size": size,
+                            "content": text
+                        });
+                        return Ok(json!({
+                            "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
+                            "structuredContent": result,
+                            "isError": false
+                        }));
+                    }
+                }
+            }
+
+            let result = json!({
+                "filename": filename,
+                "mimeType": mime,
+                "size": size,
+                "encoding": "base64url",
+                "data": data
+            });
+            Ok(json!({
+                "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
+                "structuredContent": result,
+                "isError": false
+            }))
+        }
+
+        "gws_gmail_contacts" => {
+            let query = arguments
+                .get("query")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| GwsError::Validation("Missing 'query'".into()))?;
+            let max_results = arguments
+                .get("max_results")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(5)
+                .min(30);
+
+            let people_doc = state.get_doc("people").await?;
+            let people_resource = tools::find_resource(&people_doc.resources, "people.connections")
+                .ok_or_else(|| {
+                    GwsError::Validation(
+                        "people.connections resource not found in People API".into(),
+                    )
+                })?;
+            let list_method = people_resource
+                .methods
+                .get("list")
+                .ok_or_else(|| GwsError::Validation("connections.list method not found".into()))?;
+
+            let query_lower = query.to_lowercase();
+            let mut contacts = Vec::new();
+            let mut page_token: Option<String> = None;
+
+            loop {
+                let mut params = json!({
+                    "resourceName": "people/me",
+                    "personFields": "names,emailAddresses,organizations",
+                    "pageSize": 100
+                });
+                if let Some(ref token) = page_token {
+                    params["pageToken"] = json!(token);
+                }
+                let args = json!({ "params": params });
+                let page = crate::execute::execute_tool(
+                    &people_doc,
+                    list_method,
+                    "people.connections",
+                    "list",
+                    &args,
+                    "people",
+                    policy,
+                    meta,
+                    None,
+                    None,
+                    false,
+                    &mut state.token_cache,
+                )
+                .await?;
+
+                let empty_arr = vec![];
+                let connections = page
+                    .get("connections")
+                    .and_then(|c| c.as_array())
+                    .unwrap_or(&empty_arr);
+
+                for person in connections {
+                    let name = person
+                        .get("names")
+                        .and_then(|n| n.as_array())
+                        .and_then(|a| a.first())
+                        .and_then(|n| n.get("displayName"))
+                        .and_then(|d| d.as_str())
+                        .unwrap_or("");
+                    let emails: Vec<&str> = person
+                        .get("emailAddresses")
+                        .and_then(|e| e.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|e| e.get("value").and_then(|v| v.as_str()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+
+                    if emails.is_empty() {
+                        continue;
+                    }
+
+                    let name_match = name.to_lowercase().contains(&query_lower);
+                    let email_match = emails
+                        .iter()
+                        .any(|e| e.to_lowercase().contains(&query_lower));
+
+                    if name_match || email_match {
+                        let org = person
+                            .get("organizations")
+                            .and_then(|o| o.as_array())
+                            .and_then(|a| a.first())
+                            .and_then(|o| o.get("name"))
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("");
+                        contacts.push(json!({
+                            "name": name,
+                            "emails": emails,
+                            "organization": org
+                        }));
+                        if contacts.len() >= max_results as usize {
+                            break;
+                        }
+                    }
+                }
+
+                if contacts.len() >= max_results as usize {
+                    break;
+                }
+                page_token = page
+                    .get("nextPageToken")
+                    .and_then(|t| t.as_str())
+                    .map(String::from);
+                if page_token.is_none() {
+                    break;
+                }
+            }
+
+            let result = json!({ "contacts": contacts, "count": contacts.len() });
+            Ok(json!({
+                "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
+                "structuredContent": result,
+                "isError": false
+            }))
+        }
+
+        "gws_gmail_forward" => {
+            let message_id = arguments
+                .get("message_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| GwsError::Validation("Missing 'message_id'".into()))?;
+            let to = arguments
+                .get("to")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| GwsError::Validation("Missing 'to'".into()))?;
+            let comment = arguments.get("comment").and_then(|v| v.as_str());
+            let cc = arguments.get("cc").and_then(|v| v.as_str());
+
+            let messages_resource = tools::find_resource(&gmail_doc.resources, "users.messages")
+                .ok_or_else(|| GwsError::Validation("users.messages resource not found".into()))?;
+            let get_method = messages_resource
+                .methods
+                .get("get")
+                .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
+
+            let get_args = json!({
+                "params": { "userId": "me", "id": message_id, "format": "full" }
+            });
+            let original = crate::execute::execute_tool(
+                &gmail_doc,
+                get_method,
+                "users.messages",
+                "get",
+                &get_args,
+                "gmail",
+                policy,
+                meta,
+                None,
+                None,
+                false,
+                &mut state.token_cache,
+            )
+            .await?;
+
+            if !allowed_label_ids.is_empty() {
+                let msg_labels = crate::gmail_helpers::extract_label_ids(&original);
+                crate::gmail_helpers::check_label_policy(&msg_labels, &allowed_label_ids)
+                    .map_err(GwsError::Validation)?;
+            }
+
+            let empty_headers = json!([]);
+            let empty_payload = json!({});
+            let headers = original
+                .get("payload")
+                .and_then(|p| p.get("headers"))
+                .unwrap_or(&empty_headers);
+            let hdr_map =
+                crate::gmail_helpers::extract_headers(headers, &["From", "To", "Subject", "Date"]);
+            let orig_from = hdr_map.get("from").and_then(|v| v.as_str()).unwrap_or("");
+            let orig_to = hdr_map.get("to").and_then(|v| v.as_str()).unwrap_or("");
+            let orig_subject = hdr_map
+                .get("subject")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let orig_date = hdr_map.get("date").and_then(|v| v.as_str()).unwrap_or("");
+            let payload = original.get("payload").unwrap_or(&empty_payload);
+            let orig_body = crate::gmail_helpers::decode_message_body(payload);
+
+            let fwd_subject = if orig_subject.to_lowercase().starts_with("fwd:") {
+                orig_subject.to_string()
+            } else {
+                format!("Fwd: {orig_subject}")
+            };
+
+            let fwd_body = crate::gmail_helpers::build_forward_body(
+                comment,
+                orig_from,
+                orig_date,
+                orig_subject,
+                orig_to,
+                &orig_body,
+            );
+
+            let raw = crate::gmail_helpers::build_rfc2822_message(
+                to,
+                cc,
+                None,
+                &fwd_subject,
+                &fwd_body,
+                None,
+                None,
+                None,
+            );
+
+            let send_method = messages_resource
+                .methods
+                .get("send")
+                .ok_or_else(|| GwsError::Validation("messages.send method not found".into()))?;
+
+            let args = json!({
+                "params": { "userId": "me" },
+                "body": { "raw": raw }
+            });
+            let result = crate::execute::execute_tool(
+                &gmail_doc,
+                send_method,
+                "users.messages",
+                "send",
+                &args,
+                "gmail",
+                policy,
+                meta,
+                None,
+                None,
+                false,
+                &mut state.token_cache,
+            )
+            .await?;
+
+            Ok(json!({
+                "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
+                "structuredContent": result,
+                "isError": false
+            }))
+        }
+
+        "gws_gmail_labels" => {
+            let action = arguments
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("list");
+
+            let labels_resource = tools::find_resource(&gmail_doc.resources, "users.labels")
+                .ok_or_else(|| GwsError::Validation("users.labels resource not found".into()))?;
+
+            if action == "list" {
+                let list_method = labels_resource
+                    .methods
+                    .get("list")
+                    .ok_or_else(|| GwsError::Validation("labels.list method not found".into()))?;
+                let args = json!({ "params": { "userId": "me" } });
+                let result = crate::execute::execute_tool(
+                    &gmail_doc,
+                    list_method,
+                    "users.labels",
+                    "list",
+                    &args,
+                    "gmail",
+                    policy,
+                    meta,
+                    None,
+                    None,
+                    false,
+                    &mut state.token_cache,
+                )
+                .await?;
+                return Ok(json!({
+                    "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
+                    "structuredContent": result,
+                    "isError": false
+                }));
+            }
+
+            let msg_id = arguments
+                .get("message_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    GwsError::Validation("Missing 'message_id' for label add/remove".into())
+                })?;
+            let label_name = arguments
+                .get("label")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    GwsError::Validation("Missing 'label' for label add/remove".into())
+                })?;
+
+            if !allowed_label_ids.is_empty() {
+                crate::gmail_helpers::check_label_target_policy(label_name, allowed_labels)
+                    .map_err(GwsError::Validation)?;
+
+                let messages_resource =
+                    tools::find_resource(&gmail_doc.resources, "users.messages").ok_or_else(
+                        || GwsError::Validation("users.messages resource not found".into()),
+                    )?;
+                let get_method = messages_resource
+                    .methods
+                    .get("get")
+                    .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
+                let get_args = json!({
+                    "params": { "userId": "me", "id": msg_id, "format": "minimal" },
+                    "fields": "id,labelIds"
+                });
+                let msg = crate::execute::execute_tool(
+                    &gmail_doc,
+                    get_method,
+                    "users.messages",
+                    "get",
+                    &get_args,
+                    "gmail",
+                    policy,
+                    meta,
+                    None,
+                    None,
+                    false,
+                    &mut state.token_cache,
+                )
+                .await?;
+                let msg_labels = crate::gmail_helpers::extract_label_ids(&msg);
+                crate::gmail_helpers::check_label_policy(&msg_labels, &allowed_label_ids)
+                    .map_err(GwsError::Validation)?;
+            }
+
+            let list_method = labels_resource
+                .methods
+                .get("list")
+                .ok_or_else(|| GwsError::Validation("labels.list method not found".into()))?;
+            let labels_args = json!({ "params": { "userId": "me" } });
+            let labels_result = crate::execute::execute_tool(
+                &gmail_doc,
+                list_method,
+                "users.labels",
+                "list",
+                &labels_args,
+                "gmail",
+                policy,
+                meta,
+                None,
+                None,
+                false,
+                &mut state.token_cache,
+            )
+            .await?;
+
+            let label_id = crate::gmail_helpers::resolve_label_id(label_name, &labels_result)
+                .ok_or_else(|| GwsError::Validation(format!("Label '{label_name}' not found")))?;
+
+            let messages_resource = tools::find_resource(&gmail_doc.resources, "users.messages")
+                .ok_or_else(|| GwsError::Validation("users.messages resource not found".into()))?;
+            let modify_method = messages_resource
+                .methods
+                .get("modify")
+                .ok_or_else(|| GwsError::Validation("messages.modify method not found".into()))?;
+
+            let body = match action {
+                "add" => json!({ "addLabelIds": [label_id] }),
+                "remove" => json!({ "removeLabelIds": [label_id] }),
+                _ => {
+                    return Err(GwsError::Validation(format!(
+                        "Invalid action '{action}'. Use: list, add, remove"
+                    )));
+                }
+            };
+
+            let args = json!({
+                "params": { "userId": "me", "id": msg_id },
+                "body": body
+            });
+            let result = crate::execute::execute_tool(
+                &gmail_doc,
+                modify_method,
+                "users.messages",
+                "modify",
+                &args,
+                "gmail",
+                policy,
+                meta,
+                None,
+                None,
+                false,
+                &mut state.token_cache,
+            )
+            .await?;
+
+            Ok(json!({
+                "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
+                "structuredContent": result,
+                "isError": false
+            }))
+        }
+
+        _ => Err(GwsError::Validation(format!(
+            "Unknown Gmail tool '{tool_name}'. Available: gws_gmail_search, gws_gmail_read, \
+             gws_gmail_thread, gws_gmail_attachment, gws_gmail_contacts, gws_gmail_forward, \
+             gws_gmail_draft, gws_gmail_send, gws_gmail_reply, gws_gmail_labels"
+        ))),
+    }
 }
 
 const MAX_BATCH_SIZE: usize = 100;

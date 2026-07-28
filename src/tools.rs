@@ -76,7 +76,7 @@ pub async fn build_tools_list(
 ) -> Result<Vec<Tool>, GwsError> {
     let mut tools = Vec::new();
 
-    const SERVICES_WITH_HELPERS: &[&str] = &["drive", "docs", "sheets", "slides"];
+    const SERVICES_WITH_HELPERS: &[&str] = &["drive", "docs", "sheets", "slides", "gmail"];
 
     // Pre-load discovery docs for all services (helpers need them)
     for svc_name in policy.allowed_services() {
@@ -342,6 +342,38 @@ pub async fn build_tools_list(
     ));
     tools.push(tool_from_json(crate::image_gen::image_gen_tool_schema()));
 
+    // Gmail helper tools
+    tools.push(tool_from_json(
+        crate::gmail_helpers::gmail_search_tool_schema(),
+    ));
+    tools.push(tool_from_json(
+        crate::gmail_helpers::gmail_read_tool_schema(),
+    ));
+    tools.push(tool_from_json(
+        crate::gmail_helpers::gmail_draft_tool_schema(),
+    ));
+    tools.push(tool_from_json(
+        crate::gmail_helpers::gmail_send_tool_schema(),
+    ));
+    tools.push(tool_from_json(
+        crate::gmail_helpers::gmail_reply_tool_schema(),
+    ));
+    tools.push(tool_from_json(
+        crate::gmail_helpers::gmail_thread_tool_schema(),
+    ));
+    tools.push(tool_from_json(
+        crate::gmail_helpers::gmail_attachment_tool_schema(),
+    ));
+    tools.push(tool_from_json(
+        crate::gmail_helpers::gmail_contacts_tool_schema(),
+    ));
+    tools.push(tool_from_json(
+        crate::gmail_helpers::gmail_forward_tool_schema(),
+    ));
+    tools.push(tool_from_json(
+        crate::gmail_helpers::gmail_labels_tool_schema(),
+    ));
+
     if eager {
         return Ok(tools);
     }
@@ -360,6 +392,8 @@ pub async fn build_tools_list(
             || name == "gws_generate_image"
         {
             Some("slides")
+        } else if name.starts_with("gws_gmail_") {
+            Some("gmail")
         } else {
             None
         }
@@ -424,6 +458,16 @@ fn tool_full_schema(name: &str) -> Option<Value> {
         "gws_slides_reorder" => crate::slides_helpers::slides_reorder_tool_schema(),
         "gws_slides_duplicate" => crate::slides_helpers::slides_duplicate_tool_schema(),
         "gws_slides_update" => crate::slides_helpers::slides_update_tool_schema(),
+        "gws_gmail_search" => crate::gmail_helpers::gmail_search_tool_schema(),
+        "gws_gmail_read" => crate::gmail_helpers::gmail_read_tool_schema(),
+        "gws_gmail_draft" => crate::gmail_helpers::gmail_draft_tool_schema(),
+        "gws_gmail_send" => crate::gmail_helpers::gmail_send_tool_schema(),
+        "gws_gmail_reply" => crate::gmail_helpers::gmail_reply_tool_schema(),
+        "gws_gmail_thread" => crate::gmail_helpers::gmail_thread_tool_schema(),
+        "gws_gmail_attachment" => crate::gmail_helpers::gmail_attachment_tool_schema(),
+        "gws_gmail_contacts" => crate::gmail_helpers::gmail_contacts_tool_schema(),
+        "gws_gmail_forward" => crate::gmail_helpers::gmail_forward_tool_schema(),
+        "gws_gmail_labels" => crate::gmail_helpers::gmail_labels_tool_schema(),
         _ => return None,
     };
     let mut info = json!({

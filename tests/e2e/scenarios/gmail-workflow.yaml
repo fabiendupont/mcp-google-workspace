@@ -1,0 +1,52 @@
+name: gmail-workflow
+description: "Search email, read message, thread view, attachment, list labels, create draft, manage labels, filtered search"
+prompt_file: prompts/test-gmail-workflow.md
+timeout_seconds: 300
+
+rubric:
+  - id: search_results
+    criterion: "Model searched Gmail within the GWS-MCP-Test label and received message results"
+    check: "Model used gws_gmail_search and got back a list of messages with id, subject, from fields. The search was scoped to the allowed label."
+    weight: 1.0
+
+  - id: message_read
+    criterion: "Model read a full message and got decoded body text and headers"
+    check: "Model used gws_gmail_read with a message_id and received body text, subject, from, to headers"
+    weight: 1.0
+
+  - id: thread_read
+    criterion: "Model read the full thread for the message"
+    check: "Model used gws_gmail_thread with the thread_id and received a conversation with messageCount and messages array"
+    weight: 1.0
+
+  - id: attachment_handled
+    criterion: "Model attempted to read an attachment or correctly noted none were available"
+    check: "Model used gws_gmail_attachment with message_id and attachment_id, OR noted no text attachments in the message. Score: 1.0 = used gws_gmail_attachment successfully or correctly identified no text attachment; 0.5 = acknowledged attachments exist but didn't try; 0.0 = ignored attachments entirely"
+    weight: 0.5
+
+  - id: labels_listed
+    criterion: "Model listed available Gmail labels"
+    check: "Model used gws_gmail_labels with action=list and received label names and IDs"
+    weight: 0.5
+
+  - id: draft_created
+    criterion: "Model created a draft reply mentioning follow-up next week"
+    check: "Model used gws_gmail_draft with to, subject, and body containing 'follow up' or 'next week'. Got back a draft ID"
+    weight: 1.0
+
+  - id: label_added
+    criterion: "Model added GWS-MCP-Test label to the message (allowed by policy)"
+    check: "Model used gws_gmail_labels with action=add, label=GWS-MCP-Test, and the original message_id"
+    weight: 1.0
+
+  - id: filtered_search
+    criterion: "Model searched for messages with attachments within the allowed label scope"
+    check: "Model used gws_gmail_search with query containing 'has:attachment' and reported resultSizeEstimate or message count"
+    weight: 0.5
+
+  - id: correct_tool_usage
+    criterion: "Model used the right Gmail helper tools (not generic gmail tool) for all operations"
+    check: "All Gmail operations used gws_gmail_* tools, not the generic gmail service tool. Score: 1.0 = all correct; 0.5 = mostly correct with one generic fallback; 0.0 = relied on generic tool"
+    weight: 0.5
+
+cleanup: []

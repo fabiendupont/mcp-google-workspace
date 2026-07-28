@@ -102,6 +102,8 @@ pub struct ServicePolicy {
     pub denied_methods: Vec<String>,
     #[serde(default)]
     pub constraints: Vec<Constraint>,
+    #[serde(default)]
+    pub allowed_labels: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -277,6 +279,13 @@ impl Policy {
             .unwrap_or_default()
     }
 
+    pub fn allowed_labels(&self, service: &str) -> &[String] {
+        self.services
+            .get(service)
+            .map(|s| s.allowed_labels.as_slice())
+            .unwrap_or(&[])
+    }
+
     pub fn constraints(&self, service: &str) -> &[Constraint] {
         self.services
             .get(service)
@@ -310,7 +319,13 @@ impl Policy {
 
         let denied = self.denied_methods(service);
         let full_name = format!("{resource}.{method_name}");
-        if denied.contains(method_name) || denied.contains(full_name.as_str()) {
+        let is_denied = denied.contains(method_name)
+            || denied.contains(full_name.as_str())
+            || denied.iter().any(|d| {
+                let suffixed = format!(".{d}");
+                full_name.ends_with(&suffixed)
+            });
+        if is_denied {
             return Err(GwsError::Validation(format!(
                 "Method '{full_name}' is denied by policy. \
                  Fix: remove \"{method_name}\" from \"denied_methods\" in the \"{service}\" service"
@@ -692,6 +707,35 @@ mod tests {
         assert!(denied.contains("messages.delete"));
         assert!(denied.contains("messages.trash"));
         assert!(!denied.contains("messages.list"));
+    }
+
+    #[test]
+    fn test_denied_method_suffix_match() {
+        let file: PolicyFile = serde_json::from_value(serde_json::json!({
+            "services": [{ "name": "gmail", "denied_methods": ["messages.send", "drafts.send"] }]
+        }))
+        .unwrap();
+        let p = Policy::from_policy_file(file);
+        let method = RestMethod {
+            http_method: "POST".to_string(),
+            ..Default::default()
+        };
+        assert!(
+            p.check_method("gmail", "users.messages", "send", &method)
+                .is_err()
+        );
+        assert!(
+            p.check_method("gmail", "users.drafts", "send", &method)
+                .is_err()
+        );
+        let get_method = RestMethod {
+            http_method: "GET".to_string(),
+            ..Default::default()
+        };
+        assert!(
+            p.check_method("gmail", "users.messages", "list", &get_method)
+                .is_ok()
+        );
     }
 
     // -- Body constraint tests (Drive folders pattern) --
@@ -1413,5 +1457,32 @@ mod tests {
     fn test_no_templates_by_default() {
         let p = test_policy();
         assert!(p.templates().is_empty());
+    }
+
+    #[test]
+    fn test_allowed_labels_empty_by_default() {
+        let p = test_policy();
+        assert!(p.allowed_labels("gmail").is_empty());
+    }
+
+    #[test]
+    fn test_allowed_labels_parsed() {
+        let file: PolicyFile = serde_json::from_value(serde_json::json!({
+            "services": [{
+                "name": "gmail",
+                "allowed_labels": ["GWS-MCP-Test", "STARRED"],
+                "denied_methods": ["messages.delete"]
+            }]
+        }))
+        .unwrap();
+        let p = Policy::from_policy_file(file);
+        let labels = p.allowed_labels("gmail");
+        assert_eq!(labels, &["GWS-MCP-Test", "STARRED"]);
+    }
+
+    #[test]
+    fn test_allowed_labels_unknown_service() {
+        let p = test_policy();
+        assert!(p.allowed_labels("unknown").is_empty());
     }
 }

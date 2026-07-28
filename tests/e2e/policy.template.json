@@ -31,6 +31,21 @@
       "name": "sheets"
     },
     {
+      "name": "gmail",
+      "allowed_labels": ["GWS-MCP-Test"],
+      "denied_methods": [
+        "messages.delete", "messages.trash", "messages.batchDelete",
+        "messages.send", "drafts.send",
+        "settings.updateAutoForwarding",
+        "settings.delegates.create",
+        "settings.forwardingAddresses.create"
+      ]
+    },
+    {
+      "name": "people",
+      "read_only": true
+    },
+    {
       "name": "slides",
       "constraints": [
         {

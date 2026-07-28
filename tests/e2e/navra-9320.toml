@@ -10,7 +10,7 @@
 #   MCPD_TOKEN=<token> navra run -m gemma4:e4b "$(cat prompts/test-e2e.md)"
 
 [server]
-tcp = "127.0.0.1:9315"
+tcp = "127.0.0.1:9320"
 
 # --- Agent ---
 
