@@ -1,0 +1,38 @@
+name: Bug report
+description: Report a bug in the MCP server
+labels: [bug]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What happened? What did you expect?
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `mcp-google-workspace --version` or container tag
+    validations:
+      required: true
+  - type: dropdown
+    id: transport
+    attributes:
+      label: Transport
+      options:
+        - stdio (Claude Code)
+        - HTTP
+        - Container
+    validations:
+      required: true
+  - type: textarea
+    id: policy
+    attributes:
+      label: Policy file (redact credentials)
+      render: json
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      render: text
