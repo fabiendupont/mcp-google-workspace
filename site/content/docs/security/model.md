@@ -2,7 +2,7 @@
 title = "Security model"
 description = "Policy engine, credential chain, and security properties"
 date = 2026-06-12T00:00:00+00:00
-updated = 2026-06-18T00:00:00+00:00
+updated = 2026-07-28T00:00:00+00:00
 draft = false
 weight = 10
 template = "docs/page.html"
@@ -16,14 +16,16 @@ top = false
 
 Every request passes through multiple checks before reaching Google:
 
-1. **Origin validation** — HTTP origins validated by exact hostname comparison
-2. **Rate limiting** — Per-client-IP sliding window
-3. **Body size check** — Configurable max request size
-4. **Service allow-list** — Only listed services exposed
-5. **Method denylist** — Blocked methods return an error
-6. **Read-only check** — Non-GET methods blocked when enabled
-7. **Parameter constraints** — Values validated against allowed lists with per-value access levels
-8. **Request explanation** — Write operations include a plain-English description of what they do
+1. **Origin validation** -- HTTP origins validated by exact hostname comparison
+2. **Rate limiting** -- Per-client-IP sliding window, plus per-service rate limits
+3. **Body size check** -- Configurable max request size
+4. **Service allow-list** -- Only listed services exposed
+5. **Method denylist** -- Blocked methods return an error (suffix matching: `"messages.send"` matches `"users.messages.send"`)
+6. **Read-only check** -- Non-GET methods blocked when enabled
+7. **Label policy** -- Gmail messages restricted to allowed labels
+8. **Parameter constraints** -- Values validated against allowed lists with per-value access levels
+9. **Generic tool bypass prevention** -- Services with helpers block the generic tool
+10. **Request explanation** -- Write operations include a plain-English description of what they do
 
 A denied request never reaches Google.
 
@@ -31,12 +33,16 @@ A denied request never reaches Google.
 
 The policy engine evaluates every `tools/call` against the JSON policy file. Key behaviors:
 
-- **Deny by default** — Services not listed are blocked
-- **Generic constraints** — Any parameter can be constrained with an allowlist of values and per-value access levels (read-only or read-write)
-- **Body constraints** — On reads, inject query filters to restrict results. On writes, require values from the allowed list.
-- **Actionable errors** — Every denial includes a `Fix:` hint with the exact JSON to add to the policy file
-- **Origin parsing** — URLs are parsed and hostnames compared exactly (no substring matching)
-- **CRLF prevention** — Media content types are validated to reject CR/LF characters
+- **Deny by default** -- Services not listed are blocked
+- **Generic constraints** -- Any parameter can be constrained with an allowlist of values and per-value access levels (read-only or read-write)
+- **Body constraints** -- On reads, inject query filters to restrict results. On writes, require values from the allowed list.
+- **Parent ancestry** -- Drive folder constraints check parent folders recursively. A file in a subfolder of an allowed folder inherits access.
+- **Denied methods suffix matching** -- `"messages.send"` in the denylist matches the full API method `"users.messages.send"`. This prevents bypass through fully qualified method names.
+- **Gmail label policy** -- The `allowed_labels` field restricts which labels the agent can access. Search queries are filtered and message access is validated against the allowed list.
+- **Helper tool enforcement** -- Services with helpers (Drive, Docs, Sheets, Slides, Gmail) suppress the generic tool. Attempting to call the generic tool returns an error directing the model to the helpers.
+- **Actionable errors** -- Every denial includes a `Fix:` hint with the exact JSON to add to the policy file
+- **Origin parsing** -- URLs are parsed and hostnames compared exactly (no substring matching)
+- **CRLF prevention** -- Media content types are validated to reject CR/LF characters
 
 See [Policy reference](../../configuration/policy-reference/) for all configuration options.
 
@@ -52,7 +58,7 @@ Create calendar/events.insert (POST): summary="Team standup", on calendar "prima
 
 ## Audit log
 
-The `--audit-log` flag writes a JSONL file recording every API call with timestamps, services, methods, status, and duration. Denied requests include the denial reason. See [Operations guide](../../operations/guide/) for details.
+The `--audit-log` flag writes a JSONL file recording every API call with timestamps, services, methods, tool names, status, and duration. Denied requests include the denial reason. See [Operations guide](../../operations/guide/) for details.
 
 ## Credential chain
 

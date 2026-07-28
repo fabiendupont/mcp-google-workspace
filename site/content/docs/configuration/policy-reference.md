@@ -2,7 +2,7 @@
 title = "Policy reference"
 description = "All JSON configuration fields, CLI flags, and environment variables"
 date = 2026-06-12T00:00:00+00:00
-updated = 2026-06-18T00:00:00+00:00
+updated = 2026-07-28T00:00:00+00:00
 draft = false
 weight = 10
 template = "docs/page.html"
@@ -22,8 +22,8 @@ The policy file is a JSON file with two top-level keys: `"server"` for global se
 | `max_request_bytes` | integer | `16777216` (16 MB) | Maximum request body size in bytes |
 | `rate_limit_rpm` | integer | unlimited | Max requests per minute per client IP (HTTP only) |
 | `allowed_origins` | list of strings | `[]` (localhost only) | Allowed HTTP Origin hostnames |
-| `credentials_file` | string | — | Path to Google credentials JSON |
-| `project_id` | string | — | Google Cloud project ID for quota and billing |
+| `credentials_file` | string | -- | Path to Google credentials JSON |
+| `project_id` | string | -- | Google Cloud project ID for quota and billing |
 
 ```json
 {
@@ -45,8 +45,10 @@ Only services listed here are exposed as MCP tools. Everything else is denied.
 |-------|------|---------|-------------|
 | `name` | string | required | Service alias (see table below) |
 | `read_only` | boolean | inherits from `"server"` | Override global read_only for this service |
-| `denied_methods` | list of strings | `[]` | Methods to block (e.g., `messages.delete`) |
+| `denied_methods` | list of strings | `[]` | Methods to block. Suffix matching: `"messages.send"` matches `"users.messages.send"` |
+| `allowed_labels` | list of strings | all labels | Gmail only: restrict message access to specific labels |
 | `constraints` | list of objects | `[]` | Parameter-level access controls (see below) |
+| `rate_limits` | object | -- | Per-service rate limiting overrides |
 
 ### Available services
 
@@ -55,15 +57,49 @@ Any Google Workspace API discoverable through the [Google Discovery Service](htt
 | Alias | Google API | Description |
 |-------|-----------|-------------|
 | `drive` | Google Drive API v3 | Files, folders, permissions, comments |
-| `gmail` | Gmail API v1 | Messages, threads, labels, drafts |
+| `gmail` | Gmail API v1 | Messages, threads, labels, drafts, contacts |
 | `calendar` | Google Calendar API v3 | Events, calendars, settings |
 | `sheets` | Google Sheets API v4 | Spreadsheets, values, charts |
 | `docs` | Google Docs API v1 | Documents, content, styles |
 | `slides` | Google Slides API v1 | Presentations, pages, elements |
+| `people` | People API v1 | Contacts, profiles, directory |
 | `admin` | Admin SDK Directory API | Users, groups, organizational units |
 | `chat` | Google Chat API v1 | Spaces, messages, memberships |
 
-## `"constraints"` — Parameter-level access controls
+### Gmail label policy
+
+The `allowed_labels` field restricts which Gmail labels the agent can access. When set, the server injects a label filter into search queries and validates message access against the allowed list.
+
+```json
+{
+  "services": [
+    {
+      "name": "gmail",
+      "allowed_labels": ["INBOX", "SENT", "IMPORTANT"],
+      "denied_methods": ["messages.delete", "messages.trash"]
+    }
+  ]
+}
+```
+
+### Per-service rate limits
+
+Override the global rate limit for specific services to respect Google API quotas:
+
+```json
+{
+  "services": [
+    {
+      "name": "sheets",
+      "rate_limits": {
+        "requests_per_minute": 60
+      }
+    }
+  ]
+}
+```
+
+## `"constraints"` -- Parameter-level access controls
 
 Constraints let you restrict which values a parameter can take. Each constraint specifies a parameter name, a list of allowed values, and an access level.
 
@@ -74,17 +110,18 @@ Constraints let you restrict which values a parameter can take. Each constraint 
 | `access` | string | `read-write` | `read-only` or `read-write` |
 | `location` | string | auto-detect | `body` for request body fields, omit for path/query params |
 
-Constraints are generic — the same mechanism works for any service and any parameter. The server validates constraint values against the actual API call at runtime.
+Constraints are generic -- the same mechanism works for any service and any parameter. The server validates constraint values against the actual API call at runtime.
 
 ### How constraints work
 
 - **Path/query parameters**: the value provided by the agent must be in the constraint's `values` list. If the constraint is `read-only`, write operations are denied.
 - **Body parameters** (with `"location": "body"`): on write operations, the body field must be present and its values must all be in the allowed list. On read/list operations, the server injects a query filter to restrict results.
-- Multiple constraints on the same parameter are merged — all values across constraints are allowed, and each value inherits the access level of its constraint.
+- **Parent ancestry**: For Drive folder constraints, the server recursively checks parent folders. A file in a subfolder of an allowed folder inherits access.
+- Multiple constraints on the same parameter are merged -- all values across constraints are allowed, and each value inherits the access level of its constraint.
 
 ### Examples
 
-**Drive — restrict to specific folders:**
+**Drive -- restrict to specific folders:**
 
 ```json
 {
@@ -100,7 +137,7 @@ Constraints are generic — the same mechanism works for any service and any par
 }
 ```
 
-**Calendar — restrict to specific calendars:**
+**Calendar -- restrict to specific calendars:**
 
 ```json
 {
@@ -116,7 +153,7 @@ Constraints are generic — the same mechanism works for any service and any par
 }
 ```
 
-**Sheets — restrict to a specific spreadsheet:**
+**Sheets -- restrict to a specific spreadsheet:**
 
 ```json
 {
@@ -131,13 +168,29 @@ Constraints are generic — the same mechanism works for any service and any par
 }
 ```
 
-**Gmail — block dangerous methods:**
+**Slides -- protect templates:**
+
+```json
+{
+  "services": [
+    {
+      "name": "slides",
+      "constraints": [
+        { "param": "presentationId", "values": ["template-id-123"], "access": "read-only" }
+      ]
+    }
+  ]
+}
+```
+
+**Gmail -- block dangerous methods:**
 
 ```json
 {
   "services": [
     {
       "name": "gmail",
+      "allowed_labels": ["INBOX", "SENT"],
       "denied_methods": [
         "messages.delete", "messages.trash", "messages.batchDelete",
         "settings.updateAutoForwarding",
@@ -151,18 +204,19 @@ Constraints are generic — the same mechanism works for any service and any par
 
 ### Evaluation order
 
-Every request passes through these checks in order. **All checks must pass** — the first failure stops evaluation and denies the request.
+Every request passes through these checks in order. **All checks must pass** -- the first failure stops evaluation and denies the request.
 
-1. **Service allow-list** — Is the service listed in `"services"`? Unlisted services are denied entirely.
-2. **Read-only** — Is the service (or server) read-only? If yes, non-GET methods are denied.
-3. **Denied methods** — Is the method in the `denied_methods` list?
-4. **Constraints** — Do the parameter values match the allowed list? Is the access level sufficient for the operation?
+1. **Service allow-list** -- Is the service listed in `"services"`? Unlisted services are denied entirely.
+2. **Read-only** -- Is the service (or server) read-only? If yes, non-GET methods are denied.
+3. **Denied methods** -- Is the method in the `denied_methods` list? Uses suffix matching: `"messages.send"` in the denylist matches API method `"users.messages.send"`.
+4. **Label policy** -- For Gmail, is the message's label in `allowed_labels`?
+5. **Constraints** -- Do the parameter values match the allowed list? Is the access level sufficient for the operation?
 
-There is no override mechanism — a method denied at step 2 cannot be re-allowed at step 4. Each layer can only narrow access, never widen it.
+There is no override mechanism -- a method denied at step 2 cannot be re-allowed at step 5. Each layer can only narrow access, never widen it.
 
 Every denial includes a `Fix:` hint with the exact JSON snippet to add or change in the policy file.
 
-> **Note:** This policy engine is specific to this MCP server. The upstream `google-workspace` crate (gws CLI) has no policy or permission model — it relies solely on OAuth scopes.
+> **Note:** This policy engine is specific to this MCP server. The upstream `google-workspace` crate (gws CLI) has no policy or permission model -- it relies solely on OAuth scopes.
 
 ## CLI flags
 
@@ -173,6 +227,8 @@ Every denial includes a `Fix:` hint with the exact JSON snippet to add or change
 | `--policy <path>` | Path to a JSON policy file |
 | `--services <list>` | Comma-separated service names (no constraints) |
 | `--http <addr:port>` | Run as HTTP server instead of stdio |
+| `--eager-tools` | Load all helper tools at startup instead of lazy discovery |
+| `--prompts-dir <path>` | Directory of Markdown prompt files for MCP prompts |
 | `--audit-log <path>` | Write JSONL audit log of all API calls |
 
 ### Policy tools
@@ -207,7 +263,7 @@ Failed reloads log an error and keep the current policy. Not available in stdio 
 The `--audit-log` flag writes a JSONL file with one entry per API call:
 
 ```json
-{"timestamp":"1718745600.000","action":"allowed","service":"drive","resource":"files","method":"list","http_method":"GET","status":200,"duration_ms":142}
+{"timestamp":"1718745600.000","action":"allowed","service":"drive","resource":"files","method":"list","http_method":"GET","tool":"gws_drive_list","status":200,"duration_ms":142}
 {"timestamp":"1718745601.000","action":"denied","service":"docs","resource":"documents","method":"create","reason":"Service 'docs' is read-only"}
 ```
 
