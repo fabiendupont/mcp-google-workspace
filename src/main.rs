@@ -30,12 +30,74 @@ mod tools;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use clap::Parser;
 use google_workspace::error::GwsError;
 use opentelemetry::trace::TracerProvider;
 use rmcp::ServiceExt;
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+
+/// MCP server for Google Workspace APIs with per-project safety policies
+#[derive(Parser, Debug)]
+#[command(name = "mcp-google-workspace", version)]
+struct Cli {
+    /// Path to a gws-policy.json file
+    #[arg(long)]
+    policy: Option<PathBuf>,
+
+    /// Comma-separated service names (e.g., drive,gmail,calendar)
+    #[arg(long, short)]
+    services: Option<String>,
+
+    /// Run as HTTP server (e.g., 127.0.0.1:3000)
+    #[arg(long)]
+    http: Option<String>,
+
+    /// External URL for webhook callbacks
+    #[arg(long)]
+    external_url: Option<String>,
+
+    /// Use compact tool schemas (fewer tokens)
+    #[arg(long)]
+    compact_schemas: bool,
+
+    /// Load all helper tools at startup instead of lazy discovery
+    #[arg(long)]
+    eager_tools: bool,
+
+    /// Interactive policy wizard, or use with --services for quick generation
+    #[arg(long)]
+    init_policy: bool,
+
+    /// Validate a policy file without starting the server
+    #[arg(long)]
+    check_policy: Option<PathBuf>,
+
+    /// With --check-policy: test credentials and resolve folder paths
+    #[arg(long)]
+    verify: bool,
+
+    /// With --init-policy: use a preset (analyst, assistant, admin-readonly)
+    #[arg(long)]
+    template: Option<String>,
+
+    /// Write structured audit log (JSONL) of all API calls
+    #[arg(long)]
+    audit_log: Option<PathBuf>,
+
+    /// Directory containing prompt .md files
+    #[arg(long)]
+    prompts_dir: Option<PathBuf>,
+
+    /// Walk the credential chain and report what is available
+    #[arg(long)]
+    check_auth: bool,
+
+    /// Dry-run scenarios against a policy (requires --policy)
+    #[arg(long)]
+    simulate: Option<PathBuf>,
+}
 
 enum Transport {
     Stdio,
@@ -75,173 +137,40 @@ struct ParsedArgs {
     prompts_dir: Option<PathBuf>,
 }
 
-fn print_usage() {
-    eprintln!("mcp-google-workspace — MCP server for Google Workspace APIs");
-    eprintln!();
-    eprintln!("Usage:");
-    eprintln!(
-        "  mcp-google-workspace --policy <path>        Load services and constraints from a JSON policy file"
-    );
-    eprintln!(
-        "  mcp-google-workspace --services drive,gmail  Expose specific services (no constraints)"
-    );
-    eprintln!();
-    eprintln!("Options:");
-    eprintln!("  --policy <path>       Path to a gws-policy.json file");
-    eprintln!("  --services <list>     Comma-separated service names (e.g., drive,gmail,calendar)");
-    eprintln!("  --http <addr:port>    Run as HTTP server (e.g., 127.0.0.1:3000)");
-    eprintln!(
-        "  --init-policy         Interactive policy wizard, or use with --services for quick generation"
-    );
-    eprintln!("  --check-policy <path> Validate a policy file without starting the server");
-    eprintln!(
-        "  --template <name>     With --init-policy: use a preset (analyst, assistant, admin-readonly)"
-    );
-    eprintln!(
-        "  --verify              With --check-policy: test credentials and resolve folder paths"
-    );
-    eprintln!("  --prompts-dir <path>  Directory containing prompt .md files");
-    eprintln!("  --audit-log <path>    Write structured audit log (JSONL) of all API calls");
-    eprintln!("  --check-auth          Walk the credential chain and report what is available");
-    eprintln!("  --simulate <path>     Dry-run scenarios against a policy (requires --policy)");
-    eprintln!("  --help                Show this help message");
+fn parse_args_from(args: &[String]) -> Result<Command, GwsError> {
+    let mut full_args = vec!["mcp-google-workspace".to_string()];
+    full_args.extend_from_slice(args);
+
+    let cli = match Cli::try_parse_from(&full_args) {
+        Ok(c) => c,
+        Err(e)
+            if e.kind() == clap::error::ErrorKind::DisplayHelp
+                || e.kind() == clap::error::ErrorKind::DisplayVersion =>
+        {
+            return Ok(Command::ShowHelp);
+        }
+        Err(e) => return Err(GwsError::Validation(e.to_string())),
+    };
+
+    cli_to_command(cli)
 }
 
-fn parse_args_from(args: &[String]) -> Result<Command, GwsError> {
-    let mut policy_path: Option<PathBuf> = None;
-    let mut services_str: Option<String> = None;
-    let mut http_addr: Option<String> = None;
-    let mut external_url: Option<String> = None;
-    let mut compact_schemas = false;
-    let mut eager_tools = false;
-    let mut init_policy = false;
-    let mut check_policy_path: Option<PathBuf> = None;
-    let mut verify = false;
-    let mut template: Option<String> = None;
-    let mut audit_log: Option<PathBuf> = None;
-
-    let mut prompts_dir: Option<PathBuf> = None;
-    let mut check_auth = false;
-    let mut simulate_path: Option<PathBuf> = None;
-
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--help" | "-h" => {
-                return Ok(Command::ShowHelp);
-            }
-            "--check-auth" => {
-                check_auth = true;
-            }
-            "--policy" => {
-                i += 1;
-                if i >= args.len() {
-                    return Err(GwsError::Validation("--policy requires a path".to_string()));
-                }
-                policy_path = Some(PathBuf::from(&args[i]));
-            }
-            "--services" | "-s" => {
-                i += 1;
-                if i >= args.len() {
-                    return Err(GwsError::Validation(
-                        "--services requires a comma-separated list".to_string(),
-                    ));
-                }
-                services_str = Some(args[i].clone());
-            }
-            "--http" => {
-                i += 1;
-                if i >= args.len() {
-                    return Err(GwsError::Validation(
-                        "--http requires an address (e.g., 127.0.0.1:3000)".to_string(),
-                    ));
-                }
-                http_addr = Some(args[i].clone());
-            }
-            "--external-url" => {
-                i += 1;
-                if i >= args.len() {
-                    return Err(GwsError::Validation(
-                        "--external-url requires a URL (e.g., https://mcp.example.com)".to_string(),
-                    ));
-                }
-                external_url = Some(args[i].clone());
-            }
-            "--compact-schemas" => {
-                compact_schemas = true;
-            }
-            "--eager-tools" => {
-                eager_tools = true;
-            }
-            "--init-policy" => {
-                init_policy = true;
-            }
-            "--verify" => {
-                verify = true;
-            }
-            "--template" => {
-                i += 1;
-                if i >= args.len() {
-                    return Err(GwsError::Validation(
-                        "--template requires a name (analyst, assistant, admin-readonly)"
-                            .to_string(),
-                    ));
-                }
-                template = Some(args[i].clone());
-            }
-            "--audit-log" => {
-                i += 1;
-                if i >= args.len() {
-                    return Err(GwsError::Validation(
-                        "--audit-log requires a file path".to_string(),
-                    ));
-                }
-                audit_log = Some(PathBuf::from(&args[i]));
-            }
-            "--check-policy" => {
-                i += 1;
-                if i >= args.len() {
-                    return Err(GwsError::Validation(
-                        "--check-policy requires a path".to_string(),
-                    ));
-                }
-                check_policy_path = Some(PathBuf::from(&args[i]));
-            }
-            "--prompts-dir" => {
-                i += 1;
-                if i >= args.len() {
-                    return Err(GwsError::Validation(
-                        "--prompts-dir requires a path".to_string(),
-                    ));
-                }
-                prompts_dir = Some(PathBuf::from(&args[i]));
-            }
-            "--simulate" => {
-                i += 1;
-                if i >= args.len() {
-                    return Err(GwsError::Validation(
-                        "--simulate requires a path to a scenarios JSON file".to_string(),
-                    ));
-                }
-                simulate_path = Some(PathBuf::from(&args[i]));
-            }
-            other => {
-                return Err(GwsError::Validation(format!("Unknown argument: {other}")));
-            }
-        }
-        i += 1;
+fn cli_to_command(cli: Cli) -> Result<Command, GwsError> {
+    if let Some(path) = cli.check_policy {
+        return Ok(Command::CheckPolicy {
+            path,
+            verify: cli.verify,
+        });
     }
 
-    if let Some(path) = check_policy_path {
-        return Ok(Command::CheckPolicy { path, verify });
+    if cli.check_auth {
+        return Ok(Command::CheckAuth {
+            policy_path: cli.policy,
+        });
     }
 
-    if check_auth {
-        return Ok(Command::CheckAuth { policy_path });
-    }
-
-    if let Some(scenarios_path) = simulate_path {
-        let policy_path = policy_path.ok_or_else(|| {
+    if let Some(scenarios_path) = cli.simulate {
+        let policy_path = cli.policy.ok_or_else(|| {
             GwsError::Validation("--simulate requires --policy to also be set".to_string())
         })?;
         return Ok(Command::Simulate {
@@ -250,20 +179,25 @@ fn parse_args_from(args: &[String]) -> Result<Command, GwsError> {
         });
     }
 
-    if init_policy {
-        let services = services_str.map(|s| s.split(',').map(|s| s.trim().to_string()).collect());
-        return Ok(Command::InitPolicy { services, template });
+    if cli.init_policy {
+        let services = cli
+            .services
+            .map(|s| s.split(',').map(|s| s.trim().to_string()).collect());
+        return Ok(Command::InitPolicy {
+            services,
+            template: cli.template,
+        });
     }
 
     Ok(Command::Serve(ParsedArgs {
-        policy_path,
-        services_str,
-        http_addr,
-        external_url,
-        compact_schemas,
-        eager_tools,
-        audit_log,
-        prompts_dir,
+        policy_path: cli.policy,
+        services_str: cli.services,
+        http_addr: cli.http,
+        external_url: cli.external_url,
+        compact_schemas: cli.compact_schemas,
+        eager_tools: cli.eager_tools,
+        audit_log: cli.audit_log,
+        prompts_dir: cli.prompts_dir,
     }))
 }
 
@@ -1116,12 +1050,16 @@ fn simulate_policy(policy_path: &Path, scenarios_path: &Path) -> Result<(), GwsE
 
 #[tokio::main]
 async fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let cmd = match parse_args_from(&args) {
+    let cli = match Cli::try_parse() {
+        Ok(c) => c,
+        Err(e) => {
+            e.exit();
+        }
+    };
+    let cmd = match cli_to_command(cli) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Error: {e}");
-            print_usage();
             std::process::exit(1);
         }
     };
@@ -1262,8 +1200,8 @@ async fn main() {
             std::process::exit(0);
         }
         Command::ShowHelp => {
-            print_usage();
-            std::process::exit(0);
+            Cli::parse_from(["mcp-google-workspace", "--help"]);
+            unreachable!();
         }
         Command::Serve(p) => p,
     };
@@ -1281,7 +1219,6 @@ async fn main() {
         Ok(p) => p,
         Err(e) => {
             eprintln!("Error: {e}");
-            print_usage();
             std::process::exit(1);
         }
     };
@@ -1425,14 +1362,12 @@ mod tests {
     fn test_parse_unknown_flag() {
         let err = parse_args_from(&args(&["--bogus"]));
         assert!(err.is_err());
-        assert!(err.unwrap_err().to_string().contains("Unknown argument"));
     }
 
     #[test]
     fn test_parse_policy_missing_value() {
         let err = parse_args_from(&args(&["--policy"]));
         assert!(err.is_err());
-        assert!(err.unwrap_err().to_string().contains("requires a path"));
     }
 
     #[test]
@@ -1445,7 +1380,6 @@ mod tests {
     fn test_parse_http_missing_value() {
         let err = parse_args_from(&args(&["--http"]));
         assert!(err.is_err());
-        assert!(err.unwrap_err().to_string().contains("requires an address"));
     }
 
     #[test]
@@ -1635,7 +1569,6 @@ mod tests {
     fn test_parse_check_policy_missing_value() {
         let err = parse_args_from(&args(&["--check-policy"]));
         assert!(err.is_err());
-        assert!(err.unwrap_err().to_string().contains("requires a path"));
     }
 
     #[test]
@@ -1738,7 +1671,6 @@ mod tests {
     fn test_parse_simulate_missing_value() {
         let err = parse_args_from(&args(&["--policy", "/tmp/policy.json", "--simulate"]));
         assert!(err.is_err());
-        assert!(err.unwrap_err().to_string().contains("requires a path"));
     }
 
     #[test]
@@ -1815,6 +1747,5 @@ mod tests {
     fn test_parse_prompts_dir_missing_value() {
         let err = parse_args_from(&args(&["--prompts-dir"]));
         assert!(err.is_err());
-        assert!(err.unwrap_err().to_string().contains("requires a path"));
     }
 }
