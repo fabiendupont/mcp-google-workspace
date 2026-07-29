@@ -1,3 +1,8 @@
+use crate::meta::RequestMeta;
+use crate::policy::Policy;
+use crate::server::ServerState;
+use crate::tools;
+use google_workspace::error::GwsError;
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use serde_json::{Value, json};
 
@@ -1702,6 +1707,1341 @@ pub fn docs_read_tool_schema() -> Value {
     })
 }
 
+fn parse_text_style(arguments: &Value) -> TextStyle {
+    TextStyle {
+        bold: arguments.get("bold").and_then(|v| v.as_bool()),
+        italic: arguments.get("italic").and_then(|v| v.as_bool()),
+        font_size_pt: arguments.get("font_size_pt").and_then(|v| v.as_f64()),
+        font_family: arguments
+            .get("font_family")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        foreground_color: arguments
+            .get("foreground_color")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        background_color: arguments
+            .get("background_color")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+    }
+}
+
+pub(crate) async fn execute_docs_helper(
+    tool_name: &str,
+    arguments: &Value,
+    policy: &Policy,
+    meta: &RequestMeta,
+    state: &mut ServerState,
+    dry_run: bool,
+) -> Result<Value, GwsError> {
+    if tool_name == "gws_docs_write" || tool_name == "gws_docs_replace_section" {
+        tracing::info!(
+            tool = tool_name,
+            has_content = arguments.get("content").is_some(),
+            has_document_id = arguments.get("document_id").is_some() || arguments.get("documentId").is_some(),
+            has_title = arguments.get("title").is_some(),
+            content_type = ?arguments.get("content").map(|v| v.is_string()),
+            arg_keys = ?arguments.as_object().map(|m| m.keys().collect::<Vec<_>>()),
+            "docs_write dispatch"
+        );
+        // gws_docs_replace_section requires section — validate early
+        if tool_name == "gws_docs_replace_section" {
+            if arguments.get("section").and_then(|v| v.as_str()).is_none() {
+                return Err(GwsError::Validation(
+                    "Missing 'section' — specify the heading text of the section to replace."
+                        .into(),
+                ));
+            }
+            if arguments
+                .get("document_id")
+                .and_then(|v| v.as_str())
+                .is_none()
+                && arguments
+                    .get("documentId")
+                    .and_then(|v| v.as_str())
+                    .is_none()
+            {
+                return Err(GwsError::Validation(
+                    "Missing 'document_id' — specify the doc to update.".into(),
+                ));
+            }
+        }
+        let format = crate::format::parse_format(arguments.get("format").and_then(|v| v.as_str()));
+        return execute_docs_write(arguments, policy, meta, state, dry_run, format).await;
+    }
+
+    let doc_id = arguments
+        .get("document_id")
+        .or_else(|| arguments.get("documentId"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            GwsError::Validation(format!(
+                "Missing 'document_id' in {tool_name}. Pass the Google Docs document ID."
+            ))
+        })?;
+
+    if tool_name == "gws_docs_read_table" {
+        let doc_ref = state.get_doc("docs").await?;
+        let resource = tools::find_resource(&doc_ref.resources, "documents")
+            .ok_or_else(|| GwsError::Validation("documents resource not found".into()))?;
+        let get_method = resource
+            .methods
+            .get("get")
+            .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
+        let get_args = json!({"params": {"documentId": doc_id}});
+        let doc_content = crate::execute::execute_tool(
+            &doc_ref,
+            get_method,
+            "documents",
+            "get",
+            &get_args,
+            "docs",
+            policy,
+            meta,
+            None,
+            None,
+            false,
+            &mut state.token_cache,
+        )
+        .await?;
+        let table_index = arguments
+            .get("table_index")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        let result = read_table_from_doc(&doc_content, table_index);
+        return Ok(json!({
+            "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
+            "structuredContent": result,
+            "isError": false
+        }));
+    }
+
+    if tool_name == "gws_docs_read"
+        || tool_name == "gws_docs_outline"
+        || tool_name == "gws_docs_find"
+    {
+        let doc_ref = state.get_doc("docs").await?;
+        let resource = tools::find_resource(&doc_ref.resources, "documents")
+            .ok_or_else(|| GwsError::Validation("documents resource not found".into()))?;
+        let get_method = resource
+            .methods
+            .get("get")
+            .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
+        let get_args = json!({"params": {"documentId": doc_id}});
+        let doc_content = crate::execute::execute_tool(
+            &doc_ref,
+            get_method,
+            "documents",
+            "get",
+            &get_args,
+            "docs",
+            policy,
+            meta,
+            None,
+            None,
+            false,
+            &mut state.token_cache,
+        )
+        .await?;
+
+        if tool_name == "gws_docs_find" {
+            let needle = arguments
+                .get("text")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| GwsError::Validation("Missing 'text'".into()))?;
+            let occurrence = arguments
+                .get("occurrence")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1) as usize;
+            let result = find_text_in_doc(&doc_content, needle, occurrence);
+            return Ok(json!({
+                "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
+                "structuredContent": result,
+                "isError": false
+            }));
+        }
+
+        if tool_name == "gws_docs_outline" {
+            let structure = parse_doc_structure(&doc_content);
+            return Ok(json!({
+                "content": [{ "type": "text", "text": serde_json::to_string_pretty(&structure).unwrap_or_default() }],
+                "structuredContent": structure,
+                "isError": false
+            }));
+        }
+
+        // gws_docs_read: section-level or full doc
+        let section = arguments.get("section").and_then(|v| v.as_str());
+        let format = arguments
+            .get("format")
+            .and_then(|v| v.as_str())
+            .unwrap_or("markdown");
+
+        let content_to_convert = if let Some(heading) = section {
+            if let Some((start, end)) = find_section_range(&doc_content, heading) {
+                extract_section_doc(&doc_content, start, end)
+            } else {
+                return Err(GwsError::Validation(format!(
+                    "Section '{heading}' not found. Use gws_docs_outline to see available headings."
+                )));
+            }
+        } else {
+            doc_content.clone()
+        };
+
+        let tables = extract_all_tables(&content_to_convert);
+        let has_tables = !tables.is_empty();
+
+        return match format {
+            "plain" => {
+                let plain = crate::format::doc_to_plain(&content_to_convert);
+                if has_tables {
+                    Ok(json!({
+                        "content": [{ "type": "text", "text": plain }],
+                        "structuredContent": { "text": plain, "tables": tables },
+                        "isError": false
+                    }))
+                } else {
+                    Ok(json!({
+                        "content": [{ "type": "text", "text": plain }],
+                        "isError": false
+                    }))
+                }
+            }
+            _ => {
+                let md = crate::format::doc_to_markdown(&content_to_convert);
+                if has_tables {
+                    Ok(json!({
+                        "content": [{ "type": "text", "text": md }],
+                        "structuredContent": { "text": md, "tables": tables },
+                        "isError": false
+                    }))
+                } else {
+                    Ok(json!({
+                        "content": [{ "type": "text", "text": md }],
+                        "isError": false
+                    }))
+                }
+            }
+        };
+    }
+
+    let needs_end_index = |tool: &str, args: &Value| -> bool {
+        match tool {
+            "gws_docs_insert_text" => {
+                args.get("index").is_none()
+                    && args.get("position").and_then(|v| v.as_str()) != Some("start")
+                    && (args.get("bold").is_some()
+                        || args.get("italic").is_some()
+                        || args.get("font_size_pt").is_some()
+                        || args.get("font_family").is_some()
+                        || args.get("foreground_color").is_some()
+                        || args.get("background_color").is_some()
+                        || args.get("paragraph_style").is_some())
+            }
+            _ => false,
+        }
+    };
+
+    let resolve_end_position = |position: Position, end_index: Option<i32>| -> Position {
+        match (&position, end_index) {
+            (Position::End, Some(idx)) => Position::Index(idx),
+            _ => position,
+        }
+    };
+
+    let end_index = if needs_end_index(tool_name, arguments) && !dry_run {
+        let doc_ref = state.get_doc("docs").await?;
+        let resource = tools::find_resource(&doc_ref.resources, "documents")
+            .ok_or_else(|| GwsError::Validation("documents resource not found".into()))?;
+        let get_method = resource
+            .methods
+            .get("get")
+            .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
+        let get_args = json!({"params": {"documentId": doc_id}});
+        let doc_content = crate::execute::execute_tool(
+            &doc_ref,
+            get_method,
+            "documents",
+            "get",
+            &get_args,
+            "docs",
+            policy,
+            meta,
+            None,
+            None,
+            false,
+            &mut state.token_cache,
+        )
+        .await?;
+        doc_content["body"]["content"]
+            .as_array()
+            .and_then(|arr| arr.last())
+            .and_then(|el| el["endIndex"].as_i64())
+            .map(|idx| (idx - 1) as i32)
+    } else {
+        None
+    };
+
+    let requests: Vec<Value> = match tool_name {
+        "gws_docs_insert_text" => {
+            if let Some(sections) = arguments.get("sections").and_then(|v| v.as_array()) {
+                let mut all_requests = Vec::new();
+                for section in sections {
+                    let text = section.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                    if text.is_empty() {
+                        continue;
+                    }
+                    let style = parse_text_style(section);
+                    let has_style = style.bold.is_some()
+                        || style.foreground_color.is_some()
+                        || style.italic.is_some()
+                        || style.font_size_pt.is_some();
+                    let para = section.get("paragraph_style").and_then(|v| v.as_str());
+                    all_requests.extend(build_insert_text_requests(
+                        text,
+                        Position::End,
+                        if has_style { Some(style) } else { None },
+                        para,
+                    ));
+                }
+                all_requests
+            } else {
+                let text = arguments
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| GwsError::Validation("Missing 'text' or 'sections'".into()))?;
+                let position =
+                    resolve_end_position(crate::server::parse_position(arguments), end_index);
+                let style = parse_text_style(arguments);
+                let has_style = style.bold.is_some()
+                    || style.italic.is_some()
+                    || style.font_size_pt.is_some()
+                    || style.font_family.is_some()
+                    || style.foreground_color.is_some()
+                    || style.background_color.is_some();
+                let para = arguments
+                    .get("paragraph_style")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                build_insert_text_requests(
+                    text,
+                    position,
+                    if has_style { Some(style) } else { None },
+                    para.as_deref(),
+                )
+            }
+        }
+        "gws_docs_insert_table" => {
+            let headers: Option<Vec<String>> = arguments
+                .get("headers")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                });
+            let data_rows: Option<Vec<Vec<String>>> =
+                arguments.get("rows").and_then(|v| v.as_array()).map(|arr| {
+                    arr.iter()
+                        .filter_map(|row| {
+                            row.as_array().map(|cells| {
+                                cells
+                                    .iter()
+                                    .filter_map(|c| c.as_str().map(String::from))
+                                    .collect()
+                            })
+                        })
+                        .collect()
+                });
+
+            if headers.is_some() || data_rows.is_some() {
+                let num_cols = headers
+                    .as_ref()
+                    .map(|h| h.len())
+                    .or_else(|| {
+                        data_rows
+                            .as_ref()
+                            .and_then(|r| r.first().map(|row| row.len()))
+                    })
+                    .unwrap_or(1) as u32;
+                let num_rows = (if headers.is_some() { 1 } else { 0 }
+                    + data_rows.as_ref().map(|r| r.len()).unwrap_or(0))
+                    as u32;
+
+                let position = crate::server::parse_position(arguments);
+                let insert_req = build_insert_table_request(num_rows, num_cols, position);
+
+                let doc_ref = state.get_doc("docs").await?;
+                let resource = tools::find_resource(&doc_ref.resources, "documents")
+                    .ok_or_else(|| GwsError::Validation("documents resource not found".into()))?;
+                let batch_method = resource
+                    .methods
+                    .get("batchUpdate")
+                    .ok_or_else(|| GwsError::Validation("batchUpdate not found".into()))?;
+
+                let create_args = json!({
+                    "params": { "documentId": doc_id },
+                    "body": { "requests": [insert_req] }
+                });
+                crate::execute::execute_tool(
+                    &doc_ref,
+                    batch_method,
+                    "documents",
+                    "batchUpdate",
+                    &create_args,
+                    "docs",
+                    policy,
+                    meta,
+                    None,
+                    None,
+                    dry_run,
+                    &mut state.token_cache,
+                )
+                .await?;
+
+                let get_method = resource
+                    .methods
+                    .get("get")
+                    .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
+                let get_args = json!({"params": {"documentId": doc_id}});
+                let doc_content = crate::execute::execute_tool(
+                    &doc_ref,
+                    get_method,
+                    "documents",
+                    "get",
+                    &get_args,
+                    "docs",
+                    policy,
+                    meta,
+                    None,
+                    None,
+                    false,
+                    &mut state.token_cache,
+                )
+                .await?;
+
+                let empty_rows: Vec<Vec<String>> = Vec::new();
+                let populate_reqs = build_table_populate_requests(
+                    &doc_content,
+                    headers.as_deref(),
+                    data_rows.as_ref().unwrap_or(&empty_rows),
+                );
+
+                if populate_reqs.is_empty() {
+                    return Ok(json!({
+                        "content": [{ "type": "text", "text": "Table created (no data to populate)" }],
+                        "isError": false
+                    }));
+                }
+
+                let populate_args = json!({
+                    "params": { "documentId": doc_id },
+                    "body": { "requests": populate_reqs }
+                });
+                let result = crate::execute::execute_tool(
+                    &doc_ref,
+                    batch_method,
+                    "documents",
+                    "batchUpdate",
+                    &populate_args,
+                    "docs",
+                    policy,
+                    meta,
+                    None,
+                    None,
+                    dry_run,
+                    &mut state.token_cache,
+                )
+                .await?;
+                return Ok(json!({
+                    "content": [{ "type": "text", "text": format!("Table created and populated ({} rows, {} columns)", num_rows, num_cols) }],
+                    "structuredContent": result,
+                    "isError": false
+                }));
+            }
+
+            let rows = arguments
+                .get("rows")
+                .and_then(|v| v.as_u64())
+                .or_else(|| arguments.get("row_count").and_then(|v| v.as_u64()))
+                .ok_or_else(|| GwsError::Validation("Missing 'rows' or 'headers'".into()))?
+                as u32;
+            let columns = arguments
+                .get("columns")
+                .and_then(|v| v.as_u64())
+                .or_else(|| arguments.get("column_count").and_then(|v| v.as_u64()))
+                .ok_or_else(|| GwsError::Validation("Missing 'columns' or 'headers'".into()))?
+                as u32;
+            let position = crate::server::parse_position(arguments);
+            vec![build_insert_table_request(rows, columns, position)]
+        }
+        "gws_docs_insert_image" => {
+            let image_url = arguments.get("image_url").and_then(|v| v.as_str());
+            let drive_file_id = arguments.get("drive_file_id").and_then(|v| v.as_str());
+            let image_data = arguments.get("image_data").and_then(|v| v.as_str());
+
+            let content_type = arguments
+                .get("image_content_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("image/png");
+            let uri = if let Some(url) = image_url {
+                url.to_string()
+            } else if let Some(fid) = drive_file_id {
+                let (url, _perm_id) =
+                    crate::server::make_image_insertable(fid, policy, meta, state).await?;
+                url
+            } else if let Some(data) = image_data {
+                format!("data:{content_type};base64,{data}")
+            } else {
+                return Err(GwsError::Validation(
+                    "One of 'image_url', 'drive_file_id', or 'image_data' is required".into(),
+                ));
+            };
+
+            let position = crate::server::parse_position(arguments);
+            let w = arguments.get("width_pt").and_then(|v| v.as_f64());
+            let h = arguments.get("height_pt").and_then(|v| v.as_f64());
+            let mut reqs = vec![build_insert_image_request(&uri, position, w, h)];
+            reqs.push(json!({
+                "insertText": {
+                    "text": "\n",
+                    "endOfSegmentLocation": { "segmentId": "" }
+                }
+            }));
+            reqs
+        }
+        "gws_docs_format" | "gws_docs_format_text" => {
+            let (start, end) = if let Some(text_match) =
+                arguments.get("text").and_then(|v| v.as_str())
+            {
+                let doc_ref = state.get_doc("docs").await?;
+                let resource = tools::find_resource(&doc_ref.resources, "documents")
+                    .ok_or_else(|| GwsError::Validation("documents resource not found".into()))?;
+                let get_method = resource
+                    .methods
+                    .get("get")
+                    .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
+                let get_args = json!({"params": {"documentId": doc_id}});
+                let doc_content = crate::execute::execute_tool(
+                    &doc_ref,
+                    get_method,
+                    "documents",
+                    "get",
+                    &get_args,
+                    "docs",
+                    policy,
+                    meta,
+                    None,
+                    None,
+                    false,
+                    &mut state.token_cache,
+                )
+                .await?;
+                let occurrence = arguments
+                    .get("occurrence")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1) as usize;
+                let result = find_text_in_doc(&doc_content, text_match, occurrence);
+                if result.get("found") != Some(&json!(true)) {
+                    return Err(GwsError::Validation(format!(
+                        "Text '{}' not found in document",
+                        text_match
+                    )));
+                }
+                let s = result["startIndex"].as_i64().unwrap() as i32;
+                let e = result["endIndex"].as_i64().unwrap() as i32;
+                (s, e)
+            } else {
+                let s = arguments
+                    .get("start_index")
+                    .and_then(|v| v.as_i64())
+                    .ok_or_else(|| GwsError::Validation("Missing 'start_index' or 'text'".into()))?
+                    as i32;
+                let e = arguments
+                    .get("end_index")
+                    .and_then(|v| v.as_i64())
+                    .ok_or_else(|| GwsError::Validation("Missing 'end_index'".into()))?
+                    as i32;
+                (s, e)
+            };
+            let style = parse_text_style(arguments);
+            let para =
+                if arguments.get("named_style").is_some() || arguments.get("alignment").is_some() {
+                    Some(ParagraphStyle {
+                        named_style: arguments
+                            .get("named_style")
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
+                        alignment: arguments
+                            .get("alignment")
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
+                    })
+                } else {
+                    None
+                };
+            build_format_text_requests(start, end, style, para)
+        }
+        "gws_docs_add_bullets" => {
+            let start = arguments
+                .get("start_index")
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| GwsError::Validation("Missing 'start_index'".into()))?
+                as i32;
+            let end = arguments
+                .get("end_index")
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| GwsError::Validation("Missing 'end_index'".into()))?
+                as i32;
+            let preset = arguments
+                .get("bullet_preset")
+                .and_then(|v| v.as_str())
+                .unwrap_or("BULLET_DISC_CIRCLE_SQUARE");
+            vec![build_add_bullets_request(start, end, preset)]
+        }
+        "gws_docs_append_section" => {
+            let heading = arguments.get("heading").and_then(|v| v.as_str());
+            let level = arguments
+                .get("heading_level")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1) as u32;
+            let body = arguments.get("body").and_then(|v| v.as_str());
+            let items: Option<Vec<String>> =
+                arguments
+                    .get("items")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    });
+            let preset = arguments
+                .get("bullet_preset")
+                .and_then(|v| v.as_str())
+                .unwrap_or("BULLET_DISC_CIRCLE_SQUARE");
+            build_append_section_requests(heading, level, body, items.as_deref(), preset)
+        }
+        _ => {
+            return Err(GwsError::Validation(format!(
+                "Unknown helper tool: {tool_name}"
+            )));
+        }
+    };
+
+    let batch_args = json!({
+        "params": { "documentId": doc_id },
+        "body": { "requests": requests }
+    });
+
+    let doc = state.get_doc("docs").await?;
+    let resource = tools::find_resource(&doc.resources, "documents")
+        .ok_or_else(|| GwsError::Validation("documents resource not found in docs API".into()))?;
+    let method = resource
+        .methods
+        .get("batchUpdate")
+        .ok_or_else(|| GwsError::Validation("batchUpdate method not found".into()))?;
+
+    let result = crate::execute::execute_tool(
+        &doc,
+        method,
+        "documents",
+        "batchUpdate",
+        &batch_args,
+        "docs",
+        policy,
+        meta,
+        None,
+        None,
+        dry_run,
+        &mut state.token_cache,
+    )
+    .await
+    .map_err(|e| {
+        GwsError::Other(anyhow::anyhow!(
+            "{tool_name}: batchUpdate failed for document '{doc_id}': {e}"
+        ))
+    })?;
+    crate::server::check_api_result(&result).map_err(|e| {
+        GwsError::Other(anyhow::anyhow!(
+            "{tool_name}: Google Docs API error on document '{doc_id}': {e}"
+        ))
+    })?;
+    Ok(result)
+}
+
+fn find_section_range(doc: &Value, section: &str) -> Option<(i32, i32)> {
+    let content = doc["body"]["content"].as_array()?;
+    let mut section_start = None;
+    let mut section_level = None;
+
+    for element in content {
+        if let Some(para) = element.get("paragraph") {
+            let style_type = para["paragraphStyle"]["namedStyleType"]
+                .as_str()
+                .unwrap_or("");
+            let text: String = para["elements"]
+                .as_array()
+                .map(|els| {
+                    els.iter()
+                        .filter_map(|e| e["textRun"]["content"].as_str())
+                        .collect::<String>()
+                })
+                .unwrap_or_default();
+            let text_trimmed = text.trim();
+
+            if let Some(level) = heading_level(style_type) {
+                if let Some(start_level) = section_level
+                    && level <= start_level
+                {
+                    let start = section_start.unwrap();
+                    let end = element["startIndex"].as_i64().unwrap() as i32;
+                    return Some((start, end));
+                }
+                if text_trimmed == section {
+                    section_start = Some(element["startIndex"].as_i64().unwrap() as i32);
+                    section_level = Some(level);
+                }
+            }
+        }
+    }
+
+    if let Some(start) = section_start {
+        let last = content.last()?;
+        let end = last["endIndex"].as_i64().unwrap_or(start as i64) as i32;
+        return Some((start, end - 1));
+    }
+    None
+}
+
+fn shift_request_indexes(requests: &[Value], shift: i32) -> Vec<Value> {
+    if shift == 0 {
+        return requests.to_vec();
+    }
+    requests
+        .iter()
+        .map(|req| {
+            let mut r = req.clone();
+            for path in &[
+                "/insertText/location/index",
+                "/insertTable/location/index",
+                "/updateParagraphStyle/range/startIndex",
+                "/updateParagraphStyle/range/endIndex",
+                "/updateTextStyle/range/startIndex",
+                "/updateTextStyle/range/endIndex",
+                "/createParagraphBullets/range/startIndex",
+                "/createParagraphBullets/range/endIndex",
+            ] {
+                if let Some(idx) = r.pointer_mut(path)
+                    && let Some(v) = idx.as_i64()
+                {
+                    *idx = json!(v + shift as i64);
+                }
+            }
+            r
+        })
+        .collect()
+}
+
+fn extract_section_doc(doc: &Value, start: i32, end: i32) -> Value {
+    let mut section_doc = doc.clone();
+    if let Some(content) = doc["body"]["content"].as_array() {
+        let filtered: Vec<Value> = content
+            .iter()
+            .filter(|elem| {
+                let elem_start = elem["startIndex"].as_i64().unwrap_or(0) as i32;
+                let elem_end = elem["endIndex"].as_i64().unwrap_or(0) as i32;
+                elem_start >= start && elem_end <= end
+            })
+            .cloned()
+            .collect();
+        section_doc["body"]["content"] = json!(filtered);
+    }
+    section_doc
+}
+
+pub(crate) async fn execute_docs_write(
+    arguments: &Value,
+    policy: &Policy,
+    meta: &RequestMeta,
+    state: &mut ServerState,
+    dry_run: bool,
+    format: crate::format::ContentFormat,
+) -> Result<Value, GwsError> {
+    let content = arguments
+        .get("content")
+        .or_else(|| arguments.get("markdown"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            GwsError::Validation(
+                "Missing 'content' parameter (must be a string). Pass the content to write.".into(),
+            )
+        })?;
+
+    let doc_id_arg = arguments
+        .get("document_id")
+        .or_else(|| arguments.get("documentId"))
+        .and_then(|v| v.as_str());
+    let title = arguments.get("title").and_then(|v| v.as_str());
+    let mut folder_id = arguments
+        .get("folder_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let section = arguments.get("section").and_then(|v| v.as_str());
+    let template_id = arguments.get("template_id").and_then(|v| v.as_str());
+
+    // If document_id looks like a folder (title also provided), treat it as folder_id.
+    let doc_id_arg = if let (Some(id), Some(_)) = (doc_id_arg, title) {
+        if folder_id.is_none() {
+            if let Ok(drive_doc) = state.get_doc("drive").await {
+                if let Some(resource) = tools::find_resource(&drive_doc.resources, "files") {
+                    if let Some(gm) = resource.methods.get("get") {
+                        let args = json!({"params": {"fileId": id}, "fields": "mimeType"});
+                        if let Ok(file_meta) = crate::execute::execute_tool(
+                            &drive_doc,
+                            gm,
+                            "files",
+                            "get",
+                            &args,
+                            "drive",
+                            policy,
+                            meta,
+                            None,
+                            None,
+                            false,
+                            &mut state.token_cache,
+                        )
+                        .await
+                        {
+                            if file_meta["mimeType"].as_str()
+                                == Some("application/vnd.google-apps.folder")
+                            {
+                                tracing::info!(
+                                    provided_id = id,
+                                    "document_id is a folder — treating as folder_id"
+                                );
+                                folder_id = Some(id.to_string());
+                                None
+                            } else {
+                                Some(id)
+                            }
+                        } else {
+                            Some(id)
+                        }
+                    } else {
+                        Some(id)
+                    }
+                } else {
+                    Some(id)
+                }
+            } else {
+                Some(id)
+            }
+        } else {
+            Some(id)
+        }
+    } else {
+        doc_id_arg
+    };
+
+    let folder_id = folder_id.as_deref();
+
+    // Step A: resolve, find existing, or create the document
+    let (doc_id, created_new_doc) = if let Some(id) = doc_id_arg {
+        (id.to_string(), false)
+    } else if title.is_some() || folder_id.is_some() {
+        let doc_title = title.unwrap_or("Untitled");
+        let effective_policy =
+            crate::server::policy_for_folder(folder_id, policy, meta, state).await?;
+        let drive_doc = state.get_doc("drive").await.map_err(|e| {
+            GwsError::Other(anyhow::anyhow!(
+                "gws_docs_import_markdown: failed to load Drive API: {e}"
+            ))
+        })?;
+        let drive_resource =
+            tools::find_resource(&drive_doc.resources, "files").ok_or_else(|| {
+                GwsError::Validation(
+                    "gws_docs_import_markdown: files resource not found in drive API".into(),
+                )
+            })?;
+
+        {
+            let mut body = json!({
+                "name": doc_title,
+                "mimeType": "application/vnd.google-apps.document"
+            });
+            if let Some(fid) = folder_id {
+                body["parents"] = json!([fid]);
+            }
+            let create_args = json!({"body": body});
+            let create_method = drive_resource
+                .methods
+                .get("create")
+                .ok_or_else(|| GwsError::Validation("create method not found".into()))?;
+            let result = crate::execute::execute_tool(
+                &drive_doc,
+                create_method,
+                "files",
+                "create",
+                &create_args,
+                "drive",
+                &effective_policy,
+                meta,
+                None,
+                None,
+                dry_run,
+                &mut state.token_cache,
+            )
+            .await?;
+            crate::server::check_api_result(&result)?;
+            let new_id = result["id"]
+                .as_str()
+                .ok_or_else(|| {
+                    GwsError::Other(anyhow::anyhow!("No 'id' in drive.files.create response"))
+                })?
+                .to_string();
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            (new_id, true)
+        }
+    } else {
+        return Err(GwsError::Validation(
+            "Either 'document_id' (existing doc) or 'title' (create new doc) is required. \
+             Pass document_id to import into an existing document, or title to create a new one."
+                .into(),
+        ));
+    };
+
+    // Step B: handle template (apply named styles from another doc)
+    let template_requests = if let Some(tmpl_id) = template_id {
+        let docs_doc = state.get_doc("docs").await?;
+        let resource = tools::find_resource(&docs_doc.resources, "documents")
+            .ok_or_else(|| GwsError::Validation("documents resource not found".into()))?;
+        let get_method = resource
+            .methods
+            .get("get")
+            .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
+        let get_args = json!({"params": {"documentId": tmpl_id}});
+        let tmpl_result = crate::execute::execute_tool(
+            &docs_doc,
+            get_method,
+            "documents",
+            "get",
+            &get_args,
+            "docs",
+            policy,
+            meta,
+            None,
+            None,
+            false,
+            &mut state.token_cache,
+        )
+        .await?;
+
+        let mut style_reqs = Vec::new();
+        if let Some(styles) = tmpl_result["namedStyles"]["styles"].as_array() {
+            for style in styles {
+                if let (Some(props), Some(style_type)) = (
+                    style.get("textStyle"),
+                    style.get("namedStyleType").and_then(|v| v.as_str()),
+                ) {
+                    let mut ns_props = serde_json::Map::new();
+                    ns_props.insert("namedStyleType".to_string(), json!(style_type));
+                    ns_props.insert("textStyle".to_string(), props.clone());
+                    if let Some(para) = style.get("paragraphStyle") {
+                        ns_props.insert("paragraphStyle".to_string(), para.clone());
+                    }
+                    style_reqs.push(json!({
+                        "updateNamedStyle": {
+                            "namedStyle": Value::Object(ns_props),
+                            "fields": "*"
+                        }
+                    }));
+                }
+            }
+        }
+        if style_reqs.is_empty() {
+            None
+        } else {
+            Some(style_reqs)
+        }
+    } else {
+        None
+    };
+
+    // Step C: handle section replacement
+    let (section_delete, insert_index) = if let Some(section_text) = section {
+        let docs_doc = state.get_doc("docs").await?;
+        let resource = tools::find_resource(&docs_doc.resources, "documents")
+            .ok_or_else(|| GwsError::Validation("documents resource not found".into()))?;
+        let get_method = resource
+            .methods
+            .get("get")
+            .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
+        let get_args = json!({"params": {"documentId": doc_id}});
+        let doc_content = crate::execute::execute_tool(
+            &docs_doc,
+            get_method,
+            "documents",
+            "get",
+            &get_args,
+            "docs",
+            policy,
+            meta,
+            None,
+            None,
+            false,
+            &mut state.token_cache,
+        )
+        .await?;
+
+        match find_section_range(&doc_content, section_text) {
+            Some((start, end)) => (
+                Some(json!({
+                    "deleteContentRange": {
+                        "range": { "startIndex": start, "endIndex": end }
+                    }
+                })),
+                start,
+            ),
+            None => {
+                return Err(GwsError::Validation(format!(
+                    "Section '{}' not found in document",
+                    section_text
+                )));
+            }
+        }
+    } else {
+        let idx = if created_new_doc {
+            1
+        } else if let Some(i) = arguments.get("index").and_then(|v| v.as_i64()) {
+            i as i32
+        } else {
+            match arguments.get("position").and_then(|v| v.as_str()) {
+                Some("start") => 1,
+                _ => {
+                    // Fetch document to find end index
+                    let docs_doc = state.get_doc("docs").await?;
+                    let resource = tools::find_resource(&docs_doc.resources, "documents")
+                        .ok_or_else(|| {
+                            GwsError::Validation("documents resource not found".into())
+                        })?;
+                    let get_method = resource
+                        .methods
+                        .get("get")
+                        .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
+                    let get_args = json!({"params": {"documentId": doc_id}});
+                    let doc_content = crate::execute::execute_tool(
+                        &docs_doc,
+                        get_method,
+                        "documents",
+                        "get",
+                        &get_args,
+                        "docs",
+                        policy,
+                        meta,
+                        None,
+                        None,
+                        false,
+                        &mut state.token_cache,
+                    )
+                    .await?;
+                    doc_content["body"]["content"]
+                        .as_array()
+                        .and_then(|arr| arr.last())
+                        .and_then(|el| el["endIndex"].as_i64())
+                        .map(|idx| (idx - 1) as i32)
+                        .unwrap_or(1)
+                }
+            }
+        };
+        (None, idx)
+    };
+
+    // Step D: execute batchUpdate(s)
+    let docs_doc = state.get_doc("docs").await?;
+    let resource = tools::find_resource(&docs_doc.resources, "documents")
+        .ok_or_else(|| GwsError::Validation("documents resource not found in docs API".into()))?;
+    let get_method = resource
+        .methods
+        .get("get")
+        .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
+    let batch_method = resource
+        .methods
+        .get("batchUpdate")
+        .ok_or_else(|| GwsError::Validation("batchUpdate method not found".into()))?;
+
+    if let Some(style_reqs) = template_requests {
+        let style_args = json!({
+            "params": { "documentId": doc_id },
+            "body": { "requests": style_reqs }
+        });
+        let style_result = crate::execute::execute_tool(
+            &docs_doc,
+            batch_method,
+            "documents",
+            "batchUpdate",
+            &style_args,
+            "docs",
+            policy,
+            meta,
+            None,
+            None,
+            dry_run,
+            &mut state.token_cache,
+        )
+        .await?;
+        crate::server::check_api_result(&style_result)?;
+    }
+
+    let mut content_requests: Vec<Value> = Vec::new();
+    if let Some(delete_req) = section_delete {
+        content_requests.push(delete_req);
+    }
+    content_requests.extend(crate::format::content_to_batch_requests(
+        content,
+        format,
+        insert_index,
+    ));
+
+    // Split at table boundaries: insertTable changes the doc's index space,
+    // so subsequent inserts at pre-calculated offsets fail. Split into
+    // separate batches, re-derive indexes from the doc after each table.
+    let mut batches: Vec<(Vec<Value>, Option<Value>)> = Vec::new();
+    let mut current_batch: Vec<Value> = Vec::new();
+    for req in &content_requests {
+        if let Some(mut it) = req.get("insertTable").cloned() {
+            let table_data = it.as_object_mut().and_then(|m| m.remove("_tableData"));
+            current_batch.push(json!({ "insertTable": it }));
+            batches.push((current_batch, table_data));
+            current_batch = Vec::new();
+        } else {
+            current_batch.push(req.clone());
+        }
+    }
+    if !current_batch.is_empty() {
+        batches.push((current_batch, None));
+    }
+
+    let mut result: Result<Value, GwsError> = Ok(json!({}));
+    for (batch_idx, (batch_reqs, table_data)) in batches.iter().enumerate() {
+        let final_reqs = if batch_idx > 0 && !batch_reqs.is_empty() {
+            let doc_now = crate::execute::execute_tool(
+                &docs_doc,
+                get_method,
+                "documents",
+                "get",
+                &json!({"params": {"documentId": &doc_id}}),
+                "docs",
+                policy,
+                meta,
+                None,
+                None,
+                false,
+                &mut state.token_cache,
+            )
+            .await?;
+            let end_index = doc_now
+                .pointer("/body/content")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.last())
+                .and_then(|el| el["endIndex"].as_i64())
+                .unwrap_or(1) as i32;
+            let first_idx = batch_reqs
+                .iter()
+                .find_map(|r| {
+                    r.pointer("/insertText/location/index")
+                        .and_then(|v| v.as_i64())
+                        .map(|i| i as i32)
+                })
+                .unwrap_or(end_index);
+            let shift = (end_index - 1) - first_idx;
+            shift_request_indexes(batch_reqs, shift)
+        } else {
+            batch_reqs.clone()
+        };
+
+        if !final_reqs.is_empty() {
+            let batch_args = json!({
+                "params": { "documentId": doc_id },
+                "body": { "requests": final_reqs }
+            });
+            result = crate::execute::execute_tool(
+                &docs_doc,
+                batch_method,
+                "documents",
+                "batchUpdate",
+                &batch_args,
+                "docs",
+                policy,
+                meta,
+                None,
+                None,
+                dry_run,
+                &mut state.token_cache,
+            )
+            .await;
+
+            // If batchUpdate fails with too many requests, retry in smaller chunks
+            let should_chunk = match &result {
+                Err(_) => final_reqs.len() > 10,
+                Ok(r) => crate::server::check_api_result(r).is_err() && final_reqs.len() > 10,
+            };
+            if should_chunk {
+                tracing::info!(
+                    total_requests = final_reqs.len(),
+                    "batchUpdate failed, retrying in chunks of 50"
+                );
+                result = Ok(json!({}));
+                for chunk in final_reqs.chunks(50) {
+                    let chunk_args = json!({
+                        "params": { "documentId": doc_id },
+                        "body": { "requests": chunk }
+                    });
+                    result = crate::execute::execute_tool(
+                        &docs_doc,
+                        batch_method,
+                        "documents",
+                        "batchUpdate",
+                        &chunk_args,
+                        "docs",
+                        policy,
+                        meta,
+                        None,
+                        None,
+                        dry_run,
+                        &mut state.token_cache,
+                    )
+                    .await;
+                    match &result {
+                        Ok(r) if crate::server::check_api_result(r).is_err() => break,
+                        Err(_) => break,
+                        _ => {}
+                    }
+                }
+            } else if let Ok(ref r) = result {
+                if crate::server::check_api_result(r).is_err() {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        // Populate table cells after inserting the table
+        if let Some(data) = table_data
+            && !dry_run
+        {
+            let doc_now = crate::execute::execute_tool(
+                &docs_doc,
+                get_method,
+                "documents",
+                "get",
+                &json!({"params": {"documentId": &doc_id}}),
+                "docs",
+                policy,
+                meta,
+                None,
+                None,
+                false,
+                &mut state.token_cache,
+            )
+            .await?;
+            let rows: Vec<Vec<String>> = data
+                .get("rows")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            let is_header = data
+                .get("header")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !rows.is_empty() {
+                let (headers, data_rows) = if is_header && rows.len() > 1 {
+                    (Some(rows[0].clone()), rows[1..].to_vec())
+                } else {
+                    (None, rows)
+                };
+                let populate_reqs =
+                    build_table_populate_requests(&doc_now, headers.as_deref(), &data_rows);
+                if !populate_reqs.is_empty() {
+                    let _ = crate::execute::execute_tool(
+                            &docs_doc, batch_method, "documents", "batchUpdate",
+                            &json!({"params": {"documentId": doc_id}, "body": {"requests": populate_reqs}}),
+                            "docs", policy, meta, None, None, false, &mut state.token_cache,
+                        ).await;
+                }
+            }
+        }
+    }
+
+    let failed = match &result {
+        Ok(r) => crate::server::check_api_result(r).is_err(),
+        Err(_) => true,
+    };
+
+    if failed
+        && created_new_doc
+        && let Ok(drive_doc) = state.get_doc("drive").await
+        && let Some(resource) = tools::find_resource(&drive_doc.resources, "files")
+        && let Some(delete_method) = resource.methods.get("delete")
+    {
+        let args = json!({"params": {"fileId": &doc_id}});
+        let _ = crate::execute::execute_tool(
+            &drive_doc,
+            delete_method,
+            "files",
+            "delete",
+            &args,
+            "drive",
+            policy,
+            meta,
+            None,
+            None,
+            false,
+            &mut state.token_cache,
+        )
+        .await;
+        tracing::info!(doc_id = %doc_id, "Cleaned up empty doc after failed write");
+    }
+
+    let result = match result {
+        Ok(mut r) => {
+            if let Err(e) = crate::server::check_api_result(&r) {
+                return Ok(json!({
+                    "content": [{ "type": "text", "text": format!(
+                        "gws_docs_write: content insertion failed: {e}. \
+                         Try with simpler content or split into smaller sections."
+                    )}],
+                    "isError": true
+                }));
+            }
+            r["document_id"] = json!(doc_id);
+            r
+        }
+        Err(e) => {
+            return Ok(json!({
+                "content": [{ "type": "text", "text": format!(
+                    "gws_docs_write: failed: {e}. \
+                     Try with simpler content or split into smaller sections."
+                )}],
+                "isError": true
+            }));
+        }
+    };
+
+    let text = if created_new_doc {
+        format!("Content written to new document.\ndocument_id: {doc_id}")
+    } else {
+        format!("Content written to document.\ndocument_id: {doc_id}")
+    };
+
+    Ok(json!({
+        "content": [{ "type": "text", "text": text }],
+        "structuredContent": result,
+        "isError": false
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2309,5 +3649,197 @@ mod tests {
         assert_eq!(tables[1]["index"], 1);
         assert_eq!(tables[1]["rows"][0][0], "Only");
         assert_eq!(tables[1]["row_count"], 1);
+    }
+}
+#[test]
+fn test_heading_level_known() {
+    assert_eq!(heading_level("HEADING_1"), Some(1));
+    assert_eq!(heading_level("HEADING_3"), Some(3));
+    assert_eq!(heading_level("HEADING_6"), Some(6));
+}
+
+#[test]
+fn test_heading_level_unknown() {
+    assert_eq!(heading_level("NORMAL_TEXT"), None);
+    assert_eq!(heading_level("TITLE"), None);
+}
+
+#[test]
+fn test_find_section_range_basic() {
+    let doc = json!({
+        "body": {
+            "content": [
+                { "startIndex": 1, "endIndex": 10, "paragraph": {
+                    "paragraphStyle": { "namedStyleType": "HEADING_1" },
+                    "elements": [{ "textRun": { "content": "Introduction\n" } }]
+                }},
+                { "startIndex": 10, "endIndex": 30, "paragraph": {
+                    "paragraphStyle": { "namedStyleType": "NORMAL_TEXT" },
+                    "elements": [{ "textRun": { "content": "Some body text\n" } }]
+                }},
+                { "startIndex": 30, "endIndex": 45, "paragraph": {
+                    "paragraphStyle": { "namedStyleType": "HEADING_1" },
+                    "elements": [{ "textRun": { "content": "Next Section\n" } }]
+                }}
+            ]
+        }
+    });
+    let range = find_section_range(&doc, "Introduction");
+    assert_eq!(range, Some((1, 30)));
+}
+
+#[test]
+fn test_find_section_range_to_end() {
+    let doc = json!({
+        "body": {
+            "content": [
+                { "startIndex": 1, "endIndex": 10, "paragraph": {
+                    "paragraphStyle": { "namedStyleType": "HEADING_2" },
+                    "elements": [{ "textRun": { "content": "Only Section\n" } }]
+                }},
+                { "startIndex": 10, "endIndex": 50, "paragraph": {
+                    "paragraphStyle": { "namedStyleType": "NORMAL_TEXT" },
+                    "elements": [{ "textRun": { "content": "Content goes here\n" } }]
+                }}
+            ]
+        }
+    });
+    let range = find_section_range(&doc, "Only Section");
+    assert_eq!(range, Some((1, 49)));
+}
+
+#[test]
+fn test_find_section_range_not_found() {
+    let doc = json!({
+        "body": {
+            "content": [
+                { "startIndex": 1, "endIndex": 10, "paragraph": {
+                    "paragraphStyle": { "namedStyleType": "HEADING_1" },
+                    "elements": [{ "textRun": { "content": "Existing\n" } }]
+                }}
+            ]
+        }
+    });
+    assert!(find_section_range(&doc, "Missing").is_none());
+}
+
+#[test]
+fn test_find_section_range_subsection_not_terminated_by_lower() {
+    let doc = json!({
+        "body": {
+            "content": [
+                { "startIndex": 1, "endIndex": 10, "paragraph": {
+                    "paragraphStyle": { "namedStyleType": "HEADING_2" },
+                    "elements": [{ "textRun": { "content": "Parent\n" } }]
+                }},
+                { "startIndex": 10, "endIndex": 20, "paragraph": {
+                    "paragraphStyle": { "namedStyleType": "HEADING_3" },
+                    "elements": [{ "textRun": { "content": "Child\n" } }]
+                }},
+                { "startIndex": 20, "endIndex": 30, "paragraph": {
+                    "paragraphStyle": { "namedStyleType": "HEADING_2" },
+                    "elements": [{ "textRun": { "content": "Sibling\n" } }]
+                }}
+            ]
+        }
+    });
+    // H2 "Parent" should include the H3 child, stopping at the next H2
+    let range = find_section_range(&doc, "Parent");
+    assert_eq!(range, Some((1, 20)));
+    #[test]
+    fn test_heading_level_known() {
+        assert_eq!(heading_level("HEADING_1"), Some(1));
+        assert_eq!(heading_level("HEADING_3"), Some(3));
+        assert_eq!(heading_level("HEADING_6"), Some(6));
+    }
+
+    #[test]
+    fn test_heading_level_unknown() {
+        assert_eq!(heading_level("NORMAL_TEXT"), None);
+        assert_eq!(heading_level("TITLE"), None);
+    }
+
+    #[test]
+    fn test_find_section_range_basic() {
+        let doc = json!({
+            "body": {
+                "content": [
+                    { "startIndex": 1, "endIndex": 10, "paragraph": {
+                        "paragraphStyle": { "namedStyleType": "HEADING_1" },
+                        "elements": [{ "textRun": { "content": "Introduction\n" } }]
+                    }},
+                    { "startIndex": 10, "endIndex": 30, "paragraph": {
+                        "paragraphStyle": { "namedStyleType": "NORMAL_TEXT" },
+                        "elements": [{ "textRun": { "content": "Some body text\n" } }]
+                    }},
+                    { "startIndex": 30, "endIndex": 45, "paragraph": {
+                        "paragraphStyle": { "namedStyleType": "HEADING_1" },
+                        "elements": [{ "textRun": { "content": "Next Section\n" } }]
+                    }}
+                ]
+            }
+        });
+        let range = find_section_range(&doc, "Introduction");
+        assert_eq!(range, Some((1, 30)));
+    }
+
+    #[test]
+    fn test_find_section_range_to_end() {
+        let doc = json!({
+            "body": {
+                "content": [
+                    { "startIndex": 1, "endIndex": 10, "paragraph": {
+                        "paragraphStyle": { "namedStyleType": "HEADING_2" },
+                        "elements": [{ "textRun": { "content": "Only Section\n" } }]
+                    }},
+                    { "startIndex": 10, "endIndex": 50, "paragraph": {
+                        "paragraphStyle": { "namedStyleType": "NORMAL_TEXT" },
+                        "elements": [{ "textRun": { "content": "Content goes here\n" } }]
+                    }}
+                ]
+            }
+        });
+        let range = find_section_range(&doc, "Only Section");
+        assert_eq!(range, Some((1, 49)));
+    }
+
+    #[test]
+    fn test_find_section_range_not_found() {
+        let doc = json!({
+            "body": {
+                "content": [
+                    { "startIndex": 1, "endIndex": 10, "paragraph": {
+                        "paragraphStyle": { "namedStyleType": "HEADING_1" },
+                        "elements": [{ "textRun": { "content": "Existing\n" } }]
+                    }}
+                ]
+            }
+        });
+        assert!(find_section_range(&doc, "Missing").is_none());
+    }
+
+    #[test]
+    fn test_find_section_range_subsection_not_terminated_by_lower() {
+        let doc = json!({
+            "body": {
+                "content": [
+                    { "startIndex": 1, "endIndex": 10, "paragraph": {
+                        "paragraphStyle": { "namedStyleType": "HEADING_2" },
+                        "elements": [{ "textRun": { "content": "Parent\n" } }]
+                    }},
+                    { "startIndex": 10, "endIndex": 20, "paragraph": {
+                        "paragraphStyle": { "namedStyleType": "HEADING_3" },
+                        "elements": [{ "textRun": { "content": "Child\n" } }]
+                    }},
+                    { "startIndex": 20, "endIndex": 30, "paragraph": {
+                        "paragraphStyle": { "namedStyleType": "HEADING_2" },
+                        "elements": [{ "textRun": { "content": "Sibling\n" } }]
+                    }}
+                ]
+            }
+        });
+        // H2 "Parent" should include the H3 child, stopping at the next H2
+        let range = find_section_range(&doc, "Parent");
+        assert_eq!(range, Some((1, 20)));
     }
 }

@@ -1,6 +1,11 @@
 use serde_json::{Value, json};
 
 use crate::marp::{MarpFrontmatter, MarpInlineStyle, MarpPresentation, MarpSlide, SlideBlock};
+use crate::meta::RequestMeta;
+use crate::policy::Policy;
+use crate::server::ServerState;
+use crate::tools;
+use google_workspace::error::GwsError;
 
 fn hex_to_raw_rgb(hex: &str) -> Value {
     let hex = hex.trim_start_matches('#');
@@ -1888,6 +1893,1510 @@ pub fn slides_update_tool_schema() -> Value {
             },
             "required": ["presentation_id", "slide_number"]
         }
+    })
+}
+
+pub(crate) async fn execute_slides_helper(
+    tool_name: &str,
+    arguments: &Value,
+    policy: &Policy,
+    meta: &RequestMeta,
+    state: &mut ServerState,
+    dry_run: bool,
+) -> Result<Value, GwsError> {
+    if tool_name == "gws_slides_import_marp" {
+        return execute_slides_import_marp(arguments, policy, meta, state, dry_run).await;
+    }
+    if tool_name == "gws_slides_read" {
+        return execute_slides_read(arguments, policy, meta, state, dry_run).await;
+    }
+    if tool_name == "gws_slides_add" {
+        return execute_slides_add(arguments, policy, meta, state, dry_run).await;
+    }
+    if tool_name == "gws_slides_delete" {
+        return execute_slides_delete(arguments, policy, meta, state, dry_run).await;
+    }
+    if tool_name == "gws_slides_reorder" {
+        return execute_slides_reorder(arguments, policy, meta, state, dry_run).await;
+    }
+    if tool_name == "gws_slides_duplicate" {
+        return execute_slides_duplicate(arguments, policy, meta, state, dry_run).await;
+    }
+    if tool_name == "gws_slides_update" {
+        return execute_slides_update(arguments, policy, meta, state, dry_run).await;
+    }
+    Err(GwsError::Validation(format!(
+        "Unknown slides helper: {tool_name}"
+    )))
+}
+
+async fn execute_slides_import_marp(
+    arguments: &Value,
+    policy: &Policy,
+    meta: &RequestMeta,
+    state: &mut ServerState,
+    dry_run: bool,
+) -> Result<Value, GwsError> {
+    let marp_source = arguments
+        .get("marp")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| GwsError::Validation("Missing 'marp' argument".into()))?;
+
+    let presentation_id_arg = arguments.get("presentation_id").and_then(|v| v.as_str());
+    let title = arguments.get("title").and_then(|v| v.as_str());
+    let folder_id = arguments.get("folder_id").and_then(|v| v.as_str());
+    let template_arg = arguments
+        .get("template")
+        .or_else(|| arguments.get("template_id"))
+        .and_then(|v| v.as_str());
+    let template_id =
+        template_arg.and_then(|t| policy.find_template(t).map(|e| e.id.as_str()).or(Some(t)));
+
+    let pres = crate::marp::parse_marp(marp_source)
+        .map_err(|e| GwsError::Validation(format!("Marp parse error: {e}")))?;
+
+    // Step A: Resolve or create presentation
+    let slides_doc = state.get_doc("slides").await?;
+    let drive_doc = state.get_doc("drive").await?;
+
+    let presentation_id: String;
+    let mut created_new = false;
+
+    if let Some(pid) = presentation_id_arg {
+        presentation_id = pid.to_string();
+    } else if let Some(tmpl_id) = template_id {
+        // Copy template presentation via Drive
+        let files_resource = tools::find_resource(&drive_doc.resources, "files")
+            .ok_or_else(|| GwsError::Validation("Drive files resource not found".into()))?;
+        let copy_method = files_resource
+            .methods
+            .get("copy")
+            .ok_or_else(|| GwsError::Validation("Drive files.copy method not found".into()))?;
+
+        let mut copy_body = json!({});
+        if let Some(t) = title {
+            copy_body["name"] = json!(t);
+        }
+        if let Some(fid) = folder_id {
+            copy_body["parents"] = json!([fid]);
+        }
+
+        let copy_args = json!({
+            "params": { "fileId": tmpl_id },
+            "body": copy_body
+        });
+
+        let mut tc = state.token_cache.take();
+        let copy_result = crate::execute::execute_tool(
+            &drive_doc,
+            copy_method,
+            "files",
+            "copy",
+            &copy_args,
+            "drive",
+            policy,
+            meta,
+            None,
+            None,
+            dry_run,
+            &mut tc,
+        )
+        .await?;
+        state.token_cache = tc;
+
+        presentation_id = copy_result
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| GwsError::Validation("Drive copy did not return an ID".into()))?
+            .to_string();
+        created_new = true;
+    } else if let Some(t) = title {
+        // Search for existing presentation or create new one
+        let files_resource = tools::find_resource(&drive_doc.resources, "files")
+            .ok_or_else(|| GwsError::Validation("Drive files resource not found".into()))?;
+
+        let mut query = format!(
+            "name = '{}' and mimeType = 'application/vnd.google-apps.presentation' and trashed = false",
+            t.replace('\'', "\\'")
+        );
+        if let Some(fid) = folder_id {
+            query.push_str(&format!(" and '{}' in parents", fid.replace('\'', "\\'")));
+        }
+
+        let list_method = files_resource
+            .methods
+            .get("list")
+            .ok_or_else(|| GwsError::Validation("Drive files.list method not found".into()))?;
+
+        let list_args = json!({ "params": { "q": query } });
+        let mut tc = state.token_cache.take();
+        let list_result = crate::execute::execute_tool(
+            &drive_doc,
+            list_method,
+            "files",
+            "list",
+            &list_args,
+            "drive",
+            policy,
+            meta,
+            None,
+            None,
+            dry_run,
+            &mut tc,
+        )
+        .await?;
+        state.token_cache = tc;
+
+        let files = list_result
+            .get("files")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        if let Some(existing) = files.first() {
+            presentation_id = existing
+                .get("id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| GwsError::Validation("Existing file has no ID".into()))?
+                .to_string();
+        } else {
+            // Create new presentation
+            let presentations_resource =
+                tools::find_resource(&slides_doc.resources, "presentations").ok_or_else(|| {
+                    GwsError::Validation("Slides presentations resource not found".into())
+                })?;
+            let create_method = presentations_resource
+                .methods
+                .get("create")
+                .ok_or_else(|| {
+                    GwsError::Validation("Slides presentations.create not found".into())
+                })?;
+
+            let create_args = json!({
+                "body": { "title": t }
+            });
+
+            let mut tc = state.token_cache.take();
+            let create_result = crate::execute::execute_tool(
+                &slides_doc,
+                create_method,
+                "presentations",
+                "create",
+                &create_args,
+                "slides",
+                policy,
+                meta,
+                None,
+                None,
+                dry_run,
+                &mut tc,
+            )
+            .await?;
+            state.token_cache = tc;
+
+            presentation_id = create_result
+                .get("presentationId")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    let keys: Vec<_> = create_result
+                        .as_object()
+                        .map(|o| o.keys().collect())
+                        .unwrap_or_default();
+                    GwsError::Validation(format!(
+                        "Create did not return presentationId. Response keys: {:?}",
+                        keys
+                    ))
+                })?
+                .to_string();
+            created_new = true;
+
+            if let Some(fid) = folder_id {
+                let drive_doc = state.get_doc("drive").await?;
+                let files_resource = tools::find_resource(&drive_doc.resources, "files")
+                    .ok_or_else(|| GwsError::Validation("Drive files resource not found".into()))?;
+                let update_method = files_resource
+                    .methods
+                    .get("update")
+                    .ok_or_else(|| GwsError::Validation("Drive files.update not found".into()))?;
+                let move_args = json!({
+                    "params": {
+                        "fileId": &presentation_id,
+                        "addParents": fid
+                    }
+                });
+                let mut tc = state.token_cache.take();
+                let _move_result = crate::execute::execute_tool(
+                    &drive_doc,
+                    update_method,
+                    "files",
+                    "update",
+                    &move_args,
+                    "drive",
+                    policy,
+                    meta,
+                    None,
+                    None,
+                    dry_run,
+                    &mut tc,
+                )
+                .await?;
+                state.token_cache = tc;
+            }
+        }
+    } else {
+        return Err(GwsError::Validation(
+            "One of 'presentation_id', 'title', or 'template_id' is required".into(),
+        ));
+    }
+
+    if dry_run {
+        return Ok(json!({
+            "dry_run": true,
+            "presentation_id": presentation_id,
+            "slide_count": pres.slides.len()
+        }));
+    }
+
+    // Step B: Fetch presentation, extract layouts, collect existing slide IDs
+    let (template_layouts, existing_slide_ids) = {
+        let presentations_resource = tools::find_resource(&slides_doc.resources, "presentations")
+            .ok_or_else(|| {
+            GwsError::Validation("Slides presentations resource not found".into())
+        })?;
+        let get_method = presentations_resource
+            .methods
+            .get("get")
+            .ok_or_else(|| GwsError::Validation("Slides presentations.get not found".into()))?;
+
+        let get_args = json!({ "params": { "presentationId": &presentation_id } });
+        let mut tc = state.token_cache.take();
+        let get_result = crate::execute::execute_tool(
+            &slides_doc,
+            get_method,
+            "presentations",
+            "get",
+            &get_args,
+            "slides",
+            policy,
+            meta,
+            None,
+            None,
+            false,
+            &mut tc,
+        )
+        .await?;
+        state.token_cache = tc;
+        crate::server::check_api_result(&get_result)?;
+
+        let layouts = if template_id.is_some() {
+            extract_layouts(&get_result)
+        } else {
+            Vec::new()
+        };
+
+        let existing_slide_ids: Vec<String> = get_result
+            .get("slides")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|s| {
+                        s.get("objectId")
+                            .and_then(|id| id.as_str())
+                            .map(String::from)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        (layouts, existing_slide_ids)
+    };
+
+    // Step C: Generate slide create requests, then batch cleanup + creation
+    let layouts_ref = if template_layouts.is_empty() {
+        None
+    } else {
+        Some(template_layouts.as_slice())
+    };
+    let (create_reqs, mut content_reqs) = marp_to_slide_requests(&pres, None, layouts_ref);
+
+    let presentations_resource = tools::find_resource(&slides_doc.resources, "presentations")
+        .ok_or_else(|| GwsError::Validation("Slides presentations resource not found".into()))?;
+    let batch_method = presentations_resource
+        .methods
+        .get("batchUpdate")
+        .ok_or_else(|| GwsError::Validation("Slides batchUpdate not found".into()))?;
+
+    // Step C1: Delete existing slides (create temp slide first, then delete all old ones)
+    if !existing_slide_ids.is_empty() {
+        let mut cleanup_reqs = vec![json!({
+            "createSlide": { "objectId": "temp_cleanup_slide" }
+        })];
+        for old_id in &existing_slide_ids {
+            cleanup_reqs.push(json!({ "deleteObject": { "objectId": old_id } }));
+        }
+        let batch_args = json!({
+            "params": { "presentationId": &presentation_id },
+            "body": { "requests": cleanup_reqs }
+        });
+        let mut tc = state.token_cache.take();
+        let cleanup_result = crate::execute::execute_tool(
+            &slides_doc,
+            batch_method,
+            "presentations",
+            "batchUpdate",
+            &batch_args,
+            "slides",
+            policy,
+            meta,
+            None,
+            None,
+            false,
+            &mut tc,
+        )
+        .await?;
+        state.token_cache = tc;
+        crate::server::check_api_result(&cleanup_result)?;
+    }
+
+    // Step C2: Create new slides and delete the temp cleanup slide
+    if !create_reqs.is_empty() {
+        let mut pass1_reqs = create_reqs;
+        if !existing_slide_ids.is_empty() {
+            pass1_reqs.push(json!({
+                "deleteObject": { "objectId": "temp_cleanup_slide" }
+            }));
+        }
+
+        let batch_args = json!({
+            "params": { "presentationId": &presentation_id },
+            "body": { "requests": pass1_reqs }
+        });
+        let mut tc = state.token_cache.take();
+        let create_result = crate::execute::execute_tool(
+            &slides_doc,
+            batch_method,
+            "presentations",
+            "batchUpdate",
+            &batch_args,
+            "slides",
+            policy,
+            meta,
+            None,
+            None,
+            false,
+            &mut tc,
+        )
+        .await?;
+        state.token_cache = tc;
+        crate::server::check_api_result(&create_result)?;
+    }
+
+    // Step D: Fetch presentation to get speaker notes object IDs
+    let has_notes = pres.slides.iter().any(|s| s.speaker_notes.is_some());
+    if has_notes {
+        let presentations_resource = tools::find_resource(&slides_doc.resources, "presentations")
+            .ok_or_else(|| {
+            GwsError::Validation("Slides presentations resource not found".into())
+        })?;
+        let get_method = presentations_resource
+            .methods
+            .get("get")
+            .ok_or_else(|| GwsError::Validation("Slides presentations.get not found".into()))?;
+
+        let get_args = json!({ "params": { "presentationId": &presentation_id } });
+        let mut tc = state.token_cache.take();
+        let get_result = crate::execute::execute_tool(
+            &slides_doc,
+            get_method,
+            "presentations",
+            "get",
+            &get_args,
+            "slides",
+            policy,
+            meta,
+            None,
+            None,
+            false,
+            &mut tc,
+        )
+        .await?;
+        state.token_cache = tc;
+
+        let slides_arr = get_result
+            .get("slides")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        let notes_ids: Vec<String> = slides_arr
+            .iter()
+            .filter_map(|s| {
+                s.get("slideProperties")
+                    .and_then(|sp| sp.get("notesPage"))
+                    .and_then(|np| np.get("notesProperties"))
+                    .and_then(|npp| npp.get("speakerNotesObjectId"))
+                    .and_then(|id| id.as_str())
+                    .map(String::from)
+            })
+            .collect();
+
+        let (_, notes_content_reqs) = marp_to_slide_requests(&pres, Some(&notes_ids), None);
+        // Only add notes-related requests (insertText targeting notes IDs)
+        for req in notes_content_reqs {
+            if let Some(insert) = req.get("insertText")
+                && let Some(obj_id) = insert.get("objectId").and_then(|v| v.as_str())
+                && notes_ids.contains(&obj_id.to_string())
+            {
+                content_reqs.push(req);
+            }
+        }
+    }
+
+    // Step E: Remap placeholder IDs to actual server-assigned IDs
+    // When createSlide uses placeholderIdMappings, the API may assign different IDs
+    // if the layout's placeholder type/index doesn't match exactly
+    if layouts_ref.is_some() && !content_reqs.is_empty() {
+        let refreshed = fetch_presentation(&presentation_id, state, policy, meta).await?;
+        let refreshed_slides = refreshed
+            .get("slides")
+            .and_then(|s| s.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let mut content_json = serde_json::to_string(&content_reqs).unwrap_or_default();
+        for (idx, slide) in refreshed_slides.iter().enumerate() {
+            let elements = slide
+                .get("pageElements")
+                .and_then(|pe| pe.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if let Some(real_title) = find_title_object_id(&elements) {
+                content_json = content_json
+                    .replace(&format!("\"title_{idx}\""), &format!("\"{}\"", real_title));
+            }
+            if let Some(real_body) = find_body_object_id(&elements) {
+                content_json =
+                    content_json.replace(&format!("\"body_{idx}\""), &format!("\"{}\"", real_body));
+            }
+        }
+        if let Ok(fixed) = serde_json::from_str::<Vec<Value>>(&content_json) {
+            content_reqs = fixed;
+        }
+    }
+
+    // Step F: Execute pass 2 — content, styling, backgrounds, notes
+    if !content_reqs.is_empty() {
+        let presentations_resource = tools::find_resource(&slides_doc.resources, "presentations")
+            .ok_or_else(|| {
+            GwsError::Validation("Slides presentations resource not found".into())
+        })?;
+        let batch_method = presentations_resource
+            .methods
+            .get("batchUpdate")
+            .ok_or_else(|| GwsError::Validation("Slides batchUpdate not found".into()))?;
+
+        let batch_args = json!({
+            "params": { "presentationId": &presentation_id },
+            "body": { "requests": content_reqs }
+        });
+        let mut tc = state.token_cache.take();
+        let result = crate::execute::execute_tool(
+            &slides_doc,
+            batch_method,
+            "presentations",
+            "batchUpdate",
+            &batch_args,
+            "slides",
+            policy,
+            meta,
+            None,
+            None,
+            false,
+            &mut tc,
+        )
+        .await?;
+        state.token_cache = tc;
+
+        let mut final_result = result;
+        final_result["presentation_id"] = json!(presentation_id);
+        final_result["slide_count"] = json!(pres.slides.len());
+        if created_new {
+            final_result["created_presentation_id"] = json!(&presentation_id);
+        }
+        final_result["url"] = json!(format!(
+            "https://docs.google.com/presentation/d/{}/edit",
+            presentation_id
+        ));
+        return Ok(final_result);
+    }
+
+    Ok(json!({
+        "presentation_id": presentation_id,
+        "slide_count": pres.slides.len(),
+        "url": format!("https://docs.google.com/presentation/d/{}/edit", presentation_id)
+    }))
+}
+
+async fn fetch_presentation(
+    presentation_id: &str,
+    state: &mut ServerState,
+    policy: &Policy,
+    meta: &RequestMeta,
+) -> Result<Value, GwsError> {
+    let slides_doc = state.get_doc("slides").await?;
+    let resource = tools::find_resource(&slides_doc.resources, "presentations")
+        .ok_or_else(|| GwsError::Validation("Slides presentations resource not found".into()))?;
+    let get_method = resource
+        .methods
+        .get("get")
+        .ok_or_else(|| GwsError::Validation("Slides presentations.get not found".into()))?;
+    let args = json!({ "params": { "presentationId": presentation_id } });
+    let mut tc = state.token_cache.take();
+    let result = crate::execute::execute_tool(
+        &slides_doc,
+        get_method,
+        "presentations",
+        "get",
+        &args,
+        "slides",
+        policy,
+        meta,
+        None,
+        None,
+        false,
+        &mut tc,
+    )
+    .await?;
+    state.token_cache = tc;
+    crate::server::check_api_result(&result)?;
+    Ok(result)
+}
+
+fn extract_slide_object_ids(presentation: &Value) -> Vec<String> {
+    presentation
+        .get("slides")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| {
+                    s.get("objectId")
+                        .and_then(|id| id.as_str())
+                        .map(String::from)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+async fn slides_batch_update(
+    presentation_id: &str,
+    requests: Vec<Value>,
+    state: &mut ServerState,
+    policy: &Policy,
+    meta: &RequestMeta,
+    dry_run: bool,
+) -> Result<Value, GwsError> {
+    let slides_doc = state.get_doc("slides").await?;
+    let resource = tools::find_resource(&slides_doc.resources, "presentations")
+        .ok_or_else(|| GwsError::Validation("Slides presentations resource not found".into()))?;
+    let batch_method = resource
+        .methods
+        .get("batchUpdate")
+        .ok_or_else(|| GwsError::Validation("Slides presentations.batchUpdate not found".into()))?;
+    let batch_args = json!({
+        "params": { "presentationId": presentation_id },
+        "body": { "requests": requests }
+    });
+    let mut tc = state.token_cache.take();
+    let result = crate::execute::execute_tool(
+        &slides_doc,
+        batch_method,
+        "presentations",
+        "batchUpdate",
+        &batch_args,
+        "slides",
+        policy,
+        meta,
+        None,
+        None,
+        dry_run,
+        &mut tc,
+    )
+    .await?;
+    state.token_cache = tc;
+    crate::server::check_api_result(&result)?;
+    Ok(result)
+}
+
+async fn fetch_slide_summary(
+    presentation_id: &str,
+    state: &mut ServerState,
+    policy: &Policy,
+    meta: &RequestMeta,
+) -> Result<Value, GwsError> {
+    let slides_doc = state.get_doc("slides").await?;
+    let resource = tools::find_resource(&slides_doc.resources, "presentations")
+        .ok_or_else(|| GwsError::Validation("Slides presentations resource not found".into()))?;
+    let get_method = resource
+        .methods
+        .get("get")
+        .ok_or_else(|| GwsError::Validation("Slides presentations.get not found".into()))?;
+    let args = json!({
+        "params": {
+            "presentationId": presentation_id,
+            "fields": "slides(objectId,pageElements(shape(placeholder,text)))"
+        }
+    });
+    let mut tc = state.token_cache.take();
+    let result = crate::execute::execute_tool(
+        &slides_doc,
+        get_method,
+        "presentations",
+        "get",
+        &args,
+        "slides",
+        policy,
+        meta,
+        None,
+        None,
+        false,
+        &mut tc,
+    )
+    .await?;
+    state.token_cache = tc;
+    crate::server::check_api_result(&result)?;
+
+    let slides = result
+        .get("slides")
+        .and_then(|s| s.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut summary = Vec::new();
+    for (i, slide) in slides.iter().enumerate() {
+        let elements = slide
+            .get("pageElements")
+            .and_then(|pe| pe.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let title = {
+            let t = extract_slide_text(&elements, "TITLE");
+            if t.is_empty() {
+                let t2 = extract_slide_text(&elements, "CENTERED_TITLE");
+                if t2.is_empty() {
+                    if let Some(title_id) = find_title_object_id(&elements) {
+                        elements
+                            .iter()
+                            .find(|e| {
+                                e.get("objectId").and_then(|id| id.as_str()) == Some(&title_id)
+                            })
+                            .map(extract_text_from_shape)
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    t2
+                }
+            } else {
+                t
+            }
+        };
+        summary.push(json!({
+            "slide_number": i + 1,
+            "object_id": slide.get("objectId").and_then(|v| v.as_str()).unwrap_or(""),
+            "title": title
+        }));
+    }
+    Ok(json!({ "slide_count": slides.len(), "slides": summary }))
+}
+
+async fn execute_slides_read(
+    arguments: &Value,
+    policy: &Policy,
+    meta: &RequestMeta,
+    state: &mut ServerState,
+    _dry_run: bool,
+) -> Result<Value, GwsError> {
+    let presentation_id = arguments
+        .get("presentation_id")
+        .or_else(|| arguments.get("presentationId"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| GwsError::Validation("Missing 'presentation_id' argument".into()))?;
+    let slide_number = arguments
+        .get("slide_number")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
+    let format = arguments
+        .get("format")
+        .and_then(|v| v.as_str())
+        .unwrap_or("json");
+
+    let pres_data = fetch_presentation(presentation_id, state, policy, meta).await?;
+
+    if format == "markdown" {
+        let md = presentation_to_markdown(&pres_data);
+        return Ok(json!({
+            "content": [{ "type": "text", "text": md }],
+            "isError": false
+        }));
+    }
+
+    let structured =
+        presentation_to_structured(&pres_data, slide_number).map_err(GwsError::Validation)?;
+
+    Ok(json!({
+        "content": [{ "type": "text", "text": serde_json::to_string_pretty(&structured).unwrap_or_default() }],
+        "structuredContent": structured,
+        "isError": false
+    }))
+}
+
+async fn execute_slides_delete(
+    arguments: &Value,
+    policy: &Policy,
+    meta: &RequestMeta,
+    state: &mut ServerState,
+    dry_run: bool,
+) -> Result<Value, GwsError> {
+    let presentation_id = arguments
+        .get("presentation_id")
+        .or_else(|| arguments.get("presentationId"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| GwsError::Validation("Missing 'presentation_id' argument".into()))?;
+    let slide_numbers: Vec<usize> = arguments
+        .get("slide_numbers")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| GwsError::Validation("Missing 'slide_numbers' argument".into()))?
+        .iter()
+        .filter_map(|v| v.as_u64().map(|n| n as usize))
+        .collect();
+
+    if slide_numbers.is_empty() {
+        return Err(GwsError::Validation(
+            "slide_numbers must contain at least one slide number".into(),
+        ));
+    }
+
+    let pres_data = fetch_presentation(presentation_id, state, policy, meta).await?;
+    let slide_ids = extract_slide_object_ids(&pres_data);
+    let slide_count = slide_ids.len();
+
+    for &num in &slide_numbers {
+        if num < 1 || num > slide_count {
+            return Err(GwsError::Validation(format!(
+                "Slide number {num} is out of range. Presentation has {slide_count} slides (1-{slide_count})."
+            )));
+        }
+    }
+
+    let mut unique_numbers: Vec<usize> = slide_numbers.clone();
+    unique_numbers.sort();
+    unique_numbers.dedup();
+
+    if unique_numbers.len() >= slide_count {
+        return Err(GwsError::Validation(
+            "Cannot delete all slides. A presentation must have at least one slide.".into(),
+        ));
+    }
+
+    let mut delete_reqs = Vec::new();
+    let mut deleted_ids = Vec::new();
+    for &num in &unique_numbers {
+        let obj_id = &slide_ids[num - 1];
+        delete_reqs.push(json!({ "deleteObject": { "objectId": obj_id } }));
+        deleted_ids.push(obj_id.clone());
+    }
+
+    slides_batch_update(presentation_id, delete_reqs, state, policy, meta, dry_run).await?;
+
+    let summary = fetch_slide_summary(presentation_id, state, policy, meta).await?;
+    let result = json!({
+        "deleted": deleted_ids,
+        "remaining_slides": summary.get("slide_count"),
+        "slides": summary.get("slides"),
+        "url": format!("https://docs.google.com/presentation/d/{}/edit", presentation_id)
+    });
+    Ok(json!({
+        "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
+        "structuredContent": result,
+        "isError": false
+    }))
+}
+
+async fn execute_slides_reorder(
+    arguments: &Value,
+    policy: &Policy,
+    meta: &RequestMeta,
+    state: &mut ServerState,
+    dry_run: bool,
+) -> Result<Value, GwsError> {
+    let presentation_id = arguments
+        .get("presentation_id")
+        .or_else(|| arguments.get("presentationId"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| GwsError::Validation("Missing 'presentation_id' argument".into()))?;
+    let slide_numbers: Vec<usize> = arguments
+        .get("slide_numbers")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| GwsError::Validation("Missing 'slide_numbers' argument".into()))?
+        .iter()
+        .filter_map(|v| v.as_u64().map(|n| n as usize))
+        .collect();
+    let position = arguments
+        .get("position")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| GwsError::Validation("Missing 'position' argument".into()))?
+        as usize;
+
+    if slide_numbers.is_empty() {
+        return Err(GwsError::Validation(
+            "slide_numbers must contain at least one slide number".into(),
+        ));
+    }
+
+    let pres_data = fetch_presentation(presentation_id, state, policy, meta).await?;
+    let slide_ids = extract_slide_object_ids(&pres_data);
+    let slide_count = slide_ids.len();
+
+    for &num in &slide_numbers {
+        if num < 1 || num > slide_count {
+            return Err(GwsError::Validation(format!(
+                "Slide number {num} is out of range. Presentation has {slide_count} slides (1-{slide_count})."
+            )));
+        }
+    }
+    if position < 1 || position > slide_count {
+        return Err(GwsError::Validation(format!(
+            "Position {position} is out of range. Must be 1-{slide_count}."
+        )));
+    }
+
+    let move_ids: Vec<String> = slide_numbers
+        .iter()
+        .map(|&n| slide_ids[n - 1].clone())
+        .collect();
+    let reqs = vec![json!({
+        "updateSlidesPosition": {
+            "slideObjectIds": move_ids,
+            "insertionIndex": position - 1
+        }
+    })];
+
+    slides_batch_update(presentation_id, reqs, state, policy, meta, dry_run).await?;
+
+    let summary = fetch_slide_summary(presentation_id, state, policy, meta).await?;
+    let result = json!({
+        "moved": move_ids,
+        "position": position,
+        "slides": summary.get("slides"),
+        "url": format!("https://docs.google.com/presentation/d/{}/edit", presentation_id)
+    });
+    Ok(json!({
+        "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
+        "structuredContent": result,
+        "isError": false
+    }))
+}
+
+async fn execute_slides_add(
+    arguments: &Value,
+    policy: &Policy,
+    meta: &RequestMeta,
+    state: &mut ServerState,
+    dry_run: bool,
+) -> Result<Value, GwsError> {
+    let presentation_id = arguments
+        .get("presentation_id")
+        .or_else(|| arguments.get("presentationId"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| GwsError::Validation("Missing 'presentation_id' argument".into()))?;
+    let marp_source = arguments
+        .get("marp")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| GwsError::Validation("Missing 'marp' argument".into()))?;
+    let position = arguments
+        .get("position")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
+
+    if marp_source.contains("\n---\n") || marp_source.contains("\r\n---\r\n") {
+        return Err(GwsError::Validation(
+            "Only single-slide Marp is supported. Remove '---' separators or use gws_slides_import_marp for multi-slide content.".into(),
+        ));
+    }
+
+    let is_blank = marp_source.trim().is_empty()
+        || marp_source.trim() == "---\nmarp: true\n---"
+        || marp_source.trim().chars().all(|c| c.is_whitespace());
+
+    let pres = crate::marp::parse_marp(marp_source)
+        .map_err(|e| GwsError::Validation(format!("Failed to parse Marp: {e}")))?;
+
+    if pres.slides.len() != 1 {
+        return Err(GwsError::Validation(format!(
+            "Expected 1 slide, got {}. Use gws_slides_import_marp for multi-slide content.",
+            pres.slides.len()
+        )));
+    }
+
+    let has_content =
+        !is_blank && (pres.slides[0].title.is_some() || !pres.slides[0].body_blocks.is_empty());
+
+    let pres_data = fetch_presentation(presentation_id, state, policy, meta).await?;
+    let slide_ids = extract_slide_object_ids(&pres_data);
+    let slide_count = slide_ids.len();
+
+    if let Some(pos) = position
+        && (pos < 1 || pos > slide_count + 1)
+    {
+        return Err(GwsError::Validation(format!(
+            "Position {pos} is out of range. Must be 1-{}.",
+            slide_count + 1
+        )));
+    }
+
+    let suffix = format!(
+        "_{:08x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u32)
+            .unwrap_or(0)
+    );
+    let new_slide_id = format!("slide_0{suffix}");
+
+    if has_content {
+        let layouts = extract_layouts(&pres_data);
+        let layouts_ref = if layouts.is_empty() {
+            None
+        } else {
+            Some(layouts.as_slice())
+        };
+
+        let (mut create_reqs, mut content_reqs) = marp_to_slide_requests(&pres, None, layouts_ref);
+
+        let rewrite_ids = |reqs: &mut [Value]| {
+            let json_str = serde_json::to_string(&reqs).unwrap_or_default();
+            let replaced = json_str
+                .replace("\"slide_0\"", &format!("\"slide_0{suffix}\""))
+                .replace("\"title_0\"", &format!("\"title_0{suffix}\""))
+                .replace("\"body_0\"", &format!("\"body_0{suffix}\""))
+                .replace("\"table_0_", &format!("\"table_0{suffix}_"));
+            if let Ok(parsed) = serde_json::from_str::<Vec<Value>>(&replaced) {
+                for (i, v) in parsed.into_iter().enumerate() {
+                    if i < reqs.len() {
+                        reqs[i] = v;
+                    }
+                }
+            }
+        };
+        rewrite_ids(&mut create_reqs);
+        rewrite_ids(&mut content_reqs);
+
+        if let Some(pos) = position
+            && let Some(req) = create_reqs.get_mut(0)
+            && let Some(create_slide) = req.get_mut("createSlide")
+        {
+            create_slide["insertionIndex"] = json!(pos - 1);
+        }
+
+        slides_batch_update(presentation_id, create_reqs, state, policy, meta, dry_run).await?;
+
+        if !content_reqs.is_empty() {
+            // Re-fetch the slide to discover actual placeholder IDs (mapped IDs may differ
+            // from server-assigned ones when placeholderIdMappings don't match exactly)
+            let refreshed = fetch_presentation(presentation_id, state, policy, meta).await?;
+            let refreshed_slides = refreshed
+                .get("slides")
+                .and_then(|s| s.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let target_idx = position
+                .map(|p| p - 1)
+                .unwrap_or(refreshed_slides.len().saturating_sub(1));
+            if let Some(new_slide) = refreshed_slides.get(target_idx) {
+                let elements = new_slide
+                    .get("pageElements")
+                    .and_then(|pe| pe.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let actual_title = find_title_object_id(&elements);
+                let actual_body = find_body_object_id(&elements);
+
+                // Rewrite content requests to use actual IDs instead of generated ones
+                let content_json = serde_json::to_string(&content_reqs).unwrap_or_default();
+                let mut replaced = content_json;
+                if let Some(ref real_title) = actual_title {
+                    replaced = replaced.replace(
+                        &format!("\"title_0{suffix}\""),
+                        &format!("\"{}\"", real_title),
+                    );
+                }
+                if let Some(ref real_body) = actual_body {
+                    replaced = replaced.replace(
+                        &format!("\"body_0{suffix}\""),
+                        &format!("\"{}\"", real_body),
+                    );
+                }
+                if let Ok(fixed) = serde_json::from_str::<Vec<Value>>(&replaced) {
+                    content_reqs = fixed;
+                }
+
+                // Filter content requests to only those targeting existing elements
+                let existing_ids: std::collections::HashSet<String> = elements
+                    .iter()
+                    .filter_map(|e| {
+                        e.get("objectId")
+                            .and_then(|id| id.as_str())
+                            .map(String::from)
+                    })
+                    .collect();
+                content_reqs.retain(|req| {
+                    let obj_id = req
+                        .as_object()
+                        .and_then(|m| m.values().next())
+                        .and_then(|v| v.get("objectId"))
+                        .and_then(|id| id.as_str())
+                        .unwrap_or("");
+                    obj_id.is_empty() || existing_ids.contains(obj_id)
+                });
+            }
+
+            if !content_reqs.is_empty() {
+                slides_batch_update(presentation_id, content_reqs, state, policy, meta, dry_run)
+                    .await?;
+            }
+        }
+
+        if pres.slides[0].speaker_notes.is_some() {
+            let updated_pres = fetch_presentation(presentation_id, state, policy, meta).await?;
+            let updated_slides = updated_pres
+                .get("slides")
+                .and_then(|s| s.as_array())
+                .cloned()
+                .unwrap_or_default();
+
+            let target_idx = position
+                .map(|p| p - 1)
+                .unwrap_or(updated_slides.len().saturating_sub(1));
+            if let Some(slide) = updated_slides.get(target_idx) {
+                let notes_obj_id = slide
+                    .get("slideProperties")
+                    .and_then(|sp| sp.get("notesPage"))
+                    .and_then(|np| np.get("notesProperties"))
+                    .and_then(|np| np.get("speakerNotesObjectId"))
+                    .and_then(|id| id.as_str());
+                if let (Some(notes_id), Some(notes_text)) =
+                    (notes_obj_id, &pres.slides[0].speaker_notes)
+                {
+                    let notes_reqs = vec![json!({
+                        "insertText": {
+                            "objectId": notes_id,
+                            "text": notes_text
+                        }
+                    })];
+                    slides_batch_update(presentation_id, notes_reqs, state, policy, meta, dry_run)
+                        .await?;
+                }
+            }
+        }
+    } else {
+        // Blank slide — just create it without content
+        let mut create_req = json!({ "createSlide": { "objectId": &new_slide_id } });
+        if let Some(pos) = position {
+            create_req["createSlide"]["insertionIndex"] = json!(pos - 1);
+        }
+        slides_batch_update(
+            presentation_id,
+            vec![create_req],
+            state,
+            policy,
+            meta,
+            dry_run,
+        )
+        .await?;
+    }
+
+    if let Some(bg) = arguments.get("background_image").and_then(|v| v.as_str()) {
+        let bg_url = if bg.starts_with("http") {
+            bg.to_string()
+        } else {
+            format!("https://drive.google.com/uc?export=download&id={bg}")
+        };
+        let bg_reqs = vec![json!({
+            "updatePageProperties": {
+                "objectId": &new_slide_id,
+                "pageProperties": {
+                    "pageBackgroundFill": {
+                        "stretchedPictureFill": { "contentUrl": bg_url }
+                    }
+                },
+                "fields": "pageBackgroundFill"
+            }
+        })];
+        slides_batch_update(presentation_id, bg_reqs, state, policy, meta, dry_run).await?;
+    }
+
+    let summary = fetch_slide_summary(presentation_id, state, policy, meta).await?;
+    let result = json!({
+        "presentation_id": presentation_id,
+        "slide_object_id": new_slide_id,
+        "position": position.unwrap_or(slide_count + 1),
+        "slide_count": summary.get("slide_count"),
+        "slides": summary.get("slides"),
+        "url": format!("https://docs.google.com/presentation/d/{}/edit", presentation_id)
+    });
+    Ok(json!({
+        "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
+        "structuredContent": result,
+        "isError": false
+    }))
+}
+
+async fn execute_slides_duplicate(
+    arguments: &Value,
+    policy: &Policy,
+    meta: &RequestMeta,
+    state: &mut ServerState,
+    dry_run: bool,
+) -> Result<Value, GwsError> {
+    let presentation_id = arguments
+        .get("presentation_id")
+        .or_else(|| arguments.get("presentationId"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| GwsError::Validation("Missing 'presentation_id' argument".into()))?;
+    let slide_number = arguments
+        .get("slide_number")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| GwsError::Validation("Missing 'slide_number' argument".into()))?
+        as usize;
+    let position = arguments
+        .get("position")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
+
+    let pres_data = fetch_presentation(presentation_id, state, policy, meta).await?;
+    let slide_ids = extract_slide_object_ids(&pres_data);
+    let slide_count = slide_ids.len();
+
+    if slide_number < 1 || slide_number > slide_count {
+        return Err(GwsError::Validation(format!(
+            "Slide number {slide_number} is out of range. Presentation has {slide_count} slides (1-{slide_count})."
+        )));
+    }
+
+    let source_id = &slide_ids[slide_number - 1];
+    let dup_reqs = vec![json!({ "duplicateObject": { "objectId": source_id } })];
+    let dup_result =
+        slides_batch_update(presentation_id, dup_reqs, state, policy, meta, dry_run).await?;
+
+    let new_slide_id = dup_result
+        .get("replies")
+        .and_then(|r| r.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|r| r.get("duplicateObject"))
+        .and_then(|d| d.get("objectId"))
+        .and_then(|id| id.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    if let Some(pos) = position {
+        if pos < 1 || pos > slide_count + 1 {
+            return Err(GwsError::Validation(format!(
+                "Position {pos} is out of range. Must be 1-{}.",
+                slide_count + 1
+            )));
+        }
+        let move_reqs = vec![json!({
+            "updateSlidesPosition": {
+                "slideObjectIds": [&new_slide_id],
+                "insertionIndex": pos - 1
+            }
+        })];
+        slides_batch_update(presentation_id, move_reqs, state, policy, meta, dry_run).await?;
+    }
+
+    let summary = fetch_slide_summary(presentation_id, state, policy, meta).await?;
+    let result = json!({
+        "duplicated_from": source_id,
+        "new_slide_id": new_slide_id,
+        "slides": summary.get("slides"),
+        "slide_count": summary.get("slide_count"),
+        "url": format!("https://docs.google.com/presentation/d/{}/edit", presentation_id)
+    });
+    Ok(json!({
+        "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
+        "structuredContent": result,
+        "isError": false
+    }))
+}
+
+async fn execute_slides_update(
+    arguments: &Value,
+    policy: &Policy,
+    meta: &RequestMeta,
+    state: &mut ServerState,
+    dry_run: bool,
+) -> Result<Value, GwsError> {
+    let presentation_id = arguments
+        .get("presentation_id")
+        .or_else(|| arguments.get("presentationId"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| GwsError::Validation("Missing 'presentation_id' argument".into()))?;
+    let slide_number = arguments
+        .get("slide_number")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| GwsError::Validation("Missing 'slide_number' argument".into()))?
+        as usize;
+    let new_title = arguments.get("title").and_then(|v| v.as_str());
+    let new_body = arguments.get("body").and_then(|v| v.as_str());
+    let new_notes = arguments.get("notes").and_then(|v| v.as_str());
+    let placeholders_map = arguments.get("placeholders").and_then(|v| v.as_object());
+
+    if new_title.is_none()
+        && new_body.is_none()
+        && new_notes.is_none()
+        && placeholders_map.is_none()
+    {
+        return Err(GwsError::Validation(
+            "At least one of 'title', 'body', 'notes', or 'placeholders' must be provided".into(),
+        ));
+    }
+
+    let pres_data = fetch_presentation(presentation_id, state, policy, meta).await?;
+    let slides = pres_data
+        .get("slides")
+        .and_then(|s| s.as_array())
+        .ok_or_else(|| GwsError::Validation("Presentation has no slides".into()))?;
+    let slide_count = slides.len();
+
+    if slide_number < 1 || slide_number > slide_count {
+        return Err(GwsError::Validation(format!(
+            "Slide number {slide_number} is out of range. Presentation has {slide_count} slides (1-{slide_count})."
+        )));
+    }
+
+    let slide = &slides[slide_number - 1];
+    let page_elements = slide
+        .get("pageElements")
+        .and_then(|pe| pe.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut update_reqs: Vec<Value> = Vec::new();
+
+    if let Some(title_text) = new_title {
+        let title_id = find_title_object_id(&page_elements);
+        if let Some(obj_id) = title_id {
+            let existing_title = extract_slide_text(&page_elements, "TITLE");
+            let existing_centered = extract_slide_text(&page_elements, "CENTERED_TITLE");
+            let existing_fallback = if existing_title.is_empty() && existing_centered.is_empty() {
+                extract_all_body_text(&page_elements)
+            } else {
+                String::new()
+            };
+            let has_existing = !existing_title.is_empty()
+                || !existing_centered.is_empty()
+                || !existing_fallback.is_empty();
+            if has_existing {
+                update_reqs.push(json!({
+                    "deleteText": { "objectId": &obj_id, "textRange": { "type": "ALL" } }
+                }));
+            }
+            update_reqs.push(json!({
+                "insertText": { "objectId": &obj_id, "text": title_text }
+            }));
+        }
+    }
+
+    if let Some(body_text) = new_body {
+        let body_id = find_body_object_id(&page_elements);
+        if let Some(obj_id) = body_id {
+            let existing = extract_all_body_text(&page_elements);
+            if !existing.is_empty() {
+                update_reqs.push(json!({
+                    "deleteText": { "objectId": &obj_id, "textRange": { "type": "ALL" } }
+                }));
+            }
+
+            let parsed = crate::marp::parse_marp(body_text)
+                .map_err(|e| GwsError::Validation(format!("Failed to parse body Marp: {e}")))?;
+            if let Some(slide_content) = parsed.slides.first() {
+                let blocks = &slide_content.body_blocks;
+                if !blocks.is_empty() {
+                    let (text, styles, bullets) = build_body_content(blocks, &obj_id);
+                    if !text.is_empty() {
+                        update_reqs.push(json!({
+                            "insertText": { "objectId": &obj_id, "text": text }
+                        }));
+                        update_reqs.extend(styles);
+                        update_reqs.extend(bullets);
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(notes_text) = new_notes {
+        let notes_obj_id = slide
+            .get("slideProperties")
+            .and_then(|sp| sp.get("notesPage"))
+            .and_then(|np| np.get("notesProperties"))
+            .and_then(|np| np.get("speakerNotesObjectId"))
+            .and_then(|id| id.as_str());
+        if let Some(notes_id) = notes_obj_id {
+            let existing = extract_notes_text(slide);
+            if existing.is_some() {
+                update_reqs.push(json!({
+                    "deleteText": { "objectId": notes_id, "textRange": { "type": "ALL" } }
+                }));
+            }
+            update_reqs.push(json!({
+                "insertText": { "objectId": notes_id, "text": notes_text }
+            }));
+        }
+    }
+
+    if let Some(ph_map) = placeholders_map {
+        for (label, text_val) in ph_map {
+            let text = text_val.as_str().unwrap_or("");
+            let obj_id = find_placeholder_by_label(&page_elements, label)
+                .ok_or_else(|| {
+                    GwsError::Validation(format!(
+                        "Placeholder '{label}' not found on slide {slide_number}. Use gws_templates to see available placeholders."
+                    ))
+                })?;
+            let has_text = page_elements
+                .iter()
+                .find(|e| e.get("objectId").and_then(|id| id.as_str()) == Some(&obj_id))
+                .map(|e| !extract_text_from_shape(e).is_empty())
+                .unwrap_or(false);
+            if has_text {
+                update_reqs.push(json!({
+                    "deleteText": { "objectId": &obj_id, "textRange": { "type": "ALL" } }
+                }));
+            }
+            update_reqs.push(json!({
+                "insertText": { "objectId": &obj_id, "text": text }
+            }));
+        }
+    }
+
+    if update_reqs.is_empty() {
+        return Err(GwsError::Validation(
+            "No updatable elements found on this slide. The slide may not have the expected placeholder shapes.".into(),
+        ));
+    }
+
+    slides_batch_update(presentation_id, update_reqs, state, policy, meta, dry_run).await?;
+
+    let summary = fetch_slide_summary(presentation_id, state, policy, meta).await?;
+    let result = json!({
+        "updated_slide": slide_number,
+        "slides": summary.get("slides"),
+        "url": format!("https://docs.google.com/presentation/d/{}/edit", presentation_id)
+    });
+    Ok(json!({
+        "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
+        "structuredContent": result,
+        "isError": false
+    }))
+}
+
+pub(crate) async fn execute_list_templates(
+    arguments: Option<&Value>,
+    policy: &Policy,
+    meta: &RequestMeta,
+    state: &mut ServerState,
+) -> Value {
+    let name_filter = arguments
+        .and_then(|a| a.get("name"))
+        .and_then(|n| n.as_str());
+
+    let mut templates: Vec<Value> = Vec::new();
+
+    for t in policy.templates() {
+        if let Some(filter) = name_filter
+            && !t.name.to_lowercase().contains(&filter.to_lowercase())
+        {
+            continue;
+        }
+
+        let mut entry = json!({
+            "name": t.name,
+            "id": t.id
+        });
+        if let Some(ref desc) = t.description {
+            entry["description"] = json!(desc);
+        }
+        if let Ok(slides_doc) = state.get_doc("slides").await
+            && let Some(pres_resource) =
+                tools::find_resource(&slides_doc.resources, "presentations")
+            && let Some(get_method) = pres_resource.methods.get("get")
+        {
+            let args = json!({ "params": { "presentationId": &t.id } });
+            let mut tc = state.token_cache.take();
+            if let Ok(pres_data) = crate::execute::execute_tool(
+                &slides_doc,
+                get_method,
+                "presentations",
+                "get",
+                &args,
+                "slides",
+                policy,
+                meta,
+                None,
+                None,
+                false,
+                &mut tc,
+            )
+            .await
+            {
+                let raw_layouts = pres_data
+                    .get("layouts")
+                    .and_then(|l| l.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+
+                let active_master = pres_data
+                    .get("slides")
+                    .and_then(|s| s.as_array())
+                    .and_then(|slides| slides.last())
+                    .and_then(|s| s.get("slideProperties"))
+                    .and_then(|sp| sp.get("masterObjectId"))
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("");
+
+                let mut seen = std::collections::HashSet::new();
+                let mut layout_details = Vec::new();
+                for layout in &raw_layouts {
+                    let master = layout
+                        .get("layoutProperties")
+                        .and_then(|lp| lp.get("masterObjectId"))
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("");
+                    if !active_master.is_empty() && master != active_master {
+                        continue;
+                    }
+                    let name = layout
+                        .get("layoutProperties")
+                        .and_then(|lp| lp.get("displayName"))
+                        .and_then(|dn| dn.as_str())
+                        .unwrap_or("");
+                    if name.is_empty() || !seen.insert(name.to_string()) {
+                        continue;
+                    }
+                    layout_details.push(extract_layout_details(layout));
+                }
+                entry["layouts"] = json!(layout_details);
+            }
+            state.token_cache = tc;
+        }
+        templates.push(entry);
+    }
+
+    json!({
+        "templates": templates,
+        "count": templates.len(),
+        "hint": "Use the template 'name' or 'id' as the 'template' argument in gws_slides_import_marp. Use placeholder labels with gws_slides_update."
     })
 }
 
