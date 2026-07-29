@@ -3,6 +3,7 @@
 mod audit;
 mod auth;
 mod cache;
+mod calendar_helpers;
 mod completions;
 mod drive_helpers;
 mod elicitation;

@@ -170,6 +170,15 @@ async fn handle_tool_call_inner_concurrent(
         return Ok(result);
     }
 
+    if tool_name.starts_with("gws_calendar_") {
+        let mut st = state.lock().await;
+        let result = crate::calendar_helpers::execute_calendar_helper(
+            tool_name, arguments, policy, meta, &mut st,
+        )
+        .await?;
+        return Ok(result);
+    }
+
     if tool_name == "gws_templates" {
         let mut st = state.lock().await;
         let result =
@@ -206,7 +215,8 @@ async fn handle_tool_call_inner_concurrent(
 
     let svc_alias = tool_name;
 
-    const HELPER_ONLY_SERVICES: &[&str] = &["drive", "docs", "sheets", "slides", "gmail"];
+    const HELPER_ONLY_SERVICES: &[&str] =
+        &["drive", "docs", "sheets", "slides", "gmail", "calendar"];
     if HELPER_ONLY_SERVICES.contains(&svc_alias) {
         tracing::warn!(
             service = svc_alias,

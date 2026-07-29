@@ -88,6 +88,13 @@ gws_gmail_attachment    = { domain = "network", operation = "read" }
 gws_gmail_contacts      = { domain = "network", operation = "read" }
 gws_gmail_forward       = { domain = "network", operation = "write" }
 gws_gmail_labels        = { domain = "network", operation = "write" }
+# Calendar helpers
+gws_calendar_list       = { domain = "network", operation = "read" }
+gws_calendar_get        = { domain = "network", operation = "read" }
+gws_calendar_create     = { domain = "network", operation = "write" }
+gws_calendar_update     = { domain = "network", operation = "write" }
+gws_calendar_delete     = { domain = "network", operation = "write" }
+gws_calendar_freebusy   = { domain = "network", operation = "read" }
 
 # --- Models ---
 

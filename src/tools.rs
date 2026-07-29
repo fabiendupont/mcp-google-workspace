@@ -76,7 +76,8 @@ pub async fn build_tools_list(
 ) -> Result<Vec<Tool>, GwsError> {
     let mut tools = Vec::new();
 
-    const SERVICES_WITH_HELPERS: &[&str] = &["drive", "docs", "sheets", "slides", "gmail"];
+    const SERVICES_WITH_HELPERS: &[&str] =
+        &["drive", "docs", "sheets", "slides", "gmail", "calendar"];
 
     // Pre-load discovery docs for all services (helpers need them)
     for svc_name in policy.allowed_services() {
@@ -374,6 +375,26 @@ pub async fn build_tools_list(
         crate::gmail_helpers::gmail_labels_tool_schema(),
     ));
 
+    // Calendar helper tools
+    tools.push(tool_from_json(
+        crate::calendar_helpers::calendar_list_tool_schema(),
+    ));
+    tools.push(tool_from_json(
+        crate::calendar_helpers::calendar_get_tool_schema(),
+    ));
+    tools.push(tool_from_json(
+        crate::calendar_helpers::calendar_create_tool_schema(),
+    ));
+    tools.push(tool_from_json(
+        crate::calendar_helpers::calendar_update_tool_schema(),
+    ));
+    tools.push(tool_from_json(
+        crate::calendar_helpers::calendar_delete_tool_schema(),
+    ));
+    tools.push(tool_from_json(
+        crate::calendar_helpers::calendar_freebusy_tool_schema(),
+    ));
+
     if eager {
         return Ok(tools);
     }
@@ -394,6 +415,8 @@ pub async fn build_tools_list(
             Some("slides")
         } else if name.starts_with("gws_gmail_") {
             Some("gmail")
+        } else if name.starts_with("gws_calendar_") {
+            Some("calendar")
         } else {
             None
         }
@@ -468,6 +491,12 @@ fn tool_full_schema(name: &str) -> Option<Value> {
         "gws_gmail_contacts" => crate::gmail_helpers::gmail_contacts_tool_schema(),
         "gws_gmail_forward" => crate::gmail_helpers::gmail_forward_tool_schema(),
         "gws_gmail_labels" => crate::gmail_helpers::gmail_labels_tool_schema(),
+        "gws_calendar_list" => crate::calendar_helpers::calendar_list_tool_schema(),
+        "gws_calendar_get" => crate::calendar_helpers::calendar_get_tool_schema(),
+        "gws_calendar_create" => crate::calendar_helpers::calendar_create_tool_schema(),
+        "gws_calendar_update" => crate::calendar_helpers::calendar_update_tool_schema(),
+        "gws_calendar_delete" => crate::calendar_helpers::calendar_delete_tool_schema(),
+        "gws_calendar_freebusy" => crate::calendar_helpers::calendar_freebusy_tool_schema(),
         _ => return None,
     };
     let mut info = json!({
