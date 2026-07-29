@@ -1,0 +1,46 @@
+name: cross-service
+description: "Email → Doc summary → Calendar scheduling — tests Gmail, Docs, Calendar, Drive integration"
+prompt_file: prompts/test-cross-service.md
+timeout_seconds: 300
+
+rubric:
+  - id: email_searched
+    criterion: "Model searched Gmail within the GWS-MCP-Test label"
+    check: "Model used gws_gmail_search and received messages scoped to the allowed label"
+    weight: 1.0
+
+  - id: email_read
+    criterion: "Model read the most recent email"
+    check: "Model used gws_gmail_read with a message_id and received body text and headers"
+    weight: 1.0
+
+  - id: doc_created
+    criterion: "Model created a Google Doc titled 'Email Summary' in the test folder"
+    check: "gws_drive_list the test folder, look for 'Email Summary'. Score: 1.0 = exists with content from the email; 0.5 = exists but empty or wrong content; 0.0 = not found"
+    weight: 1.0
+
+  - id: doc_has_email_content
+    criterion: "The doc contains sender, date, subject, and body summary from the email"
+    check: "gws_docs_read the document. Score: 1.0 = has sender, date, subject, and meaningful summary; 0.5 = has some but missing key fields; 0.0 = no email content"
+    weight: 1.0
+
+  - id: calendar_checked
+    criterion: "Model checked tomorrow's calendar"
+    check: "Model used gws_calendar_list or gws_calendar_freebusy for tomorrow's date range"
+    weight: 0.5
+
+  - id: meeting_created
+    criterion: "Model created a follow-up meeting with the email subject in the title"
+    check: "Model used gws_calendar_create with a summary containing 'Follow-up' and a time in a free slot. Score: 1.0 = correct title and free slot; 0.5 = meeting created but wrong time or generic title; 0.0 = no meeting"
+    weight: 1.0
+
+  - id: correct_service_usage
+    criterion: "Model used the right services: Gmail for email, Docs for document, Calendar for scheduling"
+    check: "Tool calls show gws_gmail_*, gws_docs_*, and gws_calendar_* used appropriately. No generic service tool fallback."
+    weight: 0.5
+
+cleanup:
+  - action: trash
+    name_pattern: "Email Summary"
+  - action: delete_event
+    summary_pattern: "Follow-up"

@@ -193,9 +193,9 @@ pub fn calendar_freebusy_tool_schema() -> Value {
                     "type": "string",
                     "description": "End of range (RFC3339)"
                 },
-                "calendars": {
+                "calendar_ids": {
                     "type": "string",
-                    "description": "Comma-separated calendar IDs (default: primary)"
+                    "description": "Comma-separated calendar IDs to check (default: primary)"
                 }
             },
             "required": ["time_min", "time_max"]
@@ -613,7 +613,7 @@ pub(crate) async fn execute_calendar_helper(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| GwsError::Validation("Missing 'time_max'".into()))?;
             let calendars_str = arguments
-                .get("calendars")
+                .get("calendar_ids")
                 .and_then(|v| v.as_str())
                 .unwrap_or("primary");
 

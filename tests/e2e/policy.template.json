@@ -48,7 +48,8 @@
     {
       "name": "calendar",
       "constraints": [
-        { "param": "calendarId", "values": ["primary"], "access": "read-write" }
+        { "param": "calendarId", "values": ["primary"], "access": "read-only" },
+        { "param": "calendarId", "values": ["$GWS_TEST_CALENDAR_ID"], "access": "read-write" }
       ]
     },
     {
