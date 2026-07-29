@@ -1,0 +1,44 @@
+name: calendar-workflow
+description: "List events with RSVP status, check free/busy, create event in free slot, verify"
+prompt_file: prompts/test-calendar-workflow.md
+timeout_seconds: 300
+
+rubric:
+  - id: events_listed
+    criterion: "Model listed today's calendar events with RSVP status"
+    check: "Model used gws_calendar_list and reported events with accepted/declined/tentative status"
+    weight: 1.0
+
+  - id: declined_noted
+    criterion: "Model correctly identified declined events"
+    check: "Model noted which events have myStatus=declined or responseStatus=declined. Score: 1.0 = correctly identified declined; 0.5 = mentioned status but not clearly; 0.0 = ignored status"
+    weight: 0.5
+
+  - id: freebusy_checked
+    criterion: "Model checked free/busy times for tomorrow"
+    check: "Model used gws_calendar_freebusy with tomorrow's date range and reported busy slots"
+    weight: 1.0
+
+  - id: free_slot_found
+    criterion: "Model identified a free slot tomorrow afternoon"
+    check: "Model analyzed freebusy results and found a gap after 14:00. Score: 1.0 = correct free slot; 0.5 = reasonable slot but overlaps; 0.0 = no analysis"
+    weight: 0.5
+
+  - id: event_created
+    criterion: "Model created 'MCP Review' event in the free slot"
+    check: "Model used gws_calendar_create with summary='MCP Review' and a start time in the identified free slot"
+    weight: 1.0
+
+  - id: event_verified
+    criterion: "Model retrieved and verified the created event"
+    check: "Model used gws_calendar_get with the event ID from the create response"
+    weight: 0.5
+
+  - id: correct_tool_usage
+    criterion: "Model used calendar helper tools correctly"
+    check: "All operations used gws_calendar_* tools. Score: 1.0 = all correct; 0.5 = mostly correct; 0.0 = used generic tool"
+    weight: 0.5
+
+cleanup:
+  - action: delete_event
+    summary_pattern: "MCP Review"

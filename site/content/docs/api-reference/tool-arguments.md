@@ -7,7 +7,7 @@ draft = false
 weight = 20
 template = "docs/page.html"
 [extra]
-lead = "53 purpose-built helper tools across 6 services, plus discovery and batch meta-tools."
+lead = "59 purpose-built helper tools across 7 services, plus discovery and batch meta-tools."
 toc = true
 top = false
 +++
@@ -19,7 +19,7 @@ The server operates in two modes:
 | Mode | Initial tools | Activation |
 |------|---------------|------------|
 | **Lazy** (default) | `gws_discover`, `gws_batch` | Model calls `gws_discover(service="sheets")` to activate a service |
-| **Eager** (`--eager-tools`) | All 53 tools | Loaded at startup |
+| **Eager** (`--eager-tools`) | All 59 tools | Loaded at startup |
 
 Services with helpers (Drive, Docs, Sheets, Slides, Gmail) suppress their generic tool. The model uses only the purpose-built helpers.
 
@@ -182,6 +182,35 @@ Executes multiple tool calls in a single request.
     "format": "markdown"
   }
 }
+```
+
+## Calendar helpers (6 tools)
+
+| Tool | Description |
+|------|-------------|
+| `gws_calendar_list` | List upcoming events (defaults to primary calendar, from now) |
+| `gws_calendar_get` | Get full event details |
+| `gws_calendar_create` | Create an event with title, time, attendees |
+| `gws_calendar_update` | Update an existing event (partial update) |
+| `gws_calendar_delete` | Delete (cancel) an event |
+| `gws_calendar_freebusy` | Check free/busy times for one or more calendars |
+
+Events include `myStatus` (accepted/declined/tentative) so models can filter declined events from schedule summaries.
+
+### Example: List events
+
+```json
+{"name": "gws_calendar_list", "arguments": {"max_results": 5}}
+```
+
+### Example: Find free time and create event
+
+```json
+{"name": "gws_calendar_freebusy", "arguments": {"time_min": "2026-07-30T08:00:00Z", "time_max": "2026-07-30T18:00:00Z"}}
+```
+
+```json
+{"name": "gws_calendar_create", "arguments": {"summary": "Team sync", "start": "2026-07-30T14:00:00+02:00", "end": "2026-07-30T14:30:00+02:00"}}
 ```
 
 ## Generic tool (fallback)

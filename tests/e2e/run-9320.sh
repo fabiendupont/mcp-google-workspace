@@ -9,7 +9,7 @@ MCP_PORT=3100
 NAVRA_PORT=9320
 
 ALL_MODELS="gemma4:e4b gemma4:26b qwen3:8b qwen3.6:35b-a3b claude-sonnet-4-5@20250929"
-ALL_SCENARIOS="drive-workflow docs-workflow docs-full full-e2e sheets-advanced slides-workflow slides-template gmail-workflow"
+ALL_SCENARIOS="drive-workflow docs-workflow docs-full full-e2e sheets-advanced slides-workflow slides-template gmail-workflow calendar-workflow"
 
 # --- Parse args ---
 MODELS=""
@@ -126,6 +126,7 @@ prompt_file() {
         slides-workflow) echo "$PROJECT_DIR/prompts/test-slides-workflow.md" ;;
         slides-template) echo "$PROJECT_DIR/prompts/test-slides-template.md" ;;
         gmail-workflow)  echo "$PROJECT_DIR/prompts/test-gmail-workflow.md" ;;
+        calendar-workflow) echo "$PROJECT_DIR/prompts/test-calendar-workflow.md" ;;
         *) echo ""; return 1 ;;
     esac
 }
@@ -145,6 +146,7 @@ mcp_prompt_for_scenario() {
         slides-workflow) echo "" ;;
         slides-template) echo "google-workspace:create-presentation" ;;
         gmail-workflow)  echo "google-workspace:work-with-email" ;;
+        calendar-workflow) echo "" ;;
         *) echo "" ;;
     esac
 }

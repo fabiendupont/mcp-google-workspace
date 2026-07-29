@@ -8,7 +8,8 @@ Written in Rust, uses direct Google REST API calls (not a CLI wrapper).
 ```
 main.rs           — CLI arg parsing, templates, interactive wizard, policy checker
 handler.rs        — rmcp ServerHandler impl: tools, prompts, resources, completions, tasks, elicitation, subscriptions, lazy tool discovery
-server.rs         — Tool dispatch business logic, Docs/Sheets/Slides/Drive/Gmail helpers, request explanation
+server.rs         — Tool dispatch, shared utilities (policy_for_folder, check_api_result), image gen, batch, tasks
+calendar_helpers.rs — Google Calendar enrichment (6 tools): list, get, create, update, delete, freebusy + RSVP status
 tools.rs          — Builds MCP tool list, lazy filtering by activated services, compact schema mode
 execute.rs        — HTTP execution: URL rendering, params, pagination, resumable uploads, smart field defaults, rate limiting
 format.rs         — Format transformers: Markdown/Plain → Docs batchUpdate, doc → Markdown reverse converter
@@ -35,7 +36,7 @@ image_gen.rs      — Gemini image generation and Drive upload
 marp.rs           — Marp Markdown to Google Slides conversion
 ```
 
-## Tools (53 in eager mode, 2 in lazy mode)
+## Tools (59 in eager mode, 2 in lazy mode)
 
 | Service | Tools | Notes |
 |---------|-------|-------|
@@ -45,6 +46,7 @@ marp.rs           — Marp Markdown to Google Slides conversion
 | Sheets | 14 tools (`gws_sheets_*`) | read, write (creates or updates), append, clear, info, manage_tabs, trace, explain, formulas, format, validate, named_range, csv, dimensions |
 | Slides | 9 tools (`gws_slides_*`) | read, add, update, duplicate, delete, reorder, import_marp, templates, generate_image |
 | Gmail | 10 tools (`gws_gmail_*`) | search, read, thread, attachment, contacts, forward, draft, send, reply, labels |
+| Calendar | 6 tools (`gws_calendar_*`) | list, get, create, update, delete, freebusy |
 
 ## Key Design Decisions
 
@@ -57,7 +59,7 @@ marp.rs           — Marp Markdown to Google Slides conversion
 - **Lazy tool discovery**: Default: only `gws_discover` + `gws_batch` visible.
   When model calls `gws_discover(service="sheets")`, sheets helpers are activated
   and `ToolListChangedNotification` is sent. `--eager-tools` flag loads all at startup.
-- **No generic service tools**: Services with helpers (drive, docs, sheets, slides, gmail)
+- **No generic service tools**: Services with helpers (drive, docs, sheets, slides, gmail, calendar)
   suppress their generic tool. Models use helpers only — no ambiguity.
 - **Create-on-write**: `gws_docs_write` and `gws_sheets_write` create new files
   when `title` is provided instead of `document_id`/`spreadsheet_id`. Same pattern
@@ -118,7 +120,7 @@ The judge uses the same GWS MCP tools to verify what was actually created in Dri
 
 See `tests/e2e/navra.toml`. Key points:
 - HTTP transport pointing at `127.0.0.1:3100/mcp`
-- Tool classifications for all 49 tools (network domain, read/write)
+- Tool classifications for all 59 tools (network domain, read/write)
 - Models: gemma4:e4b, gemma4:26b, qwen3:8b, qwen3.6:35b, claude-sonnet-4-5, claude-opus-4-6
 - MCP prompts injectable via `--upstream-prompt google-workspace:work-with-spreadsheet`
 
