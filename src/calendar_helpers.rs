@@ -250,12 +250,28 @@ fn format_event(event: &Value) -> Value {
         .and_then(|s| s.get("dateTime").or(s.get("date")))
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let attendees: Vec<&str> = event
+    let mut my_status = "";
+    let attendees: Vec<Value> = event
         .get("attendees")
         .and_then(|a| a.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|a| a.get("email").and_then(|e| e.as_str()))
+                .map(|a| {
+                    let email = a.get("email").and_then(|e| e.as_str()).unwrap_or("");
+                    let status = a
+                        .get("responseStatus")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("needsAction");
+                    if a.get("self").and_then(|s| s.as_bool()).unwrap_or(false) {
+                        my_status = match status {
+                            "accepted" => "accepted",
+                            "declined" => "declined",
+                            "tentative" => "tentative",
+                            _ => "needsAction",
+                        };
+                    }
+                    json!({ "email": email, "responseStatus": status })
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -268,6 +284,7 @@ fn format_event(event: &Value) -> Value {
         "location": event.get("location"),
         "description": event.get("description"),
         "status": event.get("status"),
+        "myStatus": my_status,
         "htmlLink": event.get("htmlLink"),
         "attendees": attendees,
         "organizer": event.get("organizer").and_then(|o| o.get("email"))
@@ -324,7 +341,7 @@ pub(crate) async fn execute_calendar_helper(
 
             let args = json!({
                 "params": params,
-                "fields": "items(id,summary,start,end,location,description,status,htmlLink,attendees(email),organizer(email)),nextPageToken"
+                "fields": "items(id,summary,start,end,location,description,status,htmlLink,attendees(email,responseStatus,self),organizer(email)),nextPageToken"
             });
             let result = crate::execute::execute_tool(
                 &cal_doc,
@@ -722,8 +739,8 @@ mod tests {
             "location": "Room A",
             "status": "confirmed",
             "attendees": [
-                { "email": "alice@example.com" },
-                { "email": "bob@example.com" }
+                { "email": "alice@example.com", "responseStatus": "accepted", "self": true },
+                { "email": "bob@example.com", "responseStatus": "declined" }
             ],
             "organizer": { "email": "alice@example.com" }
         });
@@ -731,5 +748,7 @@ mod tests {
         assert_eq!(formatted["id"], "abc123");
         assert_eq!(formatted["start"], "2026-07-29T10:00:00+02:00");
         assert_eq!(formatted["attendees"].as_array().unwrap().len(), 2);
+        assert_eq!(formatted["myStatus"], "accepted");
+        assert_eq!(formatted["attendees"][1]["responseStatus"], "declined");
     }
 }

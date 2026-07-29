@@ -46,6 +46,12 @@
       "read_only": true
     },
     {
+      "name": "calendar",
+      "constraints": [
+        { "param": "calendarId", "values": ["primary"], "access": "read-write" }
+      ]
+    },
+    {
       "name": "slides",
       "constraints": [
         {
