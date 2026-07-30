@@ -7,3 +7,4 @@ tests/e2e/results/*.jsonl
 tests/e2e/results/*.log
 tests/e2e/results/*-summary.md
 tests/e2e/policy.generated.json
+tests/e2e/results/

@@ -12,7 +12,7 @@ use google_workspace::error::GwsError;
 
 use crate::handler::GwsHandler;
 use crate::policy::Policy;
-use crate::server::ServerState;
+use crate::shared::ServerState;
 
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
