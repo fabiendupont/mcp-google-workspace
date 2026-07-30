@@ -289,6 +289,56 @@ impl ServerHandler for GwsHandler {
             .await
             .map_err(|e| McpError::internal_error(format!("API call failed: {e}"), None))?;
 
+            if parsed.service == "gmail" {
+                let allowed_labels = policy.allowed_labels("gmail");
+                if !allowed_labels.is_empty() {
+                    let label_ids = crate::gmail_helpers::extract_label_ids(&result);
+                    let label_doc = st.get_doc("gmail").await.map_err(|e| {
+                        McpError::internal_error(format!("Failed to load gmail doc: {e}"), None)
+                    })?;
+                    let labels_resource =
+                        crate::tools::find_resource(&label_doc.resources, "users.labels")
+                            .ok_or_else(|| {
+                                McpError::internal_error("users.labels not found", None)
+                            })?;
+                    let list_method = labels_resource
+                        .methods
+                        .get("list")
+                        .ok_or_else(|| McpError::internal_error("labels.list not found", None))?;
+                    let labels_result = crate::execute::execute_tool(
+                        &label_doc,
+                        list_method,
+                        "users.labels",
+                        "list",
+                        &json!({ "params": { "userId": "me" } }),
+                        "gmail",
+                        &policy,
+                        &meta,
+                        None,
+                        None,
+                        false,
+                        &mut st.token_cache,
+                    )
+                    .await
+                    .map_err(|e| {
+                        McpError::internal_error(format!("Failed to list labels: {e}"), None)
+                    })?;
+                    let mut allowed_ids = Vec::new();
+                    for name in allowed_labels {
+                        if let Some(id) =
+                            crate::gmail_helpers::resolve_label_id(name, &labels_result)
+                        {
+                            allowed_ids.push(id);
+                        }
+                    }
+                    if let Err(msg) =
+                        crate::gmail_helpers::check_label_policy(&label_ids, &allowed_ids)
+                    {
+                        return Err(McpError::invalid_params(msg, None));
+                    }
+                }
+            }
+
             let text = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
             let contents = rmcp::model::ResourceContents::text(&text, &request.uri)
                 .with_mime_type("application/json");
