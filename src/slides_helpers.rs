@@ -1944,7 +1944,10 @@ async fn execute_slides_import_marp(
 
     let presentation_id_arg = arguments.get("presentation_id").and_then(|v| v.as_str());
     let title = arguments.get("title").and_then(|v| v.as_str());
-    let folder_id = arguments.get("folder_id").and_then(|v| v.as_str());
+    let explicit_folder = arguments.get("folder_id").and_then(|v| v.as_str());
+    let (_effective_policy, resolved_folder) =
+        crate::server::policy_for_folder(explicit_folder, policy, meta, state).await?;
+    let folder_id = resolved_folder.as_deref().or(explicit_folder);
     let template_arg = arguments
         .get("template")
         .or_else(|| arguments.get("template_id"))

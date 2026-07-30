@@ -665,20 +665,20 @@ pub(crate) async fn policy_for_folder(
     policy: &Policy,
     meta: &RequestMeta,
     state: &mut ServerState,
-) -> Result<Policy, GwsError> {
+) -> Result<(Policy, Option<String>), GwsError> {
     let resolved = match folder_id {
         Some(fid) => Some(fid.to_string()),
         None => crate::elicitation::resolve_target_folder(None, policy)?,
     };
-    let Some(fid) = resolved.as_deref() else {
-        return Ok(policy.clone());
+    let Some(ref fid) = resolved else {
+        return Ok((policy.clone(), None));
     };
     let roots = policy.recursive_parent_values("drive");
-    if roots.is_empty() || roots.contains(&fid) {
-        return Ok(policy.clone());
+    if roots.is_empty() || roots.contains(&fid.as_str()) {
+        return Ok((policy.clone(), resolved));
     }
     if is_descendant_of(fid, &roots, state, policy, meta).await {
-        Ok(policy.with_extra_parent("drive", fid))
+        Ok((policy.with_extra_parent("drive", fid), resolved))
     } else {
         Err(GwsError::Validation(format!(
             "Folder '{fid}' is not inside an allowed root folder. \
@@ -932,6 +932,10 @@ async fn upload_image_to_drive(
         .methods
         .get("create")
         .ok_or_else(|| GwsError::Validation("Drive files.create not found".into()))?;
+
+    let (_effective_policy, resolved_folder) =
+        policy_for_folder(folder_id, policy, meta, state).await?;
+    let folder_id = resolved_folder.as_deref().or(folder_id);
 
     let mut body = json!({
         "name": format!("generated_{}.png", chrono_free_timestamp()),

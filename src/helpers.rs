@@ -2552,8 +2552,9 @@ pub(crate) async fn execute_docs_write(
         (id.to_string(), false)
     } else if title.is_some() || folder_id.is_some() {
         let doc_title = title.unwrap_or("Untitled");
-        let effective_policy =
+        let (effective_policy, resolved_folder) =
             crate::server::policy_for_folder(folder_id, policy, meta, state).await?;
+        let folder_id = resolved_folder.as_deref().or(folder_id);
         let drive_doc = state.get_doc("drive").await.map_err(|e| {
             GwsError::Other(anyhow::anyhow!(
                 "gws_docs_import_markdown: failed to load Drive API: {e}"

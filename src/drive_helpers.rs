@@ -460,8 +460,9 @@ pub(crate) async fn execute_drive_helper(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| GwsError::Validation("Missing 'name'".into()))?;
             let parent_id = arguments.get("parent_id").and_then(|v| v.as_str());
-            let effective_policy =
+            let (effective_policy, resolved_folder) =
                 crate::server::policy_for_folder(parent_id, policy, meta, state).await?;
+            let parent_id = resolved_folder.as_deref().or(parent_id);
             let drive_doc = state.get_doc("drive").await?;
             let files_resource = tools::find_resource(&drive_doc.resources, "files")
                 .ok_or_else(|| GwsError::Validation("files resource not found".into()))?;
@@ -503,7 +504,7 @@ pub(crate) async fn execute_drive_helper(
                 .get("to_folder_id")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| GwsError::Validation("Missing 'to_folder_id'".into()))?;
-            let effective_policy =
+            let (effective_policy, _) =
                 crate::server::policy_for_folder(Some(to_folder), policy, meta, state).await?;
             let drive_doc = state.get_doc("drive").await?;
             let files_resource = tools::find_resource(&drive_doc.resources, "files")
@@ -672,8 +673,9 @@ pub(crate) async fn execute_drive_helper(
             let file_id = extract_file_id(arguments, "file_id")?;
             let name = arguments.get("name").and_then(|v| v.as_str());
             let folder_id = arguments.get("folder_id").and_then(|v| v.as_str());
-            let effective_policy =
+            let (effective_policy, resolved_folder) =
                 crate::server::policy_for_folder(folder_id, policy, meta, state).await?;
+            let folder_id = resolved_folder.as_deref().or(folder_id);
             let drive_doc = state.get_doc("drive").await?;
             let files_resource = tools::find_resource(&drive_doc.resources, "files")
                 .ok_or_else(|| GwsError::Validation("files resource not found".into()))?;

@@ -1596,6 +1596,9 @@ pub(crate) async fn execute_gmail_helper(
                 .unwrap_or("attachment");
 
             let folder_id = arguments.get("folder_id").and_then(|v| v.as_str());
+            let (_effective_policy, resolved_folder) =
+                crate::server::policy_for_folder(folder_id, policy, meta, state).await?;
+            let folder_id = resolved_folder.as_deref().or(folder_id);
 
             if let Some(fid) = folder_id {
                 let raw_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD

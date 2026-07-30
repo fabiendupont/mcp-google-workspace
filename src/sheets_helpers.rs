@@ -1241,8 +1241,9 @@ pub(crate) async fn execute_sheets_helper(
                 .unwrap_or("Sheet1");
             let sheet = arguments.get("sheet").and_then(|v| v.as_str());
 
-            let effective_policy =
+            let (effective_policy, resolved_folder) =
                 crate::server::policy_for_folder(folder_id, policy, meta, state).await?;
+            let folder_id = resolved_folder.as_deref().or(folder_id);
             let drive_doc = state.get_doc("drive").await?;
             let files_resource =
                 tools::find_resource(&drive_doc.resources, "files").ok_or_else(|| {
