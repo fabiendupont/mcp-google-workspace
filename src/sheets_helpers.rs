@@ -1124,6 +1124,1073 @@ pub fn build_tab_request(
     }
 }
 
+async fn execute_sheets_write_create(
+    arguments: &Value,
+    title: &str,
+    folder_id: Option<&str>,
+    sheets_doc: &std::sync::Arc<google_workspace::discovery::RestDescription>,
+    policy: &Policy,
+    meta: &RequestMeta,
+    state: &mut ServerState,
+) -> Result<Value, GwsError> {
+    let data = arguments
+        .get("data")
+        .ok_or_else(|| GwsError::Validation("Missing 'data'".into()))?;
+    let range = arguments
+        .get("range")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Sheet1");
+    let sheet = arguments.get("sheet").and_then(|v| v.as_str());
+
+    let (effective_policy, resolved_folder) =
+        crate::server::policy_for_folder(folder_id, policy, meta, state).await?;
+    let folder_id = resolved_folder.as_deref().or(folder_id);
+    let drive_doc = state.get_doc("drive").await?;
+    let files_resource = tools::find_resource(&drive_doc.resources, "files")
+        .ok_or_else(|| GwsError::Validation("files resource not found in drive API".into()))?;
+    let create_method = files_resource
+        .methods
+        .get("create")
+        .ok_or_else(|| GwsError::Validation("create method not found".into()))?;
+    let mut body = json!({
+        "name": title,
+        "mimeType": "application/vnd.google-apps.spreadsheet"
+    });
+    if let Some(fid) = folder_id {
+        body["parents"] = json!([fid]);
+    }
+    let created = crate::execute::execute_tool(
+        &drive_doc,
+        create_method,
+        "files",
+        "create",
+        &json!({"body": body}),
+        "drive",
+        &effective_policy,
+        meta,
+        None,
+        None,
+        false,
+        &mut state.token_cache,
+    )
+    .await?;
+
+    let new_id = created.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    let url = format!("https://docs.google.com/spreadsheets/d/{new_id}/edit");
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let normalized_data = normalize_data(data);
+
+    if !new_id.is_empty() && normalized_data.is_array() {
+        let values_resource = tools::find_resource(&sheets_doc.resources, "spreadsheets.values")
+            .ok_or_else(|| GwsError::Validation("spreadsheets.values resource not found".into()))?;
+        let update_method = values_resource
+            .methods
+            .get("update")
+            .ok_or_else(|| GwsError::Validation("update method not found".into()))?;
+        let full_range = build_range(range, sheet);
+        let write_args = json!({
+            "params": {
+                "spreadsheetId": new_id,
+                "range": full_range,
+                "valueInputOption": "USER_ENTERED"
+            },
+            "body": { "range": full_range, "values": normalized_data }
+        });
+        let mut write_result = crate::execute::execute_tool(
+            sheets_doc,
+            update_method,
+            "spreadsheets.values",
+            "update",
+            &write_args,
+            "sheets",
+            policy,
+            meta,
+            None,
+            None,
+            false,
+            &mut state.token_cache,
+        )
+        .await?;
+
+        if write_result.get("updatedRows").is_none() {
+            tracing::info!(
+                "sheets create-on-write: first write returned no updatedRows, retrying after 1s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+            write_result = crate::execute::execute_tool(
+                sheets_doc,
+                update_method,
+                "spreadsheets.values",
+                "update",
+                &write_args,
+                "sheets",
+                policy,
+                meta,
+                None,
+                None,
+                false,
+                &mut state.token_cache,
+            )
+            .await?;
+        }
+
+        tracing::info!(
+            spreadsheet_id = new_id,
+            updated_rows = ?write_result.get("updatedRows"),
+            updated_range = ?write_result.get("updatedRange"),
+            "sheets create-on-write: data write result"
+        );
+
+        let output = json!({
+            "spreadsheetId": new_id,
+            "title": title,
+            "url": url,
+            "updatedRange": write_result.get("updatedRange"),
+            "updatedRows": write_result.get("updatedRows"),
+            "updatedColumns": write_result.get("updatedColumns"),
+        });
+        return Ok(json!({
+            "content": [{ "type": "text", "text": serde_json::to_string_pretty(&output).unwrap_or_default() }],
+            "structuredContent": output,
+            "isError": false
+        }));
+    }
+
+    let output = json!({ "spreadsheetId": new_id, "title": title, "url": url });
+    Ok(json!({
+        "content": [{ "type": "text", "text": serde_json::to_string_pretty(&output).unwrap_or_default() }],
+        "structuredContent": output,
+        "isError": false
+    }))
+}
+
+async fn execute_sheets_read(
+    arguments: &Value,
+    spreadsheet_id: &str,
+    sheets_doc: &std::sync::Arc<google_workspace::discovery::RestDescription>,
+    policy: &Policy,
+    meta: &RequestMeta,
+    state: &mut ServerState,
+) -> Result<Value, GwsError> {
+    let range = arguments
+        .get("range")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Sheet1");
+    let sheet = arguments.get("sheet").and_then(|v| v.as_str());
+    let format = arguments.get("format").and_then(|v| v.as_str());
+    let full_range = build_range(range, sheet);
+    let render_option = match format {
+        Some("values") => "UNFORMATTED_VALUE",
+        Some("formula") => "FORMULA",
+        _ => "FORMATTED_VALUE",
+    };
+
+    if let Some(cached) = state
+        .sheet_cache
+        .get(spreadsheet_id, &full_range, render_option)
+    {
+        tracing::debug!(spreadsheet_id, range = %full_range, "sheets cache hit");
+        let result = cached.clone();
+        return Ok(json!({
+            "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
+            "structuredContent": result,
+            "isError": false
+        }));
+    }
+
+    let values_resource = tools::find_resource(&sheets_doc.resources, "spreadsheets.values")
+        .ok_or_else(|| GwsError::Validation("spreadsheets.values resource not found".into()))?;
+    let get_method = values_resource
+        .methods
+        .get("get")
+        .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
+    let args = build_read_args(range, sheet, format);
+    let mut args_with_id = args.clone();
+    args_with_id["params"]["spreadsheetId"] = json!(spreadsheet_id);
+    let result = crate::execute::execute_tool(
+        sheets_doc,
+        get_method,
+        "spreadsheets.values",
+        "get",
+        &args_with_id,
+        "sheets",
+        policy,
+        meta,
+        None,
+        None,
+        false,
+        &mut state.token_cache,
+    )
+    .await?;
+
+    state
+        .sheet_cache
+        .put(spreadsheet_id, &full_range, render_option, result.clone());
+
+    Ok(json!({
+        "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
+        "structuredContent": result,
+        "isError": false
+    }))
+}
+
+async fn execute_sheets_write_update(
+    arguments: &Value,
+    spreadsheet_id: &str,
+    sheets_doc: &std::sync::Arc<google_workspace::discovery::RestDescription>,
+    policy: &Policy,
+    meta: &RequestMeta,
+    state: &mut ServerState,
+) -> Result<Value, GwsError> {
+    let range = arguments
+        .get("range")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Sheet1");
+    let data = arguments.get("data").ok_or_else(|| {
+        GwsError::Validation(
+            "Missing 'data'. Pass an array of rows, e.g. [[\"Name\",\"Score\"],[\"Alice\",95]]"
+                .into(),
+        )
+    })?;
+    let normalized_data = normalize_data(data);
+    let sheet = arguments.get("sheet").and_then(|v| v.as_str());
+    let values_resource = tools::find_resource(&sheets_doc.resources, "spreadsheets.values")
+        .ok_or_else(|| GwsError::Validation("spreadsheets.values resource not found".into()))?;
+    let update_method = values_resource
+        .methods
+        .get("update")
+        .ok_or_else(|| GwsError::Validation("update method not found".into()))?;
+    let args = build_write_args(range, &normalized_data, sheet);
+    let mut args_with_id = args.clone();
+    args_with_id["params"]["spreadsheetId"] = json!(spreadsheet_id);
+    let result = crate::execute::execute_tool(
+        sheets_doc,
+        update_method,
+        "spreadsheets.values",
+        "update",
+        &args_with_id,
+        "sheets",
+        policy,
+        meta,
+        None,
+        None,
+        false,
+        &mut state.token_cache,
+    )
+    .await?;
+    state.sheet_cache.invalidate(spreadsheet_id);
+    Ok(json!({
+        "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
+        "structuredContent": result,
+        "isError": false
+    }))
+}
+
+async fn execute_sheets_append(
+    arguments: &Value,
+    spreadsheet_id: &str,
+    sheets_doc: &std::sync::Arc<google_workspace::discovery::RestDescription>,
+    policy: &Policy,
+    meta: &RequestMeta,
+    state: &mut ServerState,
+) -> Result<Value, GwsError> {
+    let range = arguments
+        .get("range")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| GwsError::Validation("Missing 'range'".into()))?;
+    let data = arguments
+        .get("data")
+        .ok_or_else(|| GwsError::Validation("Missing 'data'".into()))?;
+    let sheet = arguments.get("sheet").and_then(|v| v.as_str());
+    let values_resource = tools::find_resource(&sheets_doc.resources, "spreadsheets.values")
+        .ok_or_else(|| GwsError::Validation("spreadsheets.values resource not found".into()))?;
+    let append_method = values_resource
+        .methods
+        .get("append")
+        .ok_or_else(|| GwsError::Validation("append method not found".into()))?;
+    let args = build_append_args(range, data, sheet);
+    let mut args_with_id = args.clone();
+    args_with_id["params"]["spreadsheetId"] = json!(spreadsheet_id);
+    let result = crate::execute::execute_tool(
+        sheets_doc,
+        append_method,
+        "spreadsheets.values",
+        "append",
+        &args_with_id,
+        "sheets",
+        policy,
+        meta,
+        None,
+        None,
+        false,
+        &mut state.token_cache,
+    )
+    .await?;
+    state.sheet_cache.invalidate(spreadsheet_id);
+    Ok(json!({
+        "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
+        "structuredContent": result,
+        "isError": false
+    }))
+}
+
+async fn execute_sheets_info(
+    spreadsheet_id: &str,
+    sheets_doc: &std::sync::Arc<google_workspace::discovery::RestDescription>,
+    policy: &Policy,
+    meta: &RequestMeta,
+    state: &mut ServerState,
+) -> Result<Value, GwsError> {
+    let spreadsheets_resource = tools::find_resource(&sheets_doc.resources, "spreadsheets")
+        .ok_or_else(|| GwsError::Validation("spreadsheets resource not found".into()))?;
+    let get_method = spreadsheets_resource
+        .methods
+        .get("get")
+        .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
+    let mut args = build_info_args();
+    args["params"] = json!({ "spreadsheetId": spreadsheet_id });
+    let result = crate::execute::execute_tool(
+        sheets_doc,
+        get_method,
+        "spreadsheets",
+        "get",
+        &args,
+        "sheets",
+        policy,
+        meta,
+        None,
+        None,
+        false,
+        &mut state.token_cache,
+    )
+    .await?;
+    let formatted = format_info_result(&result);
+    Ok(json!({
+        "content": [{ "type": "text", "text": serde_json::to_string_pretty(&formatted).unwrap_or_default() }],
+        "structuredContent": formatted,
+        "isError": false
+    }))
+}
+
+async fn execute_sheets_clear(
+    arguments: &Value,
+    spreadsheet_id: &str,
+    sheets_doc: &std::sync::Arc<google_workspace::discovery::RestDescription>,
+    policy: &Policy,
+    meta: &RequestMeta,
+    state: &mut ServerState,
+) -> Result<Value, GwsError> {
+    let range = arguments
+        .get("range")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| GwsError::Validation("Missing 'range'".into()))?;
+    let sheet = arguments.get("sheet").and_then(|v| v.as_str());
+    let values_resource = tools::find_resource(&sheets_doc.resources, "spreadsheets.values")
+        .ok_or_else(|| GwsError::Validation("spreadsheets.values resource not found".into()))?;
+    let clear_method = values_resource
+        .methods
+        .get("clear")
+        .ok_or_else(|| GwsError::Validation("clear method not found".into()))?;
+    let args = build_clear_args(range, sheet);
+    let mut args_with_id = args.clone();
+    args_with_id["params"]["spreadsheetId"] = json!(spreadsheet_id);
+    let result = crate::execute::execute_tool(
+        sheets_doc,
+        clear_method,
+        "spreadsheets.values",
+        "clear",
+        &args_with_id,
+        "sheets",
+        policy,
+        meta,
+        None,
+        None,
+        false,
+        &mut state.token_cache,
+    )
+    .await?;
+    state.sheet_cache.invalidate(spreadsheet_id);
+    Ok(json!({
+        "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
+        "structuredContent": result,
+        "isError": false
+    }))
+}
+
+async fn execute_sheets_manage_tabs(
+    arguments: &Value,
+    spreadsheet_id: &str,
+    sheets_doc: &std::sync::Arc<google_workspace::discovery::RestDescription>,
+    policy: &Policy,
+    meta: &RequestMeta,
+    state: &mut ServerState,
+) -> Result<Value, GwsError> {
+    let action = arguments
+        .get("action")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| GwsError::Validation("Missing 'action'".into()))?;
+    let title = arguments.get("title").and_then(|v| v.as_str());
+    let sheet_id = arguments.get("sheet_id").and_then(|v| v.as_i64());
+    let batch_args = build_tab_request(action, title, sheet_id).map_err(GwsError::Validation)?;
+    let spreadsheets_resource = tools::find_resource(&sheets_doc.resources, "spreadsheets")
+        .ok_or_else(|| GwsError::Validation("spreadsheets resource not found".into()))?;
+    let batch_method = spreadsheets_resource
+        .methods
+        .get("batchUpdate")
+        .ok_or_else(|| GwsError::Validation("batchUpdate method not found".into()))?;
+    let mut args = batch_args;
+    args["params"] = json!({ "spreadsheetId": spreadsheet_id });
+    let result = crate::execute::execute_tool(
+        sheets_doc,
+        batch_method,
+        "spreadsheets",
+        "batchUpdate",
+        &args,
+        "sheets",
+        policy,
+        meta,
+        None,
+        None,
+        false,
+        &mut state.token_cache,
+    )
+    .await?;
+    Ok(json!({
+        "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
+        "structuredContent": result,
+        "isError": false
+    }))
+}
+
+async fn execute_sheets_batch_property(
+    tool_name: &str,
+    arguments: &Value,
+    spreadsheet_id: &str,
+    sheets_doc: &std::sync::Arc<google_workspace::discovery::RestDescription>,
+    policy: &Policy,
+    meta: &RequestMeta,
+    state: &mut ServerState,
+) -> Result<Value, GwsError> {
+    let action = arguments
+        .get("action")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| GwsError::Validation("Missing 'action'".into()))?;
+    let mut sheet_id = arguments.get("sheet_id").and_then(|v| v.as_i64());
+    let sheet_name = arguments.get("sheet").and_then(|v| v.as_str());
+
+    if sheet_id.is_none() {
+        if let Some(name) = sheet_name {
+            let spreadsheets_resource = tools::find_resource(&sheets_doc.resources, "spreadsheets")
+                .ok_or_else(|| GwsError::Validation("spreadsheets resource not found".into()))?;
+            let get_method = spreadsheets_resource
+                .methods
+                .get("get")
+                .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
+            let meta_result = crate::execute::execute_tool(
+                sheets_doc, get_method, "spreadsheets", "get",
+                &json!({"params": {"spreadsheetId": spreadsheet_id}, "fields": "sheets(properties(sheetId,title))"}),
+                "sheets", policy, meta, None, None, false, &mut state.token_cache,
+            ).await?;
+            sheet_id = meta_result
+                .get("sheets")
+                .and_then(|v| v.as_array())
+                .and_then(|sheets| {
+                    sheets.iter().find(|s| {
+                        s.pointer("/properties/title").and_then(|t| t.as_str()) == Some(name)
+                    })
+                })
+                .and_then(|s| s.pointer("/properties/sheetId"))
+                .and_then(|v| v.as_i64());
+            if sheet_id.is_none() {
+                return Err(GwsError::Validation(format!(
+                    "Tab '{name}' not found. Use gws_sheets_info to list available tabs."
+                )));
+            }
+        } else if action != "list" {
+            sheet_id = Some(0);
+        }
+    }
+    let range = arguments.get("range").and_then(|v| v.as_str());
+    let rule = arguments.get("rule");
+    let index = arguments.get("index").and_then(|v| v.as_i64());
+    let name = arguments.get("name").and_then(|v| v.as_str());
+    let named_range_id = arguments.get("named_range_id").and_then(|v| v.as_str());
+    let dimension = arguments.get("dimension").and_then(|v| v.as_str());
+    let start = arguments.get("start").and_then(|v| v.as_i64());
+    let end = arguments.get("end").and_then(|v| v.as_i64());
+    let count = arguments.get("count").and_then(|v| v.as_i64());
+    let size = arguments.get("size").and_then(|v| v.as_i64());
+    let destination = arguments.get("destination").and_then(|v| v.as_i64());
+
+    if action == "list" {
+        let spreadsheets_resource = tools::find_resource(&sheets_doc.resources, "spreadsheets")
+            .ok_or_else(|| GwsError::Validation("spreadsheets resource not found".into()))?;
+        let get_method = spreadsheets_resource
+            .methods
+            .get("get")
+            .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
+        let fields = match tool_name {
+            "gws_sheets_format" => "sheets(conditionalFormats)",
+            "gws_sheets_validate" => "sheets(data(rowData(values(dataValidation))))",
+            "gws_sheets_named_range" => "namedRanges",
+            _ => "sheets",
+        };
+        let args = json!({"params": {"spreadsheetId": spreadsheet_id}, "fields": fields});
+        let result = crate::execute::execute_tool(
+            sheets_doc,
+            get_method,
+            "spreadsheets",
+            "get",
+            &args,
+            "sheets",
+            policy,
+            meta,
+            None,
+            None,
+            false,
+            &mut state.token_cache,
+        )
+        .await?;
+        return Ok(json!({
+            "content": [{"type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default()}],
+            "structuredContent": result,
+            "isError": false
+        }));
+    }
+
+    if tool_name == "gws_sheets_named_range" && action == "read" {
+        let n = name.ok_or_else(|| GwsError::Validation("Missing 'name' for read".into()))?;
+        let spreadsheets_resource = tools::find_resource(&sheets_doc.resources, "spreadsheets")
+            .ok_or_else(|| GwsError::Validation("spreadsheets resource not found".into()))?;
+        let get_method = spreadsheets_resource
+            .methods
+            .get("get")
+            .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
+        let meta_result = crate::execute::execute_tool(
+            sheets_doc, get_method, "spreadsheets", "get",
+            &json!({"params": {"spreadsheetId": spreadsheet_id}, "fields": "namedRanges,sheets(properties(sheetId,title))"}),
+            "sheets", policy, meta, None, None, false, &mut state.token_cache,
+        ).await?;
+        let named_ranges = meta_result.get("namedRanges").and_then(|v| v.as_array());
+        let found = named_ranges.and_then(|nrs| {
+            nrs.iter()
+                .find(|nr| nr.get("name").and_then(|v| v.as_str()) == Some(n))
+        });
+        if let Some(nr) = found {
+            let nr_range = nr.get("range");
+            let result = json!({"name": n, "namedRange": nr, "range": nr_range});
+            return Ok(json!({
+                "content": [{"type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default()}],
+                "structuredContent": result,
+                "isError": false
+            }));
+        }
+        return Err(GwsError::Validation(format!("Named range '{n}' not found")));
+    }
+
+    let batch_args = match tool_name {
+        "gws_sheets_format" => {
+            build_conditional_format_request(action, sheet_id, range, rule, index)
+        }
+        "gws_sheets_validate" => build_data_validation_request(action, sheet_id, range, rule),
+        "gws_sheets_named_range" => {
+            build_named_range_request(action, name, sheet_id, range, named_range_id)
+        }
+        "gws_sheets_dimensions" => build_dimension_request(
+            action,
+            sheet_id,
+            dimension,
+            start,
+            end,
+            count,
+            size,
+            destination,
+        ),
+        _ => unreachable!(),
+    }
+    .map_err(GwsError::Validation)?;
+
+    let spreadsheets_resource = tools::find_resource(&sheets_doc.resources, "spreadsheets")
+        .ok_or_else(|| GwsError::Validation("spreadsheets resource not found".into()))?;
+    let batch_method = spreadsheets_resource
+        .methods
+        .get("batchUpdate")
+        .ok_or_else(|| GwsError::Validation("batchUpdate method not found".into()))?;
+    let mut args = batch_args;
+    args["params"] = json!({"spreadsheetId": spreadsheet_id});
+    let result = crate::execute::execute_tool(
+        sheets_doc,
+        batch_method,
+        "spreadsheets",
+        "batchUpdate",
+        &args,
+        "sheets",
+        policy,
+        meta,
+        None,
+        None,
+        false,
+        &mut state.token_cache,
+    )
+    .await?;
+    state.sheet_cache.invalidate(spreadsheet_id);
+    Ok(json!({
+        "content": [{"type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default()}],
+        "structuredContent": result,
+        "isError": false
+    }))
+}
+
+async fn execute_sheets_csv(
+    arguments: &Value,
+    spreadsheet_id: &str,
+    sheets_doc: &std::sync::Arc<google_workspace::discovery::RestDescription>,
+    policy: &Policy,
+    meta: &RequestMeta,
+    state: &mut ServerState,
+) -> Result<Value, GwsError> {
+    let action = arguments
+        .get("action")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| GwsError::Validation("Missing 'action' (export or import)".into()))?;
+    let sheet = arguments
+        .get("sheet")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Sheet1");
+    let separator = arguments
+        .get("separator")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.chars().next())
+        .unwrap_or(',');
+
+    let values_resource = tools::find_resource(&sheets_doc.resources, "spreadsheets.values")
+        .ok_or_else(|| GwsError::Validation("spreadsheets.values resource not found".into()))?;
+
+    if action == "export" {
+        let get_method = values_resource
+            .methods
+            .get("get")
+            .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
+        let full_range = build_range(sheet, None);
+        let args = json!({"params": {"spreadsheetId": spreadsheet_id, "range": full_range, "valueRenderOption": "FORMATTED_VALUE"}});
+        let result = crate::execute::execute_tool(
+            sheets_doc,
+            get_method,
+            "spreadsheets.values",
+            "get",
+            &args,
+            "sheets",
+            policy,
+            meta,
+            None,
+            None,
+            false,
+            &mut state.token_cache,
+        )
+        .await?;
+        let values: Vec<Vec<String>> = result
+            .get("values")
+            .and_then(|v| v.as_array())
+            .map(|rows| {
+                rows.iter()
+                    .map(|row| {
+                        row.as_array()
+                            .map(|cells| {
+                                cells
+                                    .iter()
+                                    .map(|c| c.as_str().unwrap_or("").to_string())
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let csv = values_to_csv(&values, separator);
+        Ok(json!({
+            "content": [{"type": "text", "text": csv}],
+            "isError": false
+        }))
+    } else if action == "import" {
+        let csv_data = arguments
+            .get("data")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| GwsError::Validation("Missing 'data' (CSV string) for import".into()))?;
+        let values = csv_to_values(csv_data, separator);
+        let update_method = values_resource
+            .methods
+            .get("update")
+            .ok_or_else(|| GwsError::Validation("update method not found".into()))?;
+        let full_range = build_range(sheet, None);
+        let data_json: Vec<Value> = values.iter().map(|row| json!(row)).collect();
+        let args = json!({
+            "params": {"spreadsheetId": spreadsheet_id, "range": full_range, "valueInputOption": "USER_ENTERED"},
+            "body": {"range": full_range, "values": data_json}
+        });
+        let result = crate::execute::execute_tool(
+            sheets_doc,
+            update_method,
+            "spreadsheets.values",
+            "update",
+            &args,
+            "sheets",
+            policy,
+            meta,
+            None,
+            None,
+            false,
+            &mut state.token_cache,
+        )
+        .await?;
+        state.sheet_cache.invalidate(spreadsheet_id);
+        Ok(json!({
+            "content": [{"type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default()}],
+            "structuredContent": result,
+            "isError": false
+        }))
+    } else {
+        Err(GwsError::Validation(
+            "action must be 'export' or 'import'".into(),
+        ))
+    }
+}
+
+async fn execute_sheets_formulas(
+    arguments: &Value,
+    spreadsheet_id: &str,
+    sheets_doc: &std::sync::Arc<google_workspace::discovery::RestDescription>,
+    policy: &Policy,
+    meta: &RequestMeta,
+    state: &mut ServerState,
+) -> Result<Value, GwsError> {
+    let sheet = arguments
+        .get("sheet")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Sheet1");
+    let range = arguments
+        .get("range")
+        .and_then(|v| v.as_str())
+        .unwrap_or(sheet);
+    let full_range = build_range(range, Some(sheet));
+
+    let values_resource = tools::find_resource(&sheets_doc.resources, "spreadsheets.values")
+        .ok_or_else(|| GwsError::Validation("spreadsheets.values resource not found".into()))?;
+    let get_method = values_resource
+        .methods
+        .get("get")
+        .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
+
+    let formula_args = json!({"params": {"spreadsheetId": spreadsheet_id, "range": full_range, "valueRenderOption": "FORMULA"}});
+    let formula_result = crate::execute::execute_tool(
+        sheets_doc,
+        get_method,
+        "spreadsheets.values",
+        "get",
+        &formula_args,
+        "sheets",
+        policy,
+        meta,
+        None,
+        None,
+        false,
+        &mut state.token_cache,
+    )
+    .await?;
+
+    let header_range = build_range("1:1", Some(sheet));
+    let header_args = json!({"params": {"spreadsheetId": spreadsheet_id, "range": header_range, "valueRenderOption": "FORMATTED_VALUE"}});
+    let header_result = crate::execute::execute_tool(
+        sheets_doc,
+        get_method,
+        "spreadsheets.values",
+        "get",
+        &header_args,
+        "sheets",
+        policy,
+        meta,
+        None,
+        None,
+        false,
+        &mut state.token_cache,
+    )
+    .await?;
+    let headers: Vec<String> = header_result
+        .pointer("/values/0")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let rows = formula_result.get("values").and_then(|v| v.as_array());
+    let mut columns_with_formulas: Vec<Value> = Vec::new();
+    let mut all_formulas: Vec<Value> = Vec::new();
+
+    if let Some(rows) = rows {
+        let col_count = rows
+            .iter()
+            .map(|r| r.as_array().map(|a| a.len()).unwrap_or(0))
+            .max()
+            .unwrap_or(0);
+        for col_idx in 0..col_count {
+            let header = headers.get(col_idx).cloned().unwrap_or_else(|| {
+                let mut s = String::new();
+                let mut c = col_idx;
+                loop {
+                    s.insert(0, (b'A' + (c % 26) as u8) as char);
+                    if c < 26 {
+                        break;
+                    }
+                    c = c / 26 - 1;
+                }
+                s
+            });
+            let mut formula_count = 0;
+            let mut samples = Vec::new();
+            for (row_idx, row) in rows.iter().enumerate() {
+                if let Some(cell) = row
+                    .as_array()
+                    .and_then(|a| a.get(col_idx))
+                    .and_then(|v| v.as_str())
+                    && cell.starts_with('=')
+                {
+                    formula_count += 1;
+                    let cell_ref = format!(
+                        "{}{}",
+                        {
+                            let mut s = String::new();
+                            let mut c = col_idx;
+                            loop {
+                                s.insert(0, (b'A' + (c % 26) as u8) as char);
+                                if c < 26 {
+                                    break;
+                                }
+                                c = c / 26 - 1;
+                            }
+                            s
+                        },
+                        row_idx + 1
+                    );
+                    all_formulas.push(json!({"cell": cell_ref, "formula": cell}));
+                    if samples.len() < 3 {
+                        samples.push(cell.to_string());
+                    }
+                }
+            }
+            if formula_count > 0 {
+                columns_with_formulas.push(json!({
+                    "column": header,
+                    "formula_count": formula_count,
+                    "samples": samples
+                }));
+            }
+        }
+    }
+
+    let output = json!({
+        "columns_with_formulas": columns_with_formulas,
+        "total_formulas": all_formulas.len(),
+        "all_formulas": all_formulas
+    });
+    Ok(json!({
+        "content": [{"type": "text", "text": serde_json::to_string_pretty(&output).unwrap_or_default()}],
+        "structuredContent": output,
+        "isError": false
+    }))
+}
+
+async fn execute_sheets_trace_explain(
+    tool_name: &str,
+    arguments: &Value,
+    spreadsheet_id: &str,
+    sheets_doc: &std::sync::Arc<google_workspace::discovery::RestDescription>,
+    policy: &Policy,
+    meta: &RequestMeta,
+    state: &mut ServerState,
+) -> Result<Value, GwsError> {
+    let cell = arguments
+        .get("cell")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| GwsError::Validation("Missing 'cell' (e.g. 'B5')".into()))?;
+    let sheet = arguments
+        .get("sheet")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Sheet1");
+    let values_resource = tools::find_resource(&sheets_doc.resources, "spreadsheets.values")
+        .ok_or_else(|| GwsError::Validation("spreadsheets.values resource not found".into()))?;
+    let get_method = values_resource
+        .methods
+        .get("get")
+        .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
+
+    let cell_range = build_range(cell, Some(sheet));
+    let cell_args = json!({
+        "params": {
+            "spreadsheetId": spreadsheet_id,
+            "range": cell_range,
+            "valueRenderOption": "FORMULA"
+        }
+    });
+    let cell_result = crate::execute::execute_tool(
+        sheets_doc,
+        get_method,
+        "spreadsheets.values",
+        "get",
+        &cell_args,
+        "sheets",
+        policy,
+        meta,
+        None,
+        None,
+        false,
+        &mut state.token_cache,
+    )
+    .await?;
+
+    let formula = cell_result
+        .pointer("/values/0/0")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let is_formula = formula.starts_with('=');
+
+    if tool_name == "gws_sheets_explain" {
+        let header_args = json!({
+            "params": {
+                "spreadsheetId": spreadsheet_id,
+                "range": build_range("1:1", Some(sheet)),
+                "valueRenderOption": "FORMATTED_VALUE"
+            }
+        });
+        let header_result = crate::execute::execute_tool(
+            sheets_doc,
+            get_method,
+            "spreadsheets.values",
+            "get",
+            &header_args,
+            "sheets",
+            policy,
+            meta,
+            None,
+            None,
+            false,
+            &mut state.token_cache,
+        )
+        .await?;
+        let headers: Vec<String> = header_result
+            .pointer("/values/0")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let label_args = json!({
+            "params": {
+                "spreadsheetId": spreadsheet_id,
+                "range": build_range("A2:A100", Some(sheet)),
+                "valueRenderOption": "FORMATTED_VALUE"
+            }
+        });
+        let label_result = crate::execute::execute_tool(
+            sheets_doc,
+            get_method,
+            "spreadsheets.values",
+            "get",
+            &label_args,
+            "sheets",
+            policy,
+            meta,
+            None,
+            None,
+            false,
+            &mut state.token_cache,
+        )
+        .await?;
+        let row_labels: Vec<String> = label_result
+            .get("values")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|row| row.get(0).and_then(|v| v.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let explanation = if is_formula {
+            explain_formula(formula, &headers, &row_labels)
+        } else {
+            format!("Cell {cell} contains the value: {formula}")
+        };
+
+        let refs = extract_cell_references(formula);
+        let referenced: Vec<Value> = refs
+            .iter()
+            .map(|r| {
+                let name = resolve_cell_name(r, &headers, &row_labels);
+                json!({
+                    "ref": r,
+                    "column": name.as_ref().map(|(c, _)| c.as_str()).unwrap_or(""),
+                    "row_label": name.as_ref().map(|(_, r)| r.as_str()).unwrap_or(""),
+                })
+            })
+            .collect();
+
+        let output = json!({
+            "cell": cell,
+            "formula": formula,
+            "explanation": explanation,
+            "referenced_cells": referenced,
+        });
+        Ok(json!({
+            "content": [{ "type": "text", "text": serde_json::to_string_pretty(&output).unwrap_or_default() }],
+            "structuredContent": output,
+            "isError": false
+        }))
+    } else {
+        fn build_trace_tree(cell: &str, formula: &str, is_formula: bool) -> Value {
+            if !is_formula {
+                return json!({
+                    "cell": cell,
+                    "value": formula,
+                    "type": if formula.is_empty() { "empty" } else { "value" },
+                });
+            }
+            let refs = extract_cell_references(formula);
+            json!({
+                "cell": cell,
+                "formula": formula,
+                "type": "formula",
+                "references": refs,
+            })
+        }
+
+        let _tree = build_trace_tree(cell, formula, is_formula);
+
+        let output = json!({
+            "cell": cell,
+            "formula": if is_formula { formula } else { "" },
+            "type": if is_formula { "formula" } else if formula.is_empty() { "empty" } else { "value" },
+            "references": if is_formula { extract_cell_references(formula) } else { vec![] },
+            "note": if is_formula {
+                format!("Formula references {} cells. Use gws_sheets_explain for a human-readable explanation.", extract_cell_references(formula).len())
+            } else {
+                format!("Cell contains a plain value: {formula}")
+            },
+        });
+        Ok(json!({
+            "content": [{ "type": "text", "text": serde_json::to_string_pretty(&output).unwrap_or_default() }],
+            "structuredContent": output,
+            "isError": false
+        }))
+    }
+}
+
 pub(crate) async fn execute_sheets_helper(
     tool_name: &str,
     arguments: &Value,
@@ -1229,1048 +2296,131 @@ pub(crate) async fn execute_sheets_helper(
                      To write to an existing spreadsheet, pass spreadsheet_id instead of title.".into(),
                 )
             })?;
-            let data = arguments
-                .get("data")
-                .ok_or_else(|| GwsError::Validation("Missing 'data'".into()))?;
-            let range = arguments
-                .get("range")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Sheet1");
-            let sheet = arguments.get("sheet").and_then(|v| v.as_str());
-
-            let (effective_policy, resolved_folder) =
-                crate::server::policy_for_folder(folder_id, policy, meta, state).await?;
-            let folder_id = resolved_folder.as_deref().or(folder_id);
-            let drive_doc = state.get_doc("drive").await?;
-            let files_resource =
-                tools::find_resource(&drive_doc.resources, "files").ok_or_else(|| {
-                    GwsError::Validation("files resource not found in drive API".into())
-                })?;
-            let create_method = files_resource
-                .methods
-                .get("create")
-                .ok_or_else(|| GwsError::Validation("create method not found".into()))?;
-            let mut body = json!({
-                "name": title,
-                "mimeType": "application/vnd.google-apps.spreadsheet"
-            });
-            if let Some(fid) = folder_id {
-                body["parents"] = json!([fid]);
-            }
-            let created = crate::execute::execute_tool(
-                &drive_doc,
-                create_method,
-                "files",
-                "create",
-                &json!({"body": body}),
-                "drive",
-                &effective_policy,
+            execute_sheets_write_create(
+                arguments,
+                title,
+                folder_id,
+                &sheets_doc,
+                policy,
                 meta,
-                None,
-                None,
-                false,
-                &mut state.token_cache,
+                state,
             )
-            .await?;
-
-            let new_id = created.get("id").and_then(|v| v.as_str()).unwrap_or("");
-            let url = format!("https://docs.google.com/spreadsheets/d/{new_id}/edit");
-
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-            let normalized_data = normalize_data(data);
-
-            if !new_id.is_empty() && normalized_data.is_array() {
-                let values_resource =
-                    tools::find_resource(&sheets_doc.resources, "spreadsheets.values").ok_or_else(
-                        || GwsError::Validation("spreadsheets.values resource not found".into()),
-                    )?;
-                let update_method = values_resource
-                    .methods
-                    .get("update")
-                    .ok_or_else(|| GwsError::Validation("update method not found".into()))?;
-                let full_range = build_range(range, sheet);
-                let write_args = json!({
-                    "params": {
-                        "spreadsheetId": new_id,
-                        "range": full_range,
-                        "valueInputOption": "USER_ENTERED"
-                    },
-                    "body": { "range": full_range, "values": normalized_data }
-                });
-                let mut write_result = crate::execute::execute_tool(
-                    &sheets_doc,
-                    update_method,
-                    "spreadsheets.values",
-                    "update",
-                    &write_args,
-                    "sheets",
-                    policy,
-                    meta,
-                    None,
-                    None,
-                    false,
-                    &mut state.token_cache,
-                )
-                .await?;
-
-                if write_result.get("updatedRows").is_none() {
-                    tracing::info!(
-                        "sheets create-on-write: first write returned no updatedRows, retrying after 1s"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-                    write_result = crate::execute::execute_tool(
-                        &sheets_doc,
-                        update_method,
-                        "spreadsheets.values",
-                        "update",
-                        &write_args,
-                        "sheets",
-                        policy,
-                        meta,
-                        None,
-                        None,
-                        false,
-                        &mut state.token_cache,
-                    )
-                    .await?;
-                }
-
-                tracing::info!(
-                    spreadsheet_id = new_id,
-                    updated_rows = ?write_result.get("updatedRows"),
-                    updated_range = ?write_result.get("updatedRange"),
-                    "sheets create-on-write: data write result"
-                );
-
-                let output = json!({
-                    "spreadsheetId": new_id,
-                    "title": title,
-                    "url": url,
-                    "updatedRange": write_result.get("updatedRange"),
-                    "updatedRows": write_result.get("updatedRows"),
-                    "updatedColumns": write_result.get("updatedColumns"),
-                });
-                return Ok(json!({
-                    "content": [{ "type": "text", "text": serde_json::to_string_pretty(&output).unwrap_or_default() }],
-                    "structuredContent": output,
-                    "isError": false
-                }));
-            }
-
-            let output = json!({ "spreadsheetId": new_id, "title": title, "url": url });
-            Ok(json!({
-                "content": [{ "type": "text", "text": serde_json::to_string_pretty(&output).unwrap_or_default() }],
-                "structuredContent": output,
-                "isError": false
-            }))
+            .await
         }
-
         "gws_sheets_read" => {
-            let spreadsheet_id = spreadsheet_id_opt.unwrap();
-            let range = arguments
-                .get("range")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Sheet1");
-            let sheet = arguments.get("sheet").and_then(|v| v.as_str());
-            let format = arguments.get("format").and_then(|v| v.as_str());
-            let full_range = build_range(range, sheet);
-            let render_option = match format {
-                Some("values") => "UNFORMATTED_VALUE",
-                Some("formula") => "FORMULA",
-                _ => "FORMATTED_VALUE",
-            };
-
-            if let Some(cached) = state
-                .sheet_cache
-                .get(spreadsheet_id, &full_range, render_option)
-            {
-                tracing::debug!(spreadsheet_id, range = %full_range, "sheets cache hit");
-                let result = cached.clone();
-                return Ok(json!({
-                    "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
-                    "structuredContent": result,
-                    "isError": false
-                }));
-            }
-
-            let values_resource =
-                tools::find_resource(&sheets_doc.resources, "spreadsheets.values").ok_or_else(
-                    || GwsError::Validation("spreadsheets.values resource not found".into()),
-                )?;
-            let get_method = values_resource
-                .methods
-                .get("get")
-                .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
-            let args = build_read_args(range, sheet, format);
-            let mut args_with_id = args.clone();
-            args_with_id["params"]["spreadsheetId"] = json!(spreadsheet_id);
-            let result = crate::execute::execute_tool(
+            execute_sheets_read(
+                arguments,
+                spreadsheet_id_opt.unwrap(),
                 &sheets_doc,
-                get_method,
-                "spreadsheets.values",
-                "get",
-                &args_with_id,
-                "sheets",
                 policy,
                 meta,
-                None,
-                None,
-                false,
-                &mut state.token_cache,
+                state,
             )
-            .await?;
-
-            state
-                .sheet_cache
-                .put(spreadsheet_id, &full_range, render_option, result.clone());
-
-            Ok(json!({
-                "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
-                "structuredContent": result,
-                "isError": false
-            }))
+            .await
         }
-
         "gws_sheets_write" => {
-            let spreadsheet_id = spreadsheet_id_opt.unwrap();
-            let range = arguments
-                .get("range")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Sheet1");
-            let data = arguments
-                .get("data")
-                .ok_or_else(|| GwsError::Validation(
-                    "Missing 'data'. Pass an array of rows, e.g. [[\"Name\",\"Score\"],[\"Alice\",95]]".into()
-                ))?;
-            let normalized_data = normalize_data(data);
-            let sheet = arguments.get("sheet").and_then(|v| v.as_str());
-            let values_resource =
-                tools::find_resource(&sheets_doc.resources, "spreadsheets.values").ok_or_else(
-                    || GwsError::Validation("spreadsheets.values resource not found".into()),
-                )?;
-            let update_method = values_resource
-                .methods
-                .get("update")
-                .ok_or_else(|| GwsError::Validation("update method not found".into()))?;
-            let args = build_write_args(range, &normalized_data, sheet);
-            let mut args_with_id = args.clone();
-            args_with_id["params"]["spreadsheetId"] = json!(spreadsheet_id);
-            let result = crate::execute::execute_tool(
+            execute_sheets_write_update(
+                arguments,
+                spreadsheet_id_opt.unwrap(),
                 &sheets_doc,
-                update_method,
-                "spreadsheets.values",
-                "update",
-                &args_with_id,
-                "sheets",
                 policy,
                 meta,
-                None,
-                None,
-                false,
-                &mut state.token_cache,
+                state,
             )
-            .await?;
-            state.sheet_cache.invalidate(spreadsheet_id);
-            Ok(json!({
-                "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
-                "structuredContent": result,
-                "isError": false
-            }))
+            .await
         }
-
         "gws_sheets_append" => {
-            let spreadsheet_id = spreadsheet_id_opt.unwrap();
-            let range = arguments
-                .get("range")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| GwsError::Validation("Missing 'range'".into()))?;
-            let data = arguments
-                .get("data")
-                .ok_or_else(|| GwsError::Validation("Missing 'data'".into()))?;
-            let sheet = arguments.get("sheet").and_then(|v| v.as_str());
-            let values_resource =
-                tools::find_resource(&sheets_doc.resources, "spreadsheets.values").ok_or_else(
-                    || GwsError::Validation("spreadsheets.values resource not found".into()),
-                )?;
-            let append_method = values_resource
-                .methods
-                .get("append")
-                .ok_or_else(|| GwsError::Validation("append method not found".into()))?;
-            let args = build_append_args(range, data, sheet);
-            let mut args_with_id = args.clone();
-            args_with_id["params"]["spreadsheetId"] = json!(spreadsheet_id);
-            let result = crate::execute::execute_tool(
+            execute_sheets_append(
+                arguments,
+                spreadsheet_id_opt.unwrap(),
                 &sheets_doc,
-                append_method,
-                "spreadsheets.values",
-                "append",
-                &args_with_id,
-                "sheets",
                 policy,
                 meta,
-                None,
-                None,
-                false,
-                &mut state.token_cache,
+                state,
             )
-            .await?;
-            state.sheet_cache.invalidate(spreadsheet_id);
-            Ok(json!({
-                "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
-                "structuredContent": result,
-                "isError": false
-            }))
+            .await
         }
-
         "gws_sheets_info" => {
-            let spreadsheet_id = spreadsheet_id_opt.unwrap();
-            let spreadsheets_resource = tools::find_resource(&sheets_doc.resources, "spreadsheets")
-                .ok_or_else(|| GwsError::Validation("spreadsheets resource not found".into()))?;
-            let get_method = spreadsheets_resource
-                .methods
-                .get("get")
-                .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
-            let mut args = build_info_args();
-            args["params"] = json!({ "spreadsheetId": spreadsheet_id });
-            let result = crate::execute::execute_tool(
+            execute_sheets_info(
+                spreadsheet_id_opt.unwrap(),
                 &sheets_doc,
-                get_method,
-                "spreadsheets",
-                "get",
-                &args,
-                "sheets",
                 policy,
                 meta,
-                None,
-                None,
-                false,
-                &mut state.token_cache,
+                state,
             )
-            .await?;
-            let formatted = format_info_result(&result);
-            Ok(json!({
-                "content": [{ "type": "text", "text": serde_json::to_string_pretty(&formatted).unwrap_or_default() }],
-                "structuredContent": formatted,
-                "isError": false
-            }))
+            .await
         }
-
         "gws_sheets_clear" => {
-            let spreadsheet_id = spreadsheet_id_opt.unwrap();
-            let range = arguments
-                .get("range")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| GwsError::Validation("Missing 'range'".into()))?;
-            let sheet = arguments.get("sheet").and_then(|v| v.as_str());
-            let values_resource =
-                tools::find_resource(&sheets_doc.resources, "spreadsheets.values").ok_or_else(
-                    || GwsError::Validation("spreadsheets.values resource not found".into()),
-                )?;
-            let clear_method = values_resource
-                .methods
-                .get("clear")
-                .ok_or_else(|| GwsError::Validation("clear method not found".into()))?;
-            let args = build_clear_args(range, sheet);
-            let mut args_with_id = args.clone();
-            args_with_id["params"]["spreadsheetId"] = json!(spreadsheet_id);
-            let result = crate::execute::execute_tool(
+            execute_sheets_clear(
+                arguments,
+                spreadsheet_id_opt.unwrap(),
                 &sheets_doc,
-                clear_method,
-                "spreadsheets.values",
-                "clear",
-                &args_with_id,
-                "sheets",
                 policy,
                 meta,
-                None,
-                None,
-                false,
-                &mut state.token_cache,
+                state,
             )
-            .await?;
-            state.sheet_cache.invalidate(spreadsheet_id);
-            Ok(json!({
-                "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
-                "structuredContent": result,
-                "isError": false
-            }))
+            .await
         }
-
         "gws_sheets_manage_tabs" => {
-            let spreadsheet_id = spreadsheet_id_opt.unwrap();
-            let action = arguments
-                .get("action")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| GwsError::Validation("Missing 'action'".into()))?;
-            let title = arguments.get("title").and_then(|v| v.as_str());
-            let sheet_id = arguments.get("sheet_id").and_then(|v| v.as_i64());
-            let batch_args =
-                build_tab_request(action, title, sheet_id).map_err(GwsError::Validation)?;
-            let spreadsheets_resource = tools::find_resource(&sheets_doc.resources, "spreadsheets")
-                .ok_or_else(|| GwsError::Validation("spreadsheets resource not found".into()))?;
-            let batch_method = spreadsheets_resource
-                .methods
-                .get("batchUpdate")
-                .ok_or_else(|| GwsError::Validation("batchUpdate method not found".into()))?;
-            let mut args = batch_args;
-            args["params"] = json!({ "spreadsheetId": spreadsheet_id });
-            let result = crate::execute::execute_tool(
+            execute_sheets_manage_tabs(
+                arguments,
+                spreadsheet_id_opt.unwrap(),
                 &sheets_doc,
-                batch_method,
-                "spreadsheets",
-                "batchUpdate",
-                &args,
-                "sheets",
                 policy,
                 meta,
-                None,
-                None,
-                false,
-                &mut state.token_cache,
+                state,
             )
-            .await?;
-            Ok(json!({
-                "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
-                "structuredContent": result,
-                "isError": false
-            }))
+            .await
         }
-
         "gws_sheets_format"
         | "gws_sheets_validate"
         | "gws_sheets_named_range"
         | "gws_sheets_dimensions" => {
-            let spreadsheet_id = spreadsheet_id_opt.unwrap();
-            let action = arguments
-                .get("action")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| GwsError::Validation("Missing 'action'".into()))?;
-            let mut sheet_id = arguments.get("sheet_id").and_then(|v| v.as_i64());
-            let sheet_name = arguments.get("sheet").and_then(|v| v.as_str());
-
-            // Resolve sheet name to sheet_id if not provided
-            if sheet_id.is_none() {
-                if let Some(name) = sheet_name {
-                    let spreadsheets_resource =
-                        tools::find_resource(&sheets_doc.resources, "spreadsheets").ok_or_else(
-                            || GwsError::Validation("spreadsheets resource not found".into()),
-                        )?;
-                    let get_method = spreadsheets_resource
-                        .methods
-                        .get("get")
-                        .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
-                    let meta_result = crate::execute::execute_tool(
-                        &sheets_doc, get_method, "spreadsheets", "get",
-                        &json!({"params": {"spreadsheetId": spreadsheet_id}, "fields": "sheets(properties(sheetId,title))"}),
-                        "sheets", policy, meta, None, None, false, &mut state.token_cache,
-                    ).await?;
-                    sheet_id = meta_result
-                        .get("sheets")
-                        .and_then(|v| v.as_array())
-                        .and_then(|sheets| {
-                            sheets.iter().find(|s| {
-                                s.pointer("/properties/title").and_then(|t| t.as_str())
-                                    == Some(name)
-                            })
-                        })
-                        .and_then(|s| s.pointer("/properties/sheetId"))
-                        .and_then(|v| v.as_i64());
-                    if sheet_id.is_none() {
-                        return Err(GwsError::Validation(format!(
-                            "Tab '{name}' not found. Use gws_sheets_info to list available tabs."
-                        )));
-                    }
-                } else if action != "list" {
-                    sheet_id = Some(0);
-                }
-            }
-            let range = arguments.get("range").and_then(|v| v.as_str());
-            let rule = arguments.get("rule");
-            let index = arguments.get("index").and_then(|v| v.as_i64());
-            let name = arguments.get("name").and_then(|v| v.as_str());
-            let named_range_id = arguments.get("named_range_id").and_then(|v| v.as_str());
-            let dimension = arguments.get("dimension").and_then(|v| v.as_str());
-            let start = arguments.get("start").and_then(|v| v.as_i64());
-            let end = arguments.get("end").and_then(|v| v.as_i64());
-            let count = arguments.get("count").and_then(|v| v.as_i64());
-            let size = arguments.get("size").and_then(|v| v.as_i64());
-            let destination = arguments.get("destination").and_then(|v| v.as_i64());
-
-            // List actions: read from spreadsheet metadata
-            if action == "list" {
-                let spreadsheets_resource =
-                    tools::find_resource(&sheets_doc.resources, "spreadsheets").ok_or_else(
-                        || GwsError::Validation("spreadsheets resource not found".into()),
-                    )?;
-                let get_method = spreadsheets_resource
-                    .methods
-                    .get("get")
-                    .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
-                let fields = match tool_name {
-                    "gws_sheets_format" => "sheets(conditionalFormats)",
-                    "gws_sheets_validate" => "sheets(data(rowData(values(dataValidation))))",
-                    "gws_sheets_named_range" => "namedRanges",
-                    _ => "sheets",
-                };
-                let args = json!({"params": {"spreadsheetId": spreadsheet_id}, "fields": fields});
-                let result = crate::execute::execute_tool(
-                    &sheets_doc,
-                    get_method,
-                    "spreadsheets",
-                    "get",
-                    &args,
-                    "sheets",
-                    policy,
-                    meta,
-                    None,
-                    None,
-                    false,
-                    &mut state.token_cache,
-                )
-                .await?;
-                return Ok(json!({
-                    "content": [{"type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default()}],
-                    "structuredContent": result,
-                    "isError": false
-                }));
-            }
-
-            // Read action for named ranges
-            if tool_name == "gws_sheets_named_range" && action == "read" {
-                let n =
-                    name.ok_or_else(|| GwsError::Validation("Missing 'name' for read".into()))?;
-                let spreadsheets_resource =
-                    tools::find_resource(&sheets_doc.resources, "spreadsheets").ok_or_else(
-                        || GwsError::Validation("spreadsheets resource not found".into()),
-                    )?;
-                let get_method = spreadsheets_resource
-                    .methods
-                    .get("get")
-                    .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
-                let meta_result = crate::execute::execute_tool(
-                    &sheets_doc, get_method, "spreadsheets", "get",
-                    &json!({"params": {"spreadsheetId": spreadsheet_id}, "fields": "namedRanges,sheets(properties(sheetId,title))"}),
-                    "sheets", policy, meta, None, None, false, &mut state.token_cache,
-                ).await?;
-                // Find the named range and read its values
-                let named_ranges = meta_result.get("namedRanges").and_then(|v| v.as_array());
-                let found = named_ranges.and_then(|nrs| {
-                    nrs.iter()
-                        .find(|nr| nr.get("name").and_then(|v| v.as_str()) == Some(n))
-                });
-                if let Some(nr) = found {
-                    let nr_range = nr.get("range");
-                    let result = json!({"name": n, "namedRange": nr, "range": nr_range});
-                    return Ok(json!({
-                        "content": [{"type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default()}],
-                        "structuredContent": result,
-                        "isError": false
-                    }));
-                }
-                return Err(GwsError::Validation(format!("Named range '{n}' not found")));
-            }
-
-            // Build batchUpdate request
-            let batch_args = match tool_name {
-                "gws_sheets_format" => {
-                    build_conditional_format_request(action, sheet_id, range, rule, index)
-                }
-                "gws_sheets_validate" => {
-                    build_data_validation_request(action, sheet_id, range, rule)
-                }
-                "gws_sheets_named_range" => {
-                    build_named_range_request(action, name, sheet_id, range, named_range_id)
-                }
-                "gws_sheets_dimensions" => build_dimension_request(
-                    action,
-                    sheet_id,
-                    dimension,
-                    start,
-                    end,
-                    count,
-                    size,
-                    destination,
-                ),
-                _ => unreachable!(),
-            }
-            .map_err(GwsError::Validation)?;
-
-            let spreadsheets_resource = tools::find_resource(&sheets_doc.resources, "spreadsheets")
-                .ok_or_else(|| GwsError::Validation("spreadsheets resource not found".into()))?;
-            let batch_method = spreadsheets_resource
-                .methods
-                .get("batchUpdate")
-                .ok_or_else(|| GwsError::Validation("batchUpdate method not found".into()))?;
-            let mut args = batch_args;
-            args["params"] = json!({"spreadsheetId": spreadsheet_id});
-            let result = crate::execute::execute_tool(
+            execute_sheets_batch_property(
+                tool_name,
+                arguments,
+                spreadsheet_id_opt.unwrap(),
                 &sheets_doc,
-                batch_method,
-                "spreadsheets",
-                "batchUpdate",
-                &args,
-                "sheets",
                 policy,
                 meta,
-                None,
-                None,
-                false,
-                &mut state.token_cache,
+                state,
             )
-            .await?;
-            state.sheet_cache.invalidate(spreadsheet_id);
-            Ok(json!({
-                "content": [{"type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default()}],
-                "structuredContent": result,
-                "isError": false
-            }))
+            .await
         }
-
         "gws_sheets_csv" => {
-            let spreadsheet_id = spreadsheet_id_opt.unwrap();
-            let action = arguments
-                .get("action")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    GwsError::Validation("Missing 'action' (export or import)".into())
-                })?;
-            let sheet = arguments
-                .get("sheet")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Sheet1");
-            let separator = arguments
-                .get("separator")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.chars().next())
-                .unwrap_or(',');
-
-            let values_resource =
-                tools::find_resource(&sheets_doc.resources, "spreadsheets.values").ok_or_else(
-                    || GwsError::Validation("spreadsheets.values resource not found".into()),
-                )?;
-
-            if action == "export" {
-                let get_method = values_resource
-                    .methods
-                    .get("get")
-                    .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
-                let full_range = build_range(sheet, None);
-                let args = json!({"params": {"spreadsheetId": spreadsheet_id, "range": full_range, "valueRenderOption": "FORMATTED_VALUE"}});
-                let result = crate::execute::execute_tool(
-                    &sheets_doc,
-                    get_method,
-                    "spreadsheets.values",
-                    "get",
-                    &args,
-                    "sheets",
-                    policy,
-                    meta,
-                    None,
-                    None,
-                    false,
-                    &mut state.token_cache,
-                )
-                .await?;
-                let values: Vec<Vec<String>> = result
-                    .get("values")
-                    .and_then(|v| v.as_array())
-                    .map(|rows| {
-                        rows.iter()
-                            .map(|row| {
-                                row.as_array()
-                                    .map(|cells| {
-                                        cells
-                                            .iter()
-                                            .map(|c| c.as_str().unwrap_or("").to_string())
-                                            .collect()
-                                    })
-                                    .unwrap_or_default()
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let csv = values_to_csv(&values, separator);
-                Ok(json!({
-                    "content": [{"type": "text", "text": csv}],
-                    "isError": false
-                }))
-            } else if action == "import" {
-                let csv_data = arguments
-                    .get("data")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        GwsError::Validation("Missing 'data' (CSV string) for import".into())
-                    })?;
-                let values = csv_to_values(csv_data, separator);
-                let update_method = values_resource
-                    .methods
-                    .get("update")
-                    .ok_or_else(|| GwsError::Validation("update method not found".into()))?;
-                let full_range = build_range(sheet, None);
-                let data_json: Vec<Value> = values.iter().map(|row| json!(row)).collect();
-                let args = json!({
-                    "params": {"spreadsheetId": spreadsheet_id, "range": full_range, "valueInputOption": "USER_ENTERED"},
-                    "body": {"range": full_range, "values": data_json}
-                });
-                let result = crate::execute::execute_tool(
-                    &sheets_doc,
-                    update_method,
-                    "spreadsheets.values",
-                    "update",
-                    &args,
-                    "sheets",
-                    policy,
-                    meta,
-                    None,
-                    None,
-                    false,
-                    &mut state.token_cache,
-                )
-                .await?;
-                state.sheet_cache.invalidate(spreadsheet_id);
-                Ok(json!({
-                    "content": [{"type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default()}],
-                    "structuredContent": result,
-                    "isError": false
-                }))
-            } else {
-                Err(GwsError::Validation(
-                    "action must be 'export' or 'import'".into(),
-                ))
-            }
+            execute_sheets_csv(
+                arguments,
+                spreadsheet_id_opt.unwrap(),
+                &sheets_doc,
+                policy,
+                meta,
+                state,
+            )
+            .await
         }
-
         "gws_sheets_formulas" => {
-            let spreadsheet_id = spreadsheet_id_opt.unwrap();
-            let sheet = arguments
-                .get("sheet")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Sheet1");
-            let range = arguments
-                .get("range")
-                .and_then(|v| v.as_str())
-                .unwrap_or(sheet);
-            let full_range = build_range(range, Some(sheet));
-
-            let values_resource =
-                tools::find_resource(&sheets_doc.resources, "spreadsheets.values").ok_or_else(
-                    || GwsError::Validation("spreadsheets.values resource not found".into()),
-                )?;
-            let get_method = values_resource
-                .methods
-                .get("get")
-                .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
-
-            // Read formulas
-            let formula_args = json!({"params": {"spreadsheetId": spreadsheet_id, "range": full_range, "valueRenderOption": "FORMULA"}});
-            let formula_result = crate::execute::execute_tool(
+            execute_sheets_formulas(
+                arguments,
+                spreadsheet_id_opt.unwrap(),
                 &sheets_doc,
-                get_method,
-                "spreadsheets.values",
-                "get",
-                &formula_args,
-                "sheets",
                 policy,
                 meta,
-                None,
-                None,
-                false,
-                &mut state.token_cache,
+                state,
             )
-            .await?;
-
-            // Read headers
-            let header_range = build_range("1:1", Some(sheet));
-            let header_args = json!({"params": {"spreadsheetId": spreadsheet_id, "range": header_range, "valueRenderOption": "FORMATTED_VALUE"}});
-            let header_result = crate::execute::execute_tool(
-                &sheets_doc,
-                get_method,
-                "spreadsheets.values",
-                "get",
-                &header_args,
-                "sheets",
-                policy,
-                meta,
-                None,
-                None,
-                false,
-                &mut state.token_cache,
-            )
-            .await?;
-            let headers: Vec<String> = header_result
-                .pointer("/values/0")
-                .and_then(|v| v.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            let rows = formula_result.get("values").and_then(|v| v.as_array());
-            let mut columns_with_formulas: Vec<Value> = Vec::new();
-            let mut all_formulas: Vec<Value> = Vec::new();
-
-            if let Some(rows) = rows {
-                let col_count = rows
-                    .iter()
-                    .map(|r| r.as_array().map(|a| a.len()).unwrap_or(0))
-                    .max()
-                    .unwrap_or(0);
-                for col_idx in 0..col_count {
-                    let header = headers.get(col_idx).cloned().unwrap_or_else(|| {
-                        let mut s = String::new();
-                        let mut c = col_idx;
-                        loop {
-                            s.insert(0, (b'A' + (c % 26) as u8) as char);
-                            if c < 26 {
-                                break;
-                            }
-                            c = c / 26 - 1;
-                        }
-                        s
-                    });
-                    let mut formula_count = 0;
-                    let mut samples = Vec::new();
-                    for (row_idx, row) in rows.iter().enumerate() {
-                        if let Some(cell) = row
-                            .as_array()
-                            .and_then(|a| a.get(col_idx))
-                            .and_then(|v| v.as_str())
-                            && cell.starts_with('=')
-                        {
-                            formula_count += 1;
-                            let cell_ref = format!(
-                                "{}{}",
-                                {
-                                    let mut s = String::new();
-                                    let mut c = col_idx;
-                                    loop {
-                                        s.insert(0, (b'A' + (c % 26) as u8) as char);
-                                        if c < 26 {
-                                            break;
-                                        }
-                                        c = c / 26 - 1;
-                                    }
-                                    s
-                                },
-                                row_idx + 1
-                            );
-                            all_formulas.push(json!({"cell": cell_ref, "formula": cell}));
-                            if samples.len() < 3 {
-                                samples.push(cell.to_string());
-                            }
-                        }
-                    }
-                    if formula_count > 0 {
-                        columns_with_formulas.push(json!({
-                            "column": header,
-                            "formula_count": formula_count,
-                            "samples": samples
-                        }));
-                    }
-                }
-            }
-
-            let output = json!({
-                "columns_with_formulas": columns_with_formulas,
-                "total_formulas": all_formulas.len(),
-                "all_formulas": all_formulas
-            });
-            Ok(json!({
-                "content": [{"type": "text", "text": serde_json::to_string_pretty(&output).unwrap_or_default()}],
-                "structuredContent": output,
-                "isError": false
-            }))
+            .await
         }
-
         "gws_sheets_trace" | "gws_sheets_explain" => {
-            let spreadsheet_id = spreadsheet_id_opt.unwrap();
-            let cell = arguments
-                .get("cell")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| GwsError::Validation("Missing 'cell' (e.g. 'B5')".into()))?;
-            let sheet = arguments
-                .get("sheet")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Sheet1");
-            let values_resource =
-                tools::find_resource(&sheets_doc.resources, "spreadsheets.values").ok_or_else(
-                    || GwsError::Validation("spreadsheets.values resource not found".into()),
-                )?;
-            let get_method = values_resource
-                .methods
-                .get("get")
-                .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
-
-            // Read the cell's formula
-            let cell_range = build_range(cell, Some(sheet));
-            let cell_args = json!({
-                "params": {
-                    "spreadsheetId": spreadsheet_id,
-                    "range": cell_range,
-                    "valueRenderOption": "FORMULA"
-                }
-            });
-            let cell_result = crate::execute::execute_tool(
+            execute_sheets_trace_explain(
+                tool_name,
+                arguments,
+                spreadsheet_id_opt.unwrap(),
                 &sheets_doc,
-                get_method,
-                "spreadsheets.values",
-                "get",
-                &cell_args,
-                "sheets",
                 policy,
                 meta,
-                None,
-                None,
-                false,
-                &mut state.token_cache,
+                state,
             )
-            .await?;
-
-            let formula = cell_result
-                .pointer("/values/0/0")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let is_formula = formula.starts_with('=');
-
-            if tool_name == "gws_sheets_explain" {
-                // Read headers (row 1) and row labels (column A)
-                let header_args = json!({
-                    "params": {
-                        "spreadsheetId": spreadsheet_id,
-                        "range": build_range("1:1", Some(sheet)),
-                        "valueRenderOption": "FORMATTED_VALUE"
-                    }
-                });
-                let header_result = crate::execute::execute_tool(
-                    &sheets_doc,
-                    get_method,
-                    "spreadsheets.values",
-                    "get",
-                    &header_args,
-                    "sheets",
-                    policy,
-                    meta,
-                    None,
-                    None,
-                    false,
-                    &mut state.token_cache,
-                )
-                .await?;
-                let headers: Vec<String> = header_result
-                    .pointer("/values/0")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                let label_args = json!({
-                    "params": {
-                        "spreadsheetId": spreadsheet_id,
-                        "range": build_range("A2:A100", Some(sheet)),
-                        "valueRenderOption": "FORMATTED_VALUE"
-                    }
-                });
-                let label_result = crate::execute::execute_tool(
-                    &sheets_doc,
-                    get_method,
-                    "spreadsheets.values",
-                    "get",
-                    &label_args,
-                    "sheets",
-                    policy,
-                    meta,
-                    None,
-                    None,
-                    false,
-                    &mut state.token_cache,
-                )
-                .await?;
-                let row_labels: Vec<String> = label_result
-                    .get("values")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|row| row.get(0).and_then(|v| v.as_str()).map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                let explanation = if is_formula {
-                    explain_formula(formula, &headers, &row_labels)
-                } else {
-                    format!("Cell {cell} contains the value: {formula}")
-                };
-
-                let refs = extract_cell_references(formula);
-                let referenced: Vec<Value> = refs
-                    .iter()
-                    .map(|r| {
-                        let name = resolve_cell_name(r, &headers, &row_labels);
-                        json!({
-                            "ref": r,
-                            "column": name.as_ref().map(|(c, _)| c.as_str()).unwrap_or(""),
-                            "row_label": name.as_ref().map(|(_, r)| r.as_str()).unwrap_or(""),
-                        })
-                    })
-                    .collect();
-
-                let output = json!({
-                    "cell": cell,
-                    "formula": formula,
-                    "explanation": explanation,
-                    "referenced_cells": referenced,
-                });
-                Ok(json!({
-                    "content": [{ "type": "text", "text": serde_json::to_string_pretty(&output).unwrap_or_default() }],
-                    "structuredContent": output,
-                    "isError": false
-                }))
-            } else {
-                // gws_sheets_trace — single-level dependency extraction
-                fn build_trace_tree(cell: &str, formula: &str, is_formula: bool) -> Value {
-                    if !is_formula {
-                        return json!({
-                            "cell": cell,
-                            "value": formula,
-                            "type": if formula.is_empty() { "empty" } else { "value" },
-                        });
-                    }
-                    let refs = extract_cell_references(formula);
-                    json!({
-                        "cell": cell,
-                        "formula": formula,
-                        "type": "formula",
-                        "references": refs,
-                    })
-                }
-
-                let _tree = build_trace_tree(cell, formula, is_formula);
-
-                let output = json!({
-                    "cell": cell,
-                    "formula": if is_formula { formula } else { "" },
-                    "type": if is_formula { "formula" } else if formula.is_empty() { "empty" } else { "value" },
-                    "references": if is_formula { extract_cell_references(formula) } else { vec![] },
-                    "note": if is_formula {
-                        format!("Formula references {} cells. Use gws_sheets_explain for a human-readable explanation.", extract_cell_references(formula).len())
-                    } else {
-                        format!("Cell contains a plain value: {formula}")
-                    },
-                });
-                Ok(json!({
-                    "content": [{ "type": "text", "text": serde_json::to_string_pretty(&output).unwrap_or_default() }],
-                    "structuredContent": output,
-                    "isError": false
-                }))
-            }
+            .await
         }
-
         _ => Err(GwsError::Validation(format!(
             "Unknown sheets helper: {tool_name}"
         ))),

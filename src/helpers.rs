@@ -1727,6 +1727,701 @@ fn parse_text_style(arguments: &Value) -> TextStyle {
     }
 }
 
+async fn docs_batch_update(
+    doc_id: &str,
+    requests: Vec<Value>,
+    tool_name: &str,
+    policy: &Policy,
+    meta: &RequestMeta,
+    state: &mut ServerState,
+    dry_run: bool,
+) -> Result<Value, GwsError> {
+    let batch_args = json!({
+        "params": { "documentId": doc_id },
+        "body": { "requests": requests }
+    });
+    let doc = state.get_doc("docs").await?;
+    let resource = tools::find_resource(&doc.resources, "documents")
+        .ok_or_else(|| GwsError::Validation("documents resource not found in docs API".into()))?;
+    let method = resource
+        .methods
+        .get("batchUpdate")
+        .ok_or_else(|| GwsError::Validation("batchUpdate method not found".into()))?;
+    let result = crate::execute::execute_tool(
+        &doc,
+        method,
+        "documents",
+        "batchUpdate",
+        &batch_args,
+        "docs",
+        policy,
+        meta,
+        None,
+        None,
+        dry_run,
+        &mut state.token_cache,
+    )
+    .await
+    .map_err(|e| {
+        GwsError::Other(anyhow::anyhow!(
+            "{tool_name}: batchUpdate failed for document '{doc_id}': {e}"
+        ))
+    })?;
+    crate::server::check_api_result(&result).map_err(|e| {
+        GwsError::Other(anyhow::anyhow!(
+            "{tool_name}: Google Docs API error on document '{doc_id}': {e}"
+        ))
+    })?;
+    Ok(result)
+}
+
+async fn execute_docs_read_table(
+    doc_id: &str,
+    arguments: &Value,
+    policy: &Policy,
+    meta: &RequestMeta,
+    state: &mut ServerState,
+) -> Result<Value, GwsError> {
+    let doc_ref = state.get_doc("docs").await?;
+    let resource = tools::find_resource(&doc_ref.resources, "documents")
+        .ok_or_else(|| GwsError::Validation("documents resource not found".into()))?;
+    let get_method = resource
+        .methods
+        .get("get")
+        .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
+    let get_args = json!({"params": {"documentId": doc_id}});
+    let doc_content = crate::execute::execute_tool(
+        &doc_ref,
+        get_method,
+        "documents",
+        "get",
+        &get_args,
+        "docs",
+        policy,
+        meta,
+        None,
+        None,
+        false,
+        &mut state.token_cache,
+    )
+    .await?;
+    let table_index = arguments
+        .get("table_index")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let result = read_table_from_doc(&doc_content, table_index);
+    Ok(json!({
+        "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
+        "structuredContent": result,
+        "isError": false
+    }))
+}
+
+async fn execute_docs_read_block(
+    tool_name: &str,
+    doc_id: &str,
+    arguments: &Value,
+    policy: &Policy,
+    meta: &RequestMeta,
+    state: &mut ServerState,
+) -> Result<Value, GwsError> {
+    let doc_ref = state.get_doc("docs").await?;
+    let resource = tools::find_resource(&doc_ref.resources, "documents")
+        .ok_or_else(|| GwsError::Validation("documents resource not found".into()))?;
+    let get_method = resource
+        .methods
+        .get("get")
+        .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
+    let get_args = json!({"params": {"documentId": doc_id}});
+    let doc_content = crate::execute::execute_tool(
+        &doc_ref,
+        get_method,
+        "documents",
+        "get",
+        &get_args,
+        "docs",
+        policy,
+        meta,
+        None,
+        None,
+        false,
+        &mut state.token_cache,
+    )
+    .await?;
+
+    if tool_name == "gws_docs_find" {
+        let needle = arguments
+            .get("text")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| GwsError::Validation("Missing 'text'".into()))?;
+        let occurrence = arguments
+            .get("occurrence")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1) as usize;
+        let result = find_text_in_doc(&doc_content, needle, occurrence);
+        return Ok(json!({
+            "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
+            "structuredContent": result,
+            "isError": false
+        }));
+    }
+
+    if tool_name == "gws_docs_outline" {
+        let structure = parse_doc_structure(&doc_content);
+        return Ok(json!({
+            "content": [{ "type": "text", "text": serde_json::to_string_pretty(&structure).unwrap_or_default() }],
+            "structuredContent": structure,
+            "isError": false
+        }));
+    }
+
+    // gws_docs_read: section-level or full doc
+    let section = arguments.get("section").and_then(|v| v.as_str());
+    let format = arguments
+        .get("format")
+        .and_then(|v| v.as_str())
+        .unwrap_or("markdown");
+
+    let content_to_convert = if let Some(heading) = section {
+        if let Some((start, end)) = find_section_range(&doc_content, heading) {
+            extract_section_doc(&doc_content, start, end)
+        } else {
+            return Err(GwsError::Validation(format!(
+                "Section '{heading}' not found. Use gws_docs_outline to see available headings."
+            )));
+        }
+    } else {
+        doc_content.clone()
+    };
+
+    let tables = extract_all_tables(&content_to_convert);
+    let has_tables = !tables.is_empty();
+
+    match format {
+        "plain" => {
+            let plain = crate::format::doc_to_plain(&content_to_convert);
+            if has_tables {
+                Ok(json!({
+                    "content": [{ "type": "text", "text": plain }],
+                    "structuredContent": { "text": plain, "tables": tables },
+                    "isError": false
+                }))
+            } else {
+                Ok(json!({
+                    "content": [{ "type": "text", "text": plain }],
+                    "isError": false
+                }))
+            }
+        }
+        _ => {
+            let md = crate::format::doc_to_markdown(&content_to_convert);
+            if has_tables {
+                Ok(json!({
+                    "content": [{ "type": "text", "text": md }],
+                    "structuredContent": { "text": md, "tables": tables },
+                    "isError": false
+                }))
+            } else {
+                Ok(json!({
+                    "content": [{ "type": "text", "text": md }],
+                    "isError": false
+                }))
+            }
+        }
+    }
+}
+
+async fn execute_docs_insert_text(
+    doc_id: &str,
+    arguments: &Value,
+    policy: &Policy,
+    meta: &RequestMeta,
+    state: &mut ServerState,
+    dry_run: bool,
+) -> Result<Value, GwsError> {
+    let needs_end_index = arguments.get("index").is_none()
+        && arguments.get("position").and_then(|v| v.as_str()) != Some("start")
+        && (arguments.get("bold").is_some()
+            || arguments.get("italic").is_some()
+            || arguments.get("font_size_pt").is_some()
+            || arguments.get("font_family").is_some()
+            || arguments.get("foreground_color").is_some()
+            || arguments.get("background_color").is_some()
+            || arguments.get("paragraph_style").is_some());
+
+    let end_index = if needs_end_index && !dry_run {
+        let doc_ref = state.get_doc("docs").await?;
+        let resource = tools::find_resource(&doc_ref.resources, "documents")
+            .ok_or_else(|| GwsError::Validation("documents resource not found".into()))?;
+        let get_method = resource
+            .methods
+            .get("get")
+            .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
+        let get_args = json!({"params": {"documentId": doc_id}});
+        let doc_content = crate::execute::execute_tool(
+            &doc_ref,
+            get_method,
+            "documents",
+            "get",
+            &get_args,
+            "docs",
+            policy,
+            meta,
+            None,
+            None,
+            false,
+            &mut state.token_cache,
+        )
+        .await?;
+        doc_content["body"]["content"]
+            .as_array()
+            .and_then(|arr| arr.last())
+            .and_then(|el| el["endIndex"].as_i64())
+            .map(|idx| (idx - 1) as i32)
+    } else {
+        None
+    };
+
+    let requests = if let Some(sections) = arguments.get("sections").and_then(|v| v.as_array()) {
+        let mut all_requests = Vec::new();
+        for section in sections {
+            let text = section.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            if text.is_empty() {
+                continue;
+            }
+            let style = parse_text_style(section);
+            let has_style = style.bold.is_some()
+                || style.foreground_color.is_some()
+                || style.italic.is_some()
+                || style.font_size_pt.is_some();
+            let para = section.get("paragraph_style").and_then(|v| v.as_str());
+            all_requests.extend(build_insert_text_requests(
+                text,
+                Position::End,
+                if has_style { Some(style) } else { None },
+                para,
+            ));
+        }
+        all_requests
+    } else {
+        let text = arguments
+            .get("text")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| GwsError::Validation("Missing 'text' or 'sections'".into()))?;
+        let position = match (crate::server::parse_position(arguments), end_index) {
+            (Position::End, Some(idx)) => Position::Index(idx),
+            (pos, _) => pos,
+        };
+        let style = parse_text_style(arguments);
+        let has_style = style.bold.is_some()
+            || style.italic.is_some()
+            || style.font_size_pt.is_some()
+            || style.font_family.is_some()
+            || style.foreground_color.is_some()
+            || style.background_color.is_some();
+        let para = arguments
+            .get("paragraph_style")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        build_insert_text_requests(
+            text,
+            position,
+            if has_style { Some(style) } else { None },
+            para.as_deref(),
+        )
+    };
+
+    docs_batch_update(
+        doc_id,
+        requests,
+        "gws_docs_insert_text",
+        policy,
+        meta,
+        state,
+        dry_run,
+    )
+    .await
+}
+
+async fn execute_docs_insert_table(
+    doc_id: &str,
+    arguments: &Value,
+    policy: &Policy,
+    meta: &RequestMeta,
+    state: &mut ServerState,
+    dry_run: bool,
+) -> Result<Value, GwsError> {
+    let headers: Option<Vec<String>> =
+        arguments
+            .get("headers")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            });
+    let data_rows: Option<Vec<Vec<String>>> =
+        arguments.get("rows").and_then(|v| v.as_array()).map(|arr| {
+            arr.iter()
+                .filter_map(|row| {
+                    row.as_array().map(|cells| {
+                        cells
+                            .iter()
+                            .filter_map(|c| c.as_str().map(String::from))
+                            .collect()
+                    })
+                })
+                .collect()
+        });
+
+    if headers.is_some() || data_rows.is_some() {
+        let num_cols = headers
+            .as_ref()
+            .map(|h| h.len())
+            .or_else(|| {
+                data_rows
+                    .as_ref()
+                    .and_then(|r| r.first().map(|row| row.len()))
+            })
+            .unwrap_or(1) as u32;
+        let num_rows = (if headers.is_some() { 1 } else { 0 }
+            + data_rows.as_ref().map(|r| r.len()).unwrap_or(0)) as u32;
+
+        let position = crate::server::parse_position(arguments);
+        let insert_req = build_insert_table_request(num_rows, num_cols, position);
+
+        let doc_ref = state.get_doc("docs").await?;
+        let resource = tools::find_resource(&doc_ref.resources, "documents")
+            .ok_or_else(|| GwsError::Validation("documents resource not found".into()))?;
+        let batch_method = resource
+            .methods
+            .get("batchUpdate")
+            .ok_or_else(|| GwsError::Validation("batchUpdate not found".into()))?;
+
+        let create_args = json!({
+            "params": { "documentId": doc_id },
+            "body": { "requests": [insert_req] }
+        });
+        crate::execute::execute_tool(
+            &doc_ref,
+            batch_method,
+            "documents",
+            "batchUpdate",
+            &create_args,
+            "docs",
+            policy,
+            meta,
+            None,
+            None,
+            dry_run,
+            &mut state.token_cache,
+        )
+        .await?;
+
+        let get_method = resource
+            .methods
+            .get("get")
+            .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
+        let get_args = json!({"params": {"documentId": doc_id}});
+        let doc_content = crate::execute::execute_tool(
+            &doc_ref,
+            get_method,
+            "documents",
+            "get",
+            &get_args,
+            "docs",
+            policy,
+            meta,
+            None,
+            None,
+            false,
+            &mut state.token_cache,
+        )
+        .await?;
+
+        let empty_rows: Vec<Vec<String>> = Vec::new();
+        let populate_reqs = build_table_populate_requests(
+            &doc_content,
+            headers.as_deref(),
+            data_rows.as_ref().unwrap_or(&empty_rows),
+        );
+
+        if populate_reqs.is_empty() {
+            return Ok(json!({
+                "content": [{ "type": "text", "text": "Table created (no data to populate)" }],
+                "isError": false
+            }));
+        }
+
+        let populate_args = json!({
+            "params": { "documentId": doc_id },
+            "body": { "requests": populate_reqs }
+        });
+        let result = crate::execute::execute_tool(
+            &doc_ref,
+            batch_method,
+            "documents",
+            "batchUpdate",
+            &populate_args,
+            "docs",
+            policy,
+            meta,
+            None,
+            None,
+            dry_run,
+            &mut state.token_cache,
+        )
+        .await?;
+        return Ok(json!({
+            "content": [{ "type": "text", "text": format!("Table created and populated ({} rows, {} columns)", num_rows, num_cols) }],
+            "structuredContent": result,
+            "isError": false
+        }));
+    }
+
+    let rows = arguments
+        .get("rows")
+        .and_then(|v| v.as_u64())
+        .or_else(|| arguments.get("row_count").and_then(|v| v.as_u64()))
+        .ok_or_else(|| GwsError::Validation("Missing 'rows' or 'headers'".into()))?
+        as u32;
+    let columns = arguments
+        .get("columns")
+        .and_then(|v| v.as_u64())
+        .or_else(|| arguments.get("column_count").and_then(|v| v.as_u64()))
+        .ok_or_else(|| GwsError::Validation("Missing 'columns' or 'headers'".into()))?
+        as u32;
+    let position = crate::server::parse_position(arguments);
+    let requests = vec![build_insert_table_request(rows, columns, position)];
+
+    docs_batch_update(
+        doc_id,
+        requests,
+        "gws_docs_insert_table",
+        policy,
+        meta,
+        state,
+        dry_run,
+    )
+    .await
+}
+
+async fn execute_docs_insert_image(
+    doc_id: &str,
+    arguments: &Value,
+    policy: &Policy,
+    meta: &RequestMeta,
+    state: &mut ServerState,
+    dry_run: bool,
+) -> Result<Value, GwsError> {
+    let image_url = arguments.get("image_url").and_then(|v| v.as_str());
+    let drive_file_id = arguments.get("drive_file_id").and_then(|v| v.as_str());
+    let image_data = arguments.get("image_data").and_then(|v| v.as_str());
+
+    let content_type = arguments
+        .get("image_content_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("image/png");
+    let uri = if let Some(url) = image_url {
+        url.to_string()
+    } else if let Some(fid) = drive_file_id {
+        let (url, _perm_id) =
+            crate::server::make_image_insertable(fid, policy, meta, state).await?;
+        url
+    } else if let Some(data) = image_data {
+        format!("data:{content_type};base64,{data}")
+    } else {
+        return Err(GwsError::Validation(
+            "One of 'image_url', 'drive_file_id', or 'image_data' is required".into(),
+        ));
+    };
+
+    let position = crate::server::parse_position(arguments);
+    let w = arguments.get("width_pt").and_then(|v| v.as_f64());
+    let h = arguments.get("height_pt").and_then(|v| v.as_f64());
+    let mut requests = vec![build_insert_image_request(&uri, position, w, h)];
+    requests.push(json!({
+        "insertText": {
+            "text": "\n",
+            "endOfSegmentLocation": { "segmentId": "" }
+        }
+    }));
+
+    docs_batch_update(
+        doc_id,
+        requests,
+        "gws_docs_insert_image",
+        policy,
+        meta,
+        state,
+        dry_run,
+    )
+    .await
+}
+
+async fn execute_docs_format(
+    doc_id: &str,
+    arguments: &Value,
+    policy: &Policy,
+    meta: &RequestMeta,
+    state: &mut ServerState,
+    dry_run: bool,
+) -> Result<Value, GwsError> {
+    let (start, end) = if let Some(text_match) = arguments.get("text").and_then(|v| v.as_str()) {
+        let doc_ref = state.get_doc("docs").await?;
+        let resource = tools::find_resource(&doc_ref.resources, "documents")
+            .ok_or_else(|| GwsError::Validation("documents resource not found".into()))?;
+        let get_method = resource
+            .methods
+            .get("get")
+            .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
+        let get_args = json!({"params": {"documentId": doc_id}});
+        let doc_content = crate::execute::execute_tool(
+            &doc_ref,
+            get_method,
+            "documents",
+            "get",
+            &get_args,
+            "docs",
+            policy,
+            meta,
+            None,
+            None,
+            false,
+            &mut state.token_cache,
+        )
+        .await?;
+        let occurrence = arguments
+            .get("occurrence")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1) as usize;
+        let result = find_text_in_doc(&doc_content, text_match, occurrence);
+        if result.get("found") != Some(&json!(true)) {
+            return Err(GwsError::Validation(format!(
+                "Text '{}' not found in document",
+                text_match
+            )));
+        }
+        let s = result["startIndex"].as_i64().unwrap() as i32;
+        let e = result["endIndex"].as_i64().unwrap() as i32;
+        (s, e)
+    } else {
+        let s = arguments
+            .get("start_index")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| GwsError::Validation("Missing 'start_index' or 'text'".into()))?
+            as i32;
+        let e = arguments
+            .get("end_index")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| GwsError::Validation("Missing 'end_index'".into()))?
+            as i32;
+        (s, e)
+    };
+    let style = parse_text_style(arguments);
+    let para = if arguments.get("named_style").is_some() || arguments.get("alignment").is_some() {
+        Some(ParagraphStyle {
+            named_style: arguments
+                .get("named_style")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            alignment: arguments
+                .get("alignment")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+        })
+    } else {
+        None
+    };
+    let requests = build_format_text_requests(start, end, style, para);
+
+    docs_batch_update(
+        doc_id,
+        requests,
+        "gws_docs_format",
+        policy,
+        meta,
+        state,
+        dry_run,
+    )
+    .await
+}
+
+async fn execute_docs_add_bullets(
+    doc_id: &str,
+    arguments: &Value,
+    policy: &Policy,
+    meta: &RequestMeta,
+    state: &mut ServerState,
+    dry_run: bool,
+) -> Result<Value, GwsError> {
+    let start = arguments
+        .get("start_index")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| GwsError::Validation("Missing 'start_index'".into()))?
+        as i32;
+    let end = arguments
+        .get("end_index")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| GwsError::Validation("Missing 'end_index'".into()))? as i32;
+    let preset = arguments
+        .get("bullet_preset")
+        .and_then(|v| v.as_str())
+        .unwrap_or("BULLET_DISC_CIRCLE_SQUARE");
+    let requests = vec![build_add_bullets_request(start, end, preset)];
+
+    docs_batch_update(
+        doc_id,
+        requests,
+        "gws_docs_add_bullets",
+        policy,
+        meta,
+        state,
+        dry_run,
+    )
+    .await
+}
+
+async fn execute_docs_append_section(
+    doc_id: &str,
+    arguments: &Value,
+    policy: &Policy,
+    meta: &RequestMeta,
+    state: &mut ServerState,
+    dry_run: bool,
+) -> Result<Value, GwsError> {
+    let heading = arguments.get("heading").and_then(|v| v.as_str());
+    let level = arguments
+        .get("heading_level")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1) as u32;
+    let body = arguments.get("body").and_then(|v| v.as_str());
+    let items: Option<Vec<String>> = arguments
+        .get("items")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        });
+    let preset = arguments
+        .get("bullet_preset")
+        .and_then(|v| v.as_str())
+        .unwrap_or("BULLET_DISC_CIRCLE_SQUARE");
+    let requests = build_append_section_requests(heading, level, body, items.as_deref(), preset);
+
+    docs_batch_update(
+        doc_id,
+        requests,
+        "gws_docs_append_section",
+        policy,
+        meta,
+        state,
+        dry_run,
+    )
+    .await
+}
+
 pub(crate) async fn execute_docs_helper(
     tool_name: &str,
     arguments: &Value,
@@ -1745,7 +2440,6 @@ pub(crate) async fn execute_docs_helper(
             arg_keys = ?arguments.as_object().map(|m| m.keys().collect::<Vec<_>>()),
             "docs_write dispatch"
         );
-        // gws_docs_replace_section requires section — validate early
         if tool_name == "gws_docs_replace_section" {
             if arguments.get("section").and_then(|v| v.as_str()).is_none() {
                 return Err(GwsError::Validation(
@@ -1781,594 +2475,35 @@ pub(crate) async fn execute_docs_helper(
             ))
         })?;
 
-    if tool_name == "gws_docs_read_table" {
-        let doc_ref = state.get_doc("docs").await?;
-        let resource = tools::find_resource(&doc_ref.resources, "documents")
-            .ok_or_else(|| GwsError::Validation("documents resource not found".into()))?;
-        let get_method = resource
-            .methods
-            .get("get")
-            .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
-        let get_args = json!({"params": {"documentId": doc_id}});
-        let doc_content = crate::execute::execute_tool(
-            &doc_ref,
-            get_method,
-            "documents",
-            "get",
-            &get_args,
-            "docs",
-            policy,
-            meta,
-            None,
-            None,
-            false,
-            &mut state.token_cache,
-        )
-        .await?;
-        let table_index = arguments
-            .get("table_index")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize;
-        let result = read_table_from_doc(&doc_content, table_index);
-        return Ok(json!({
-            "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
-            "structuredContent": result,
-            "isError": false
-        }));
-    }
-
-    if tool_name == "gws_docs_read"
-        || tool_name == "gws_docs_outline"
-        || tool_name == "gws_docs_find"
-    {
-        let doc_ref = state.get_doc("docs").await?;
-        let resource = tools::find_resource(&doc_ref.resources, "documents")
-            .ok_or_else(|| GwsError::Validation("documents resource not found".into()))?;
-        let get_method = resource
-            .methods
-            .get("get")
-            .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
-        let get_args = json!({"params": {"documentId": doc_id}});
-        let doc_content = crate::execute::execute_tool(
-            &doc_ref,
-            get_method,
-            "documents",
-            "get",
-            &get_args,
-            "docs",
-            policy,
-            meta,
-            None,
-            None,
-            false,
-            &mut state.token_cache,
-        )
-        .await?;
-
-        if tool_name == "gws_docs_find" {
-            let needle = arguments
-                .get("text")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| GwsError::Validation("Missing 'text'".into()))?;
-            let occurrence = arguments
-                .get("occurrence")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(1) as usize;
-            let result = find_text_in_doc(&doc_content, needle, occurrence);
-            return Ok(json!({
-                "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
-                "structuredContent": result,
-                "isError": false
-            }));
+    match tool_name {
+        "gws_docs_read_table" => {
+            execute_docs_read_table(doc_id, arguments, policy, meta, state).await
         }
-
-        if tool_name == "gws_docs_outline" {
-            let structure = parse_doc_structure(&doc_content);
-            return Ok(json!({
-                "content": [{ "type": "text", "text": serde_json::to_string_pretty(&structure).unwrap_or_default() }],
-                "structuredContent": structure,
-                "isError": false
-            }));
+        "gws_docs_read" | "gws_docs_outline" | "gws_docs_find" => {
+            execute_docs_read_block(tool_name, doc_id, arguments, policy, meta, state).await
         }
-
-        // gws_docs_read: section-level or full doc
-        let section = arguments.get("section").and_then(|v| v.as_str());
-        let format = arguments
-            .get("format")
-            .and_then(|v| v.as_str())
-            .unwrap_or("markdown");
-
-        let content_to_convert = if let Some(heading) = section {
-            if let Some((start, end)) = find_section_range(&doc_content, heading) {
-                extract_section_doc(&doc_content, start, end)
-            } else {
-                return Err(GwsError::Validation(format!(
-                    "Section '{heading}' not found. Use gws_docs_outline to see available headings."
-                )));
-            }
-        } else {
-            doc_content.clone()
-        };
-
-        let tables = extract_all_tables(&content_to_convert);
-        let has_tables = !tables.is_empty();
-
-        return match format {
-            "plain" => {
-                let plain = crate::format::doc_to_plain(&content_to_convert);
-                if has_tables {
-                    Ok(json!({
-                        "content": [{ "type": "text", "text": plain }],
-                        "structuredContent": { "text": plain, "tables": tables },
-                        "isError": false
-                    }))
-                } else {
-                    Ok(json!({
-                        "content": [{ "type": "text", "text": plain }],
-                        "isError": false
-                    }))
-                }
-            }
-            _ => {
-                let md = crate::format::doc_to_markdown(&content_to_convert);
-                if has_tables {
-                    Ok(json!({
-                        "content": [{ "type": "text", "text": md }],
-                        "structuredContent": { "text": md, "tables": tables },
-                        "isError": false
-                    }))
-                } else {
-                    Ok(json!({
-                        "content": [{ "type": "text", "text": md }],
-                        "isError": false
-                    }))
-                }
-            }
-        };
-    }
-
-    let needs_end_index = |tool: &str, args: &Value| -> bool {
-        match tool {
-            "gws_docs_insert_text" => {
-                args.get("index").is_none()
-                    && args.get("position").and_then(|v| v.as_str()) != Some("start")
-                    && (args.get("bold").is_some()
-                        || args.get("italic").is_some()
-                        || args.get("font_size_pt").is_some()
-                        || args.get("font_family").is_some()
-                        || args.get("foreground_color").is_some()
-                        || args.get("background_color").is_some()
-                        || args.get("paragraph_style").is_some())
-            }
-            _ => false,
-        }
-    };
-
-    let resolve_end_position = |position: Position, end_index: Option<i32>| -> Position {
-        match (&position, end_index) {
-            (Position::End, Some(idx)) => Position::Index(idx),
-            _ => position,
-        }
-    };
-
-    let end_index = if needs_end_index(tool_name, arguments) && !dry_run {
-        let doc_ref = state.get_doc("docs").await?;
-        let resource = tools::find_resource(&doc_ref.resources, "documents")
-            .ok_or_else(|| GwsError::Validation("documents resource not found".into()))?;
-        let get_method = resource
-            .methods
-            .get("get")
-            .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
-        let get_args = json!({"params": {"documentId": doc_id}});
-        let doc_content = crate::execute::execute_tool(
-            &doc_ref,
-            get_method,
-            "documents",
-            "get",
-            &get_args,
-            "docs",
-            policy,
-            meta,
-            None,
-            None,
-            false,
-            &mut state.token_cache,
-        )
-        .await?;
-        doc_content["body"]["content"]
-            .as_array()
-            .and_then(|arr| arr.last())
-            .and_then(|el| el["endIndex"].as_i64())
-            .map(|idx| (idx - 1) as i32)
-    } else {
-        None
-    };
-
-    let requests: Vec<Value> = match tool_name {
         "gws_docs_insert_text" => {
-            if let Some(sections) = arguments.get("sections").and_then(|v| v.as_array()) {
-                let mut all_requests = Vec::new();
-                for section in sections {
-                    let text = section.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                    if text.is_empty() {
-                        continue;
-                    }
-                    let style = parse_text_style(section);
-                    let has_style = style.bold.is_some()
-                        || style.foreground_color.is_some()
-                        || style.italic.is_some()
-                        || style.font_size_pt.is_some();
-                    let para = section.get("paragraph_style").and_then(|v| v.as_str());
-                    all_requests.extend(build_insert_text_requests(
-                        text,
-                        Position::End,
-                        if has_style { Some(style) } else { None },
-                        para,
-                    ));
-                }
-                all_requests
-            } else {
-                let text = arguments
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| GwsError::Validation("Missing 'text' or 'sections'".into()))?;
-                let position =
-                    resolve_end_position(crate::server::parse_position(arguments), end_index);
-                let style = parse_text_style(arguments);
-                let has_style = style.bold.is_some()
-                    || style.italic.is_some()
-                    || style.font_size_pt.is_some()
-                    || style.font_family.is_some()
-                    || style.foreground_color.is_some()
-                    || style.background_color.is_some();
-                let para = arguments
-                    .get("paragraph_style")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                build_insert_text_requests(
-                    text,
-                    position,
-                    if has_style { Some(style) } else { None },
-                    para.as_deref(),
-                )
-            }
+            execute_docs_insert_text(doc_id, arguments, policy, meta, state, dry_run).await
         }
         "gws_docs_insert_table" => {
-            let headers: Option<Vec<String>> = arguments
-                .get("headers")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                });
-            let data_rows: Option<Vec<Vec<String>>> =
-                arguments.get("rows").and_then(|v| v.as_array()).map(|arr| {
-                    arr.iter()
-                        .filter_map(|row| {
-                            row.as_array().map(|cells| {
-                                cells
-                                    .iter()
-                                    .filter_map(|c| c.as_str().map(String::from))
-                                    .collect()
-                            })
-                        })
-                        .collect()
-                });
-
-            if headers.is_some() || data_rows.is_some() {
-                let num_cols = headers
-                    .as_ref()
-                    .map(|h| h.len())
-                    .or_else(|| {
-                        data_rows
-                            .as_ref()
-                            .and_then(|r| r.first().map(|row| row.len()))
-                    })
-                    .unwrap_or(1) as u32;
-                let num_rows = (if headers.is_some() { 1 } else { 0 }
-                    + data_rows.as_ref().map(|r| r.len()).unwrap_or(0))
-                    as u32;
-
-                let position = crate::server::parse_position(arguments);
-                let insert_req = build_insert_table_request(num_rows, num_cols, position);
-
-                let doc_ref = state.get_doc("docs").await?;
-                let resource = tools::find_resource(&doc_ref.resources, "documents")
-                    .ok_or_else(|| GwsError::Validation("documents resource not found".into()))?;
-                let batch_method = resource
-                    .methods
-                    .get("batchUpdate")
-                    .ok_or_else(|| GwsError::Validation("batchUpdate not found".into()))?;
-
-                let create_args = json!({
-                    "params": { "documentId": doc_id },
-                    "body": { "requests": [insert_req] }
-                });
-                crate::execute::execute_tool(
-                    &doc_ref,
-                    batch_method,
-                    "documents",
-                    "batchUpdate",
-                    &create_args,
-                    "docs",
-                    policy,
-                    meta,
-                    None,
-                    None,
-                    dry_run,
-                    &mut state.token_cache,
-                )
-                .await?;
-
-                let get_method = resource
-                    .methods
-                    .get("get")
-                    .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
-                let get_args = json!({"params": {"documentId": doc_id}});
-                let doc_content = crate::execute::execute_tool(
-                    &doc_ref,
-                    get_method,
-                    "documents",
-                    "get",
-                    &get_args,
-                    "docs",
-                    policy,
-                    meta,
-                    None,
-                    None,
-                    false,
-                    &mut state.token_cache,
-                )
-                .await?;
-
-                let empty_rows: Vec<Vec<String>> = Vec::new();
-                let populate_reqs = build_table_populate_requests(
-                    &doc_content,
-                    headers.as_deref(),
-                    data_rows.as_ref().unwrap_or(&empty_rows),
-                );
-
-                if populate_reqs.is_empty() {
-                    return Ok(json!({
-                        "content": [{ "type": "text", "text": "Table created (no data to populate)" }],
-                        "isError": false
-                    }));
-                }
-
-                let populate_args = json!({
-                    "params": { "documentId": doc_id },
-                    "body": { "requests": populate_reqs }
-                });
-                let result = crate::execute::execute_tool(
-                    &doc_ref,
-                    batch_method,
-                    "documents",
-                    "batchUpdate",
-                    &populate_args,
-                    "docs",
-                    policy,
-                    meta,
-                    None,
-                    None,
-                    dry_run,
-                    &mut state.token_cache,
-                )
-                .await?;
-                return Ok(json!({
-                    "content": [{ "type": "text", "text": format!("Table created and populated ({} rows, {} columns)", num_rows, num_cols) }],
-                    "structuredContent": result,
-                    "isError": false
-                }));
-            }
-
-            let rows = arguments
-                .get("rows")
-                .and_then(|v| v.as_u64())
-                .or_else(|| arguments.get("row_count").and_then(|v| v.as_u64()))
-                .ok_or_else(|| GwsError::Validation("Missing 'rows' or 'headers'".into()))?
-                as u32;
-            let columns = arguments
-                .get("columns")
-                .and_then(|v| v.as_u64())
-                .or_else(|| arguments.get("column_count").and_then(|v| v.as_u64()))
-                .ok_or_else(|| GwsError::Validation("Missing 'columns' or 'headers'".into()))?
-                as u32;
-            let position = crate::server::parse_position(arguments);
-            vec![build_insert_table_request(rows, columns, position)]
+            execute_docs_insert_table(doc_id, arguments, policy, meta, state, dry_run).await
         }
         "gws_docs_insert_image" => {
-            let image_url = arguments.get("image_url").and_then(|v| v.as_str());
-            let drive_file_id = arguments.get("drive_file_id").and_then(|v| v.as_str());
-            let image_data = arguments.get("image_data").and_then(|v| v.as_str());
-
-            let content_type = arguments
-                .get("image_content_type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("image/png");
-            let uri = if let Some(url) = image_url {
-                url.to_string()
-            } else if let Some(fid) = drive_file_id {
-                let (url, _perm_id) =
-                    crate::server::make_image_insertable(fid, policy, meta, state).await?;
-                url
-            } else if let Some(data) = image_data {
-                format!("data:{content_type};base64,{data}")
-            } else {
-                return Err(GwsError::Validation(
-                    "One of 'image_url', 'drive_file_id', or 'image_data' is required".into(),
-                ));
-            };
-
-            let position = crate::server::parse_position(arguments);
-            let w = arguments.get("width_pt").and_then(|v| v.as_f64());
-            let h = arguments.get("height_pt").and_then(|v| v.as_f64());
-            let mut reqs = vec![build_insert_image_request(&uri, position, w, h)];
-            reqs.push(json!({
-                "insertText": {
-                    "text": "\n",
-                    "endOfSegmentLocation": { "segmentId": "" }
-                }
-            }));
-            reqs
+            execute_docs_insert_image(doc_id, arguments, policy, meta, state, dry_run).await
         }
         "gws_docs_format" | "gws_docs_format_text" => {
-            let (start, end) = if let Some(text_match) =
-                arguments.get("text").and_then(|v| v.as_str())
-            {
-                let doc_ref = state.get_doc("docs").await?;
-                let resource = tools::find_resource(&doc_ref.resources, "documents")
-                    .ok_or_else(|| GwsError::Validation("documents resource not found".into()))?;
-                let get_method = resource
-                    .methods
-                    .get("get")
-                    .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
-                let get_args = json!({"params": {"documentId": doc_id}});
-                let doc_content = crate::execute::execute_tool(
-                    &doc_ref,
-                    get_method,
-                    "documents",
-                    "get",
-                    &get_args,
-                    "docs",
-                    policy,
-                    meta,
-                    None,
-                    None,
-                    false,
-                    &mut state.token_cache,
-                )
-                .await?;
-                let occurrence = arguments
-                    .get("occurrence")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(1) as usize;
-                let result = find_text_in_doc(&doc_content, text_match, occurrence);
-                if result.get("found") != Some(&json!(true)) {
-                    return Err(GwsError::Validation(format!(
-                        "Text '{}' not found in document",
-                        text_match
-                    )));
-                }
-                let s = result["startIndex"].as_i64().unwrap() as i32;
-                let e = result["endIndex"].as_i64().unwrap() as i32;
-                (s, e)
-            } else {
-                let s = arguments
-                    .get("start_index")
-                    .and_then(|v| v.as_i64())
-                    .ok_or_else(|| GwsError::Validation("Missing 'start_index' or 'text'".into()))?
-                    as i32;
-                let e = arguments
-                    .get("end_index")
-                    .and_then(|v| v.as_i64())
-                    .ok_or_else(|| GwsError::Validation("Missing 'end_index'".into()))?
-                    as i32;
-                (s, e)
-            };
-            let style = parse_text_style(arguments);
-            let para =
-                if arguments.get("named_style").is_some() || arguments.get("alignment").is_some() {
-                    Some(ParagraphStyle {
-                        named_style: arguments
-                            .get("named_style")
-                            .and_then(|v| v.as_str())
-                            .map(String::from),
-                        alignment: arguments
-                            .get("alignment")
-                            .and_then(|v| v.as_str())
-                            .map(String::from),
-                    })
-                } else {
-                    None
-                };
-            build_format_text_requests(start, end, style, para)
+            execute_docs_format(doc_id, arguments, policy, meta, state, dry_run).await
         }
         "gws_docs_add_bullets" => {
-            let start = arguments
-                .get("start_index")
-                .and_then(|v| v.as_i64())
-                .ok_or_else(|| GwsError::Validation("Missing 'start_index'".into()))?
-                as i32;
-            let end = arguments
-                .get("end_index")
-                .and_then(|v| v.as_i64())
-                .ok_or_else(|| GwsError::Validation("Missing 'end_index'".into()))?
-                as i32;
-            let preset = arguments
-                .get("bullet_preset")
-                .and_then(|v| v.as_str())
-                .unwrap_or("BULLET_DISC_CIRCLE_SQUARE");
-            vec![build_add_bullets_request(start, end, preset)]
+            execute_docs_add_bullets(doc_id, arguments, policy, meta, state, dry_run).await
         }
         "gws_docs_append_section" => {
-            let heading = arguments.get("heading").and_then(|v| v.as_str());
-            let level = arguments
-                .get("heading_level")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(1) as u32;
-            let body = arguments.get("body").and_then(|v| v.as_str());
-            let items: Option<Vec<String>> =
-                arguments
-                    .get("items")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect()
-                    });
-            let preset = arguments
-                .get("bullet_preset")
-                .and_then(|v| v.as_str())
-                .unwrap_or("BULLET_DISC_CIRCLE_SQUARE");
-            build_append_section_requests(heading, level, body, items.as_deref(), preset)
+            execute_docs_append_section(doc_id, arguments, policy, meta, state, dry_run).await
         }
-        _ => {
-            return Err(GwsError::Validation(format!(
-                "Unknown helper tool: {tool_name}"
-            )));
-        }
-    };
-
-    let batch_args = json!({
-        "params": { "documentId": doc_id },
-        "body": { "requests": requests }
-    });
-
-    let doc = state.get_doc("docs").await?;
-    let resource = tools::find_resource(&doc.resources, "documents")
-        .ok_or_else(|| GwsError::Validation("documents resource not found in docs API".into()))?;
-    let method = resource
-        .methods
-        .get("batchUpdate")
-        .ok_or_else(|| GwsError::Validation("batchUpdate method not found".into()))?;
-
-    let result = crate::execute::execute_tool(
-        &doc,
-        method,
-        "documents",
-        "batchUpdate",
-        &batch_args,
-        "docs",
-        policy,
-        meta,
-        None,
-        None,
-        dry_run,
-        &mut state.token_cache,
-    )
-    .await
-    .map_err(|e| {
-        GwsError::Other(anyhow::anyhow!(
-            "{tool_name}: batchUpdate failed for document '{doc_id}': {e}"
-        ))
-    })?;
-    crate::server::check_api_result(&result).map_err(|e| {
-        GwsError::Other(anyhow::anyhow!(
-            "{tool_name}: Google Docs API error on document '{doc_id}': {e}"
-        ))
-    })?;
-    Ok(result)
+        _ => Err(GwsError::Validation(format!(
+            "Unknown helper tool: {tool_name}"
+        ))),
+    }
 }
 
 fn find_section_range(doc: &Value, section: &str) -> Option<(i32, i32)> {
