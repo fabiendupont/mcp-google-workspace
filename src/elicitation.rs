@@ -76,6 +76,36 @@ pub async fn ask_template(peer: &Peer<RoleServer>, template_names: &[String]) ->
     }
 }
 
+pub fn resolve_target_folder(
+    explicit_folder_id: Option<&str>,
+    policy: &crate::policy::Policy,
+) -> Result<Option<String>, google_workspace::error::GwsError> {
+    if let Some(fid) = explicit_folder_id {
+        return Ok(Some(fid.to_string()));
+    }
+
+    if !policy.has_parent_constraints("drive") {
+        return Ok(None);
+    }
+
+    let writable = policy.writable_parent_folders("drive");
+    match writable.len() {
+        0 => Err(google_workspace::error::GwsError::Validation(
+            "Drive policy has parent constraints but no read-write folders. \
+             Fix: add a folder with \"access\": \"read-write\" to the parents constraint."
+                .to_string(),
+        )),
+        1 => Ok(Some(writable[0].to_string())),
+        _ => {
+            let list = writable.join(", ");
+            Err(google_workspace::error::GwsError::Validation(format!(
+                "Multiple writable folders available: {list}. \
+                 Specify folder_id to choose which folder to create in."
+            )))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

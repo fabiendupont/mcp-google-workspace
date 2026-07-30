@@ -230,6 +230,29 @@ impl Policy {
             .collect()
     }
 
+    pub fn writable_parent_folders(&self, service: &str) -> Vec<&str> {
+        self.constraints(service)
+            .iter()
+            .filter(|c| {
+                c.param == "parents"
+                    && c.mode == ConstraintMode::Restrict
+                    && c.access == Access::ReadWrite
+                    && (c.location.as_deref() == Some("body")
+                        || c.location.as_deref() == Some("body-write-only"))
+            })
+            .flat_map(|c| c.values.iter().map(|v| v.as_str()))
+            .collect()
+    }
+
+    pub fn has_parent_constraints(&self, service: &str) -> bool {
+        self.constraints(service).iter().any(|c| {
+            c.param == "parents"
+                && c.mode == ConstraintMode::Restrict
+                && (c.location.as_deref() == Some("body")
+                    || c.location.as_deref() == Some("body-write-only"))
+        })
+    }
+
     pub fn templates(&self) -> &[TemplateEntry] {
         &self.templates
     }

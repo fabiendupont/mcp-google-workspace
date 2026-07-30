@@ -666,7 +666,11 @@ pub(crate) async fn policy_for_folder(
     meta: &RequestMeta,
     state: &mut ServerState,
 ) -> Result<Policy, GwsError> {
-    let Some(fid) = folder_id else {
+    let resolved = match folder_id {
+        Some(fid) => Some(fid.to_string()),
+        None => crate::elicitation::resolve_target_folder(None, policy)?,
+    };
+    let Some(fid) = resolved.as_deref() else {
         return Ok(policy.clone());
     };
     let roots = policy.recursive_parent_values("drive");
