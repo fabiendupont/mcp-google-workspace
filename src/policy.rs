@@ -104,6 +104,8 @@ pub struct ServicePolicy {
     pub constraints: Vec<Constraint>,
     #[serde(default)]
     pub allowed_labels: Vec<String>,
+    #[serde(default)]
+    pub allowed_resources: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -283,6 +285,13 @@ impl Policy {
         self.services
             .get(service)
             .map(|s| s.allowed_labels.as_slice())
+            .unwrap_or(&[])
+    }
+
+    pub fn allowed_resources(&self, service: &str) -> &[String] {
+        self.services
+            .get(service)
+            .map(|s| s.allowed_resources.as_slice())
             .unwrap_or(&[])
     }
 
@@ -1484,5 +1493,24 @@ mod tests {
     fn test_allowed_labels_unknown_service() {
         let p = test_policy();
         assert!(p.allowed_labels("unknown").is_empty());
+    }
+
+    #[test]
+    fn test_allowed_resources_empty_by_default() {
+        let p = test_policy();
+        assert!(p.allowed_resources("drive").is_empty());
+    }
+
+    #[test]
+    fn test_allowed_resources_parsed() {
+        let file: PolicyFile = serde_json::from_value(serde_json::json!({
+            "services": [{
+                "name": "drive",
+                "allowed_resources": ["files"]
+            }]
+        }))
+        .unwrap();
+        let p = Policy::from_policy_file(file);
+        assert_eq!(p.allowed_resources("drive"), &["files"]);
     }
 }

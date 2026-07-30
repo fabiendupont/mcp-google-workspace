@@ -28,6 +28,10 @@ pub fn parse_gws_uri(uri: &str) -> Option<ParsedUri> {
     })
 }
 
+pub fn is_resource_allowed(allowed: &[String], resource_path: &str) -> bool {
+    allowed.is_empty() || allowed.iter().any(|a| a == resource_path)
+}
+
 pub fn id_param_name(resource: &RestResource, method_name: &str) -> Option<String> {
     let method = resource.methods.get(method_name)?;
     method
@@ -47,8 +51,9 @@ pub fn build_resource_templates(
         let Some(doc) = docs.get(svc_name) else {
             continue;
         };
+        let allowed = policy.allowed_resources(svc_name);
 
-        collect_templates(svc_name, &doc.resources, "", &mut templates);
+        collect_templates(svc_name, &doc.resources, "", allowed, &mut templates);
     }
 
     templates.sort_by(|a, b| a.uri_template.cmp(&b.uri_template));
@@ -59,6 +64,7 @@ fn collect_templates(
     service: &str,
     resources: &HashMap<String, RestResource>,
     prefix: &str,
+    allowed: &[String],
     out: &mut Vec<ResourceTemplate>,
 ) {
     for (name, resource) in resources {
@@ -67,6 +73,13 @@ fn collect_templates(
         } else {
             format!("{prefix}.{name}")
         };
+
+        if !allowed.is_empty() && !allowed.iter().any(|a| a == &resource_path) {
+            if !resource.resources.is_empty() {
+                collect_templates(service, &resource.resources, &resource_path, allowed, out);
+            }
+            continue;
+        }
 
         if let Some(get_method) = resource.methods.get("get")
             && let Some(id_param) = get_method
@@ -86,7 +99,7 @@ fn collect_templates(
         }
 
         if !resource.resources.is_empty() {
-            collect_templates(service, &resource.resources, &resource_path, out);
+            collect_templates(service, &resource.resources, &resource_path, allowed, out);
         }
     }
 }

@@ -237,6 +237,18 @@ impl ServerHandler for GwsHandler {
                 ));
             }
 
+            let allowed = policy.allowed_resources(&parsed.service);
+            if !crate::resources::is_resource_allowed(allowed, &parsed.resource) {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "Resource '{}' is not in allowed_resources for service '{}'. \
+                         Fix: add \"{}\" to the \"allowed_resources\" array in your policy file",
+                        parsed.resource, parsed.service, parsed.resource
+                    ),
+                    None,
+                ));
+            }
+
             let meta = crate::meta::RequestMeta::default();
             let mut st = self.state.lock().await;
             let doc = st.get_doc(&parsed.service).await.map_err(|e| {

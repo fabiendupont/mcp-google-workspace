@@ -5,6 +5,7 @@
   "services": [
     {
       "name": "drive",
+      "allowed_resources": ["files"],
       "constraints": [
         {
           "param": "parents",
@@ -18,6 +19,7 @@
     },
     {
       "name": "docs",
+      "allowed_resources": ["documents"],
       "constraints": [
         {
           "param": "documentId",
@@ -28,10 +30,12 @@
       ]
     },
     {
-      "name": "sheets"
+      "name": "sheets",
+      "allowed_resources": ["spreadsheets"]
     },
     {
       "name": "gmail",
+      "allowed_resources": ["users.messages", "users.threads", "users.labels", "users.drafts"],
       "allowed_labels": ["GWS-MCP-Test"],
       "denied_methods": [
         "messages.delete", "messages.trash", "messages.batchDelete",
@@ -43,10 +47,12 @@
     },
     {
       "name": "people",
-      "read_only": true
+      "read_only": true,
+      "allowed_resources": ["people", "people.connections"]
     },
     {
       "name": "calendar",
+      "allowed_resources": ["events"],
       "constraints": [
         { "param": "calendarId", "values": ["primary"], "access": "read-only" },
         { "param": "calendarId", "values": ["$GWS_TEST_CALENDAR_ID"], "access": "read-write" }
@@ -54,6 +60,7 @@
     },
     {
       "name": "slides",
+      "allowed_resources": ["presentations"],
       "constraints": [
         {
           "param": "presentationId",
