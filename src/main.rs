@@ -22,6 +22,7 @@ mod prompts;
 mod rate_limit;
 mod resources;
 mod server;
+mod shared;
 mod sheets_helpers;
 mod slides_helpers;
 mod subscriptions;
@@ -1284,7 +1285,7 @@ async fn main() {
                 tracing::info!(services = %svc_list.join(", "), "Starting MCP HTTP server");
             }
 
-            let mut state = server::ServerState::new();
+            let mut state = shared::ServerState::new();
             state.prompts = prompts;
             state.audit = audit;
             state.eager_tools = eager_tools;

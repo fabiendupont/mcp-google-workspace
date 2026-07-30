@@ -1,6 +1,6 @@
 use crate::meta::RequestMeta;
 use crate::policy::Policy;
-use crate::server::ServerState;
+use crate::shared::ServerState;
 use crate::tools;
 use base64::Engine;
 use google_workspace::error::GwsError;
@@ -1628,7 +1628,7 @@ async fn execute_gmail_attachment(
 
     let folder_id = arguments.get("folder_id").and_then(|v| v.as_str());
     let (_effective_policy, resolved_folder) =
-        crate::server::policy_for_folder(folder_id, policy, meta, state).await?;
+        crate::shared::policy_for_folder(folder_id, policy, meta, state).await?;
     let folder_id = resolved_folder.as_deref().or(folder_id);
 
     if let Some(fid) = folder_id {

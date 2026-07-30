@@ -1,6 +1,6 @@
 use crate::meta::RequestMeta;
 use crate::policy::Policy;
-use crate::server::ServerState;
+use crate::shared::ServerState;
 use crate::tools;
 use google_workspace::error::GwsError;
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
@@ -1767,7 +1767,7 @@ async fn docs_batch_update(
             "{tool_name}: batchUpdate failed for document '{doc_id}': {e}"
         ))
     })?;
-    crate::server::check_api_result(&result).map_err(|e| {
+    crate::shared::check_api_result(&result).map_err(|e| {
         GwsError::Other(anyhow::anyhow!(
             "{tool_name}: Google Docs API error on document '{doc_id}': {e}"
         ))
@@ -2008,7 +2008,7 @@ async fn execute_docs_insert_text(
             .get("text")
             .and_then(|v| v.as_str())
             .ok_or_else(|| GwsError::Validation("Missing 'text' or 'sections'".into()))?;
-        let position = match (crate::server::parse_position(arguments), end_index) {
+        let position = match (crate::shared::parse_position(arguments), end_index) {
             (Position::End, Some(idx)) => Position::Index(idx),
             (pos, _) => pos,
         };
@@ -2087,7 +2087,7 @@ async fn execute_docs_insert_table(
         let num_rows = (if headers.is_some() { 1 } else { 0 }
             + data_rows.as_ref().map(|r| r.len()).unwrap_or(0)) as u32;
 
-        let position = crate::server::parse_position(arguments);
+        let position = crate::shared::parse_position(arguments);
         let insert_req = build_insert_table_request(num_rows, num_cols, position);
 
         let doc_ref = state.get_doc("docs").await?;
@@ -2191,7 +2191,7 @@ async fn execute_docs_insert_table(
         .or_else(|| arguments.get("column_count").and_then(|v| v.as_u64()))
         .ok_or_else(|| GwsError::Validation("Missing 'columns' or 'headers'".into()))?
         as u32;
-    let position = crate::server::parse_position(arguments);
+    let position = crate::shared::parse_position(arguments);
     let requests = vec![build_insert_table_request(rows, columns, position)];
 
     docs_batch_update(
@@ -2226,7 +2226,7 @@ async fn execute_docs_insert_image(
         url.to_string()
     } else if let Some(fid) = drive_file_id {
         let (url, _perm_id) =
-            crate::server::make_image_insertable(fid, policy, meta, state).await?;
+            crate::shared::make_image_insertable(fid, policy, meta, state).await?;
         url
     } else if let Some(data) = image_data {
         format!("data:{content_type};base64,{data}")
@@ -2236,7 +2236,7 @@ async fn execute_docs_insert_image(
         ));
     };
 
-    let position = crate::server::parse_position(arguments);
+    let position = crate::shared::parse_position(arguments);
     let w = arguments.get("width_pt").and_then(|v| v.as_f64());
     let h = arguments.get("height_pt").and_then(|v| v.as_f64());
     let mut requests = vec![build_insert_image_request(&uri, position, w, h)];
@@ -2688,7 +2688,7 @@ pub(crate) async fn execute_docs_write(
     } else if title.is_some() || folder_id.is_some() {
         let doc_title = title.unwrap_or("Untitled");
         let (effective_policy, resolved_folder) =
-            crate::server::policy_for_folder(folder_id, policy, meta, state).await?;
+            crate::shared::policy_for_folder(folder_id, policy, meta, state).await?;
         let folder_id = resolved_folder.as_deref().or(folder_id);
         let drive_doc = state.get_doc("drive").await.map_err(|e| {
             GwsError::Other(anyhow::anyhow!(
@@ -2730,7 +2730,7 @@ pub(crate) async fn execute_docs_write(
                 &mut state.token_cache,
             )
             .await?;
-            crate::server::check_api_result(&result)?;
+            crate::shared::check_api_result(&result)?;
             let new_id = result["id"]
                 .as_str()
                 .ok_or_else(|| {
@@ -2927,7 +2927,7 @@ pub(crate) async fn execute_docs_write(
             &mut state.token_cache,
         )
         .await?;
-        crate::server::check_api_result(&style_result)?;
+        crate::shared::check_api_result(&style_result)?;
     }
 
     let mut content_requests: Vec<Value> = Vec::new();
@@ -3021,7 +3021,7 @@ pub(crate) async fn execute_docs_write(
             // If batchUpdate fails with too many requests, retry in smaller chunks
             let should_chunk = match &result {
                 Err(_) => final_reqs.len() > 10,
-                Ok(r) => crate::server::check_api_result(r).is_err() && final_reqs.len() > 10,
+                Ok(r) => crate::shared::check_api_result(r).is_err() && final_reqs.len() > 10,
             };
             if should_chunk {
                 tracing::info!(
@@ -3050,13 +3050,13 @@ pub(crate) async fn execute_docs_write(
                     )
                     .await;
                     match &result {
-                        Ok(r) if crate::server::check_api_result(r).is_err() => break,
+                        Ok(r) if crate::shared::check_api_result(r).is_err() => break,
                         Err(_) => break,
                         _ => {}
                     }
                 }
             } else if let Ok(ref r) = result {
-                if crate::server::check_api_result(r).is_err() {
+                if crate::shared::check_api_result(r).is_err() {
                     break;
                 }
             } else {
@@ -3111,7 +3111,7 @@ pub(crate) async fn execute_docs_write(
     }
 
     let failed = match &result {
-        Ok(r) => crate::server::check_api_result(r).is_err(),
+        Ok(r) => crate::shared::check_api_result(r).is_err(),
         Err(_) => true,
     };
 
@@ -3142,7 +3142,7 @@ pub(crate) async fn execute_docs_write(
 
     let result = match result {
         Ok(mut r) => {
-            if let Err(e) = crate::server::check_api_result(&r) {
+            if let Err(e) = crate::shared::check_api_result(&r) {
                 return Ok(json!({
                     "content": [{ "type": "text", "text": format!(
                         "gws_docs_write: content insertion failed: {e}. \

@@ -3,7 +3,7 @@ use serde_json::{Value, json};
 use crate::marp::{MarpFrontmatter, MarpInlineStyle, MarpPresentation, MarpSlide, SlideBlock};
 use crate::meta::RequestMeta;
 use crate::policy::Policy;
-use crate::server::ServerState;
+use crate::shared::ServerState;
 use crate::tools;
 use google_workspace::error::GwsError;
 
@@ -1946,7 +1946,7 @@ async fn execute_slides_import_marp(
     let title = arguments.get("title").and_then(|v| v.as_str());
     let explicit_folder = arguments.get("folder_id").and_then(|v| v.as_str());
     let (_effective_policy, resolved_folder) =
-        crate::server::policy_for_folder(explicit_folder, policy, meta, state).await?;
+        crate::shared::policy_for_folder(explicit_folder, policy, meta, state).await?;
     let folder_id = resolved_folder.as_deref().or(explicit_folder);
     let template_arg = arguments
         .get("template")
@@ -2189,7 +2189,7 @@ async fn execute_slides_import_marp(
         )
         .await?;
         state.token_cache = tc;
-        crate::server::check_api_result(&get_result)?;
+        crate::shared::check_api_result(&get_result)?;
 
         let layouts = if template_id.is_some() {
             extract_layouts(&get_result)
@@ -2258,7 +2258,7 @@ async fn execute_slides_import_marp(
         )
         .await?;
         state.token_cache = tc;
-        crate::server::check_api_result(&cleanup_result)?;
+        crate::shared::check_api_result(&cleanup_result)?;
     }
 
     // Step C2: Create new slides and delete the temp cleanup slide
@@ -2291,7 +2291,7 @@ async fn execute_slides_import_marp(
         )
         .await?;
         state.token_cache = tc;
-        crate::server::check_api_result(&create_result)?;
+        crate::shared::check_api_result(&create_result)?;
     }
 
     // Step D: Fetch presentation to get speaker notes object IDs
@@ -2470,7 +2470,7 @@ async fn fetch_presentation(
     )
     .await?;
     state.token_cache = tc;
-    crate::server::check_api_result(&result)?;
+    crate::shared::check_api_result(&result)?;
     Ok(result)
 }
 
@@ -2526,7 +2526,7 @@ async fn slides_batch_update(
     )
     .await?;
     state.token_cache = tc;
-    crate::server::check_api_result(&result)?;
+    crate::shared::check_api_result(&result)?;
     Ok(result)
 }
 
@@ -2566,7 +2566,7 @@ async fn fetch_slide_summary(
     )
     .await?;
     state.token_cache = tc;
-    crate::server::check_api_result(&result)?;
+    crate::shared::check_api_result(&result)?;
 
     let slides = result
         .get("slides")

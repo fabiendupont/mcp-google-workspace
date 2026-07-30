@@ -3,7 +3,7 @@ use serde_json::{Value, json};
 
 use crate::meta::RequestMeta;
 use crate::policy::Policy;
-use crate::server::ServerState;
+use crate::shared::ServerState;
 use crate::tools;
 
 pub fn calendar_list_tool_schema() -> Value {

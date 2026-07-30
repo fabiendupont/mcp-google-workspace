@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::policy::Policy;
-use crate::server::ServerState;
+use crate::shared::ServerState;
 
 pub struct GwsHandler {
     pub(crate) state: Arc<Mutex<ServerState>>,
