@@ -11,7 +11,7 @@ enum Credential {
 }
 
 #[derive(Debug)]
-pub(crate) struct TokenCache {
+pub struct TokenCache {
     token: String,
     expires_at: Instant,
 }

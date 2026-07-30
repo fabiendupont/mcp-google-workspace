@@ -1,33 +1,6 @@
 #![allow(dead_code, clippy::too_many_arguments, clippy::manual_async_fn)]
 
-mod audit;
-mod auth;
-mod cache;
-mod calendar_helpers;
-mod completions;
-mod drive_helpers;
-mod elicitation;
-mod execute;
-mod format;
-mod gmail_helpers;
-mod handler;
-mod helpers;
-mod http;
-mod image_gen;
-mod marp;
-mod meta;
-mod metrics;
-mod policy;
-mod prompts;
-mod rate_limit;
-mod resources;
-mod server;
-mod shared;
-mod sheets_helpers;
-mod slides_helpers;
-mod subscriptions;
-mod tasks;
-mod tools;
+use mcp_google_workspace::*;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1285,13 +1258,10 @@ async fn main() {
                 tracing::info!(services = %svc_list.join(", "), "Starting MCP HTTP server");
             }
 
-            let mut state = shared::ServerState::new();
-            state.prompts = prompts;
-            state.audit = audit;
-            state.eager_tools = eager_tools;
-            state.webhook_url = external_url
+            let webhook = external_url
                 .clone()
                 .or_else(|| Some(format!("http://{addr}")));
+            let state = shared::ServerState::with_config(prompts, audit, eager_tools, webhook);
             let state = Arc::new(tokio::sync::Mutex::new(state));
             let policy = Arc::new(tokio::sync::RwLock::new(policy));
 

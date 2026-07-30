@@ -12,22 +12,22 @@ use crate::policy::Policy;
 use crate::tasks;
 use crate::tools;
 
-pub(crate) struct ServerState {
-    pub tools: Option<Vec<rmcp::model::Tool>>,
-    pub docs: HashMap<String, Arc<RestDescription>>,
-    pub tasks: HashMap<String, tasks::Task>,
-    pub token_cache: Option<crate::auth::TokenCache>,
-    pub audit: Option<Arc<crate::audit::AuditLogger>>,
-    pub prompts: Vec<crate::prompts::Prompt>,
-    pub subscriptions: Arc<tokio::sync::Mutex<crate::subscriptions::SubscriptionMap>>,
-    pub webhook_url: Option<String>,
-    pub sheet_cache: crate::cache::SheetCache,
-    pub activated_services: std::collections::HashSet<String>,
-    pub eager_tools: bool,
+pub struct ServerState {
+    pub(crate) tools: Option<Vec<rmcp::model::Tool>>,
+    pub(crate) docs: HashMap<String, Arc<RestDescription>>,
+    pub(crate) tasks: HashMap<String, tasks::Task>,
+    pub(crate) token_cache: Option<crate::auth::TokenCache>,
+    pub(crate) audit: Option<Arc<crate::audit::AuditLogger>>,
+    pub(crate) prompts: Vec<crate::prompts::Prompt>,
+    pub(crate) subscriptions: Arc<tokio::sync::Mutex<crate::subscriptions::SubscriptionMap>>,
+    pub(crate) webhook_url: Option<String>,
+    pub(crate) sheet_cache: crate::cache::SheetCache,
+    pub(crate) activated_services: std::collections::HashSet<String>,
+    pub(crate) eager_tools: bool,
 }
 
 impl ServerState {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             tools: None,
             docs: HashMap::new(),
@@ -43,6 +43,20 @@ impl ServerState {
         }
     }
 
+    pub fn with_config(
+        prompts: Vec<crate::prompts::Prompt>,
+        audit: Option<Arc<crate::audit::AuditLogger>>,
+        eager_tools: bool,
+        webhook_url: Option<String>,
+    ) -> Self {
+        let mut s = Self::new();
+        s.prompts = prompts;
+        s.audit = audit;
+        s.eager_tools = eager_tools;
+        s.webhook_url = webhook_url;
+        s
+    }
+
     pub(crate) async fn get_doc(
         &mut self,
         svc_alias: &str,
@@ -55,7 +69,7 @@ impl ServerState {
     }
 }
 
-pub(crate) fn check_api_result(result: &Value) -> Result<(), GwsError> {
+pub fn check_api_result(result: &Value) -> Result<(), GwsError> {
     if let Some(err) = result.get("error") {
         let msg = if let Some(s) = err.as_str() {
             s.to_string()
@@ -85,7 +99,7 @@ pub(crate) fn check_api_result(result: &Value) -> Result<(), GwsError> {
     Ok(())
 }
 
-pub(crate) fn parse_position(arguments: &Value) -> Position {
+pub fn parse_position(arguments: &Value) -> Position {
     if let Some(idx) = arguments.get("index").and_then(|v| v.as_i64()) {
         return Position::Index(idx as i32);
     }
@@ -95,7 +109,7 @@ pub(crate) fn parse_position(arguments: &Value) -> Position {
     }
 }
 
-pub(crate) async fn is_descendant_of(
+pub async fn is_descendant_of(
     folder_id: &str,
     allowed_roots: &[&str],
     state: &mut ServerState,
@@ -157,7 +171,7 @@ pub(crate) async fn is_descendant_of(
     false
 }
 
-pub(crate) async fn policy_for_folder(
+pub async fn policy_for_folder(
     folder_id: Option<&str>,
     policy: &Policy,
     meta: &RequestMeta,
@@ -185,7 +199,7 @@ pub(crate) async fn policy_for_folder(
     }
 }
 
-pub(crate) async fn make_image_insertable(
+pub async fn make_image_insertable(
     file_id: &str,
     policy: &Policy,
     meta: &RequestMeta,
@@ -238,7 +252,7 @@ pub(crate) async fn make_image_insertable(
     Ok((url, Some(perm_id)))
 }
 
-pub(crate) async fn revoke_image_sharing(
+pub async fn revoke_image_sharing(
     file_id: &str,
     permission_id: &str,
     policy: &Policy,
@@ -264,5 +278,11 @@ pub(crate) async fn revoke_image_sharing(
             &mut state.token_cache,
         )
         .await;
+    }
+}
+
+impl Default for ServerState {
+    fn default() -> Self {
+        Self::new()
     }
 }
