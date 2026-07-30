@@ -5,15 +5,22 @@ use crate::tools;
 use google_workspace::error::GwsError;
 use serde_json::{Value, json};
 
-pub fn validate_file_id(id: &str) -> Result<(), String> {
+pub fn validate_google_id(id: &str, label: &str, typical_len: &str) -> Result<(), String> {
     if id.len() < 20 {
         return Err(format!(
-            "Invalid file ID '{}' (too short — Google Drive IDs are typically 33-44 characters). \
-             Check the ID from the previous tool call response.",
-            id
+            "Invalid {label} '{id}' (too short — {typical_len}). \
+             Check the ID from the previous tool call response."
         ));
     }
     Ok(())
+}
+
+pub fn validate_file_id(id: &str) -> Result<(), String> {
+    validate_google_id(
+        id,
+        "file ID",
+        "Google Drive IDs are typically 33-44 characters",
+    )
 }
 
 pub fn drive_list_tool_schema() -> Value {

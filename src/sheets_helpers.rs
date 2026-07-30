@@ -6,14 +6,11 @@ use google_workspace::error::GwsError;
 use serde_json::{Value, json};
 
 pub fn validate_spreadsheet_id(id: &str) -> Result<(), String> {
-    if id.len() < 20 {
-        return Err(format!(
-            "Invalid spreadsheet ID '{}' (too short — Google Sheets IDs are typically 44 characters). \
-             Check the ID from the previous tool call response.",
-            id
-        ));
-    }
-    Ok(())
+    crate::drive_helpers::validate_google_id(
+        id,
+        "spreadsheet ID",
+        "Google Sheets IDs are typically 44 characters",
+    )
 }
 
 pub fn sheets_read_tool_schema() -> Value {
