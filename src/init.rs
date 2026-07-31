@@ -253,13 +253,24 @@ pub async fn init_guided() -> Result<serde_json::Value, GwsError> {
 }
 
 fn pick_project() -> Result<String, GwsError> {
+    let mut current_project = String::new();
+    if let Ok(out) = std::process::Command::new("gcloud")
+        .args(["config", "get-value", "project"])
+        .output()
+    {
+        if out.status.success() {
+            current_project = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        }
+    }
+
     let mut projects = Vec::new();
     if let Ok(out) = std::process::Command::new("gcloud")
         .args([
             "projects",
             "list",
             "--format=json(projectId,name)",
-            "--limit=20",
+            "--sort-by=name",
+            "--limit=50",
         ])
         .output()
         && out.status.success()
@@ -275,6 +286,16 @@ fn pick_project() -> Result<String, GwsError> {
         }
     }
 
+    if !current_project.is_empty() && !projects.iter().any(|(id, _)| id == &current_project) {
+        projects.insert(
+            0,
+            (
+                current_project.clone(),
+                format!("(current) {current_project}"),
+            ),
+        );
+    }
+
     if !projects.is_empty() {
         let mut opts: Vec<String> = projects
             .iter()
@@ -282,7 +303,18 @@ fn pick_project() -> Result<String, GwsError> {
             .collect();
         opts.push("Enter manually".into());
         opts.push("Skip".into());
+
+        let default_idx = if !current_project.is_empty() {
+            projects
+                .iter()
+                .position(|(id, _)| id == &current_project)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
         let choice = Select::new("Project:", opts.clone())
+            .with_starting_cursor(default_idx)
             .with_help_message("\u{2191}\u{2193} move  type to filter  enter select")
             .prompt()
             .map_err(err)?;
