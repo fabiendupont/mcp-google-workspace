@@ -173,15 +173,39 @@ fn cli_to_command(cli: Cli) -> Result<Command, GwsError> {
     }
 }
 
+const POLICY_FILE_NAMES: &[&str] = &[".gws-policy.json", "gws-policy.json"];
+
+fn discover_policy_file() -> Option<PathBuf> {
+    let mut dir = std::env::current_dir().ok()?;
+    loop {
+        for name in POLICY_FILE_NAMES {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                tracing::info!(path = %candidate.display(), "Auto-discovered policy file");
+                return Some(candidate);
+            }
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
 fn resolve_config(parsed: ParsedArgs) -> Result<(policy::Policy, Transport), GwsError> {
     let policy = if let Some(path) = parsed.policy_path {
         policy::Policy::from_file(&path)?
     } else if let Some(svc) = parsed.services_str {
         let names: Vec<String> = svc.split(',').map(|s| s.trim().to_string()).collect();
         policy::Policy::from_services(&names)
+    } else if let Some(discovered) = discover_policy_file() {
+        policy::Policy::from_file(&discovered)?
     } else {
         return Err(GwsError::Validation(
-            "Either --policy <path> or --services <list> is required".to_string(),
+            "No policy found. Either:\n  \
+             - Run: mcp-google-workspace init\n  \
+             - Pass: --policy <path>\n  \
+             - Place .gws-policy.json in the project directory"
+                .to_string(),
         ));
     };
 
@@ -641,9 +665,9 @@ async fn main() {
                 eprintln!();
                 let path: String = Input::new()
                     .with_prompt("Save to")
-                    .default("policy.json".to_string())
+                    .default(".gws-policy.json".to_string())
                     .interact_text()
-                    .unwrap_or_else(|_| "policy.json".to_string());
+                    .unwrap_or_else(|_| ".gws-policy.json".to_string());
 
                 if let Err(e) = std::fs::write(&path, &output) {
                     eprintln!("Error writing {path}: {e}");
@@ -651,8 +675,16 @@ async fn main() {
                 }
                 eprintln!();
                 eprintln!("Saved to {path}");
+                if path.starts_with('.') {
+                    eprintln!();
+                    eprintln!("Add to .gitignore (contains project IDs and folder IDs):");
+                    eprintln!("  echo '{path}' >> .gitignore");
+                }
                 eprintln!();
-                eprintln!("Start the server with:");
+                eprintln!("The server auto-discovers {path} — just run:");
+                eprintln!("  mcp-google-workspace");
+                eprintln!();
+                eprintln!("Or explicitly:");
                 eprintln!("  mcp-google-workspace --policy {path}");
                 eprintln!();
                 eprintln!("Validate with:");
