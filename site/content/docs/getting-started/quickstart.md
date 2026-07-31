@@ -24,13 +24,13 @@ top = false
 The fastest way is to use a template:
 
 ```bash
-mcp-google-workspace --init-policy --template assistant > policy.json
+mcp-google-workspace init --template assistant > policy.json
 ```
 
 Or run the interactive wizard:
 
 ```bash
-mcp-google-workspace --init-policy
+mcp-google-workspace init
 ```
 
 Or create `policy.json` manually:
@@ -62,7 +62,7 @@ Or create `policy.json` manually:
 ## 2. Validate the policy
 
 ```bash
-mcp-google-workspace --check-policy policy.json
+mcp-google-workspace check-policy policy.json
 ```
 
 This shows a summary of services, constraints, and security warnings for risky configurations.

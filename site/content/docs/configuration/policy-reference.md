@@ -235,10 +235,10 @@ Every denial includes a `Fix:` hint with the exact JSON snippet to add or change
 
 | Flag | Description |
 |------|-------------|
-| `--init-policy` | Interactive policy wizard (or use with `--services` for quick generation) |
+| `init` | Guided setup: check auth, pick services, folders, labels, calendars |
 | `--template <name>` | Use a preset: `analyst`, `assistant`, `admin-readonly`. Use `--template list` for details |
-| `--check-policy <path>` | Validate a policy file and show security warnings |
-| `--verify` | With `--check-policy`: test credentials against Google APIs |
+| `check-policy <path>` | Validate a policy file and show security warnings |
+| `--verify` | With `check-policy`: test credentials against Google APIs |
 
 ### Templates
 

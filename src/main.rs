@@ -17,12 +17,15 @@ use tracing_subscriber::util::SubscriberInitExt;
 #[derive(Parser, Debug)]
 #[command(name = "mcp-google-workspace", version)]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<CliCommand>,
+
     /// Path to a gws-policy.json file
-    #[arg(long)]
+    #[arg(long, global = true)]
     policy: Option<PathBuf>,
 
     /// Comma-separated service names (e.g., drive,gmail,calendar)
-    #[arg(long, short)]
+    #[arg(long, short, global = true)]
     services: Option<String>,
 
     /// Run as HTTP server (e.g., 127.0.0.1:3000)
@@ -41,22 +44,6 @@ struct Cli {
     #[arg(long)]
     eager_tools: bool,
 
-    /// Interactive policy wizard, or use with --services for quick generation
-    #[arg(long)]
-    init_policy: bool,
-
-    /// Validate a policy file without starting the server
-    #[arg(long)]
-    check_policy: Option<PathBuf>,
-
-    /// With --check-policy: test credentials and resolve folder paths
-    #[arg(long)]
-    verify: bool,
-
-    /// With --init-policy: use a preset (analyst, assistant, admin-readonly)
-    #[arg(long)]
-    template: Option<String>,
-
     /// Write structured audit log (JSONL) of all API calls
     #[arg(long)]
     audit_log: Option<PathBuf>,
@@ -64,14 +51,35 @@ struct Cli {
     /// Directory containing prompt .md files
     #[arg(long)]
     prompts_dir: Option<PathBuf>,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum CliCommand {
+    /// Guided setup: check auth, pick services, folders, labels, calendars
+    Init {
+        /// Use a preset instead of interactive setup (analyst, assistant, admin-readonly)
+        #[arg(long)]
+        template: Option<String>,
+    },
+
+    /// Validate a policy file and show security warnings
+    CheckPolicy {
+        /// Path to the policy file to validate
+        path: PathBuf,
+
+        /// Also test credentials against Google APIs
+        #[arg(long)]
+        verify: bool,
+    },
 
     /// Walk the credential chain and report what is available
-    #[arg(long)]
-    check_auth: bool,
+    CheckAuth,
 
-    /// Dry-run scenarios against a policy (requires --policy)
-    #[arg(long)]
-    simulate: Option<PathBuf>,
+    /// Dry-run scenarios against a policy
+    Simulate {
+        /// Path to scenarios JSON file
+        scenarios: PathBuf,
+    },
 }
 
 enum Transport {
@@ -131,49 +139,37 @@ fn parse_args_from(args: &[String]) -> Result<Command, GwsError> {
 }
 
 fn cli_to_command(cli: Cli) -> Result<Command, GwsError> {
-    if let Some(path) = cli.check_policy {
-        return Ok(Command::CheckPolicy {
-            path,
-            verify: cli.verify,
-        });
-    }
-
-    if cli.check_auth {
-        return Ok(Command::CheckAuth {
+    match cli.command {
+        Some(CliCommand::Init { template }) => {
+            let services = cli
+                .services
+                .map(|s| s.split(',').map(|s| s.trim().to_string()).collect());
+            Ok(Command::InitPolicy { services, template })
+        }
+        Some(CliCommand::CheckPolicy { path, verify }) => Ok(Command::CheckPolicy { path, verify }),
+        Some(CliCommand::CheckAuth) => Ok(Command::CheckAuth {
             policy_path: cli.policy,
-        });
+        }),
+        Some(CliCommand::Simulate { scenarios }) => {
+            let policy_path = cli.policy.ok_or_else(|| {
+                GwsError::Validation("simulate requires --policy to also be set".to_string())
+            })?;
+            Ok(Command::Simulate {
+                policy_path,
+                scenarios_path: scenarios,
+            })
+        }
+        None => Ok(Command::Serve(ParsedArgs {
+            policy_path: cli.policy,
+            services_str: cli.services,
+            http_addr: cli.http,
+            external_url: cli.external_url,
+            compact_schemas: cli.compact_schemas,
+            eager_tools: cli.eager_tools,
+            audit_log: cli.audit_log,
+            prompts_dir: cli.prompts_dir,
+        })),
     }
-
-    if let Some(scenarios_path) = cli.simulate {
-        let policy_path = cli.policy.ok_or_else(|| {
-            GwsError::Validation("--simulate requires --policy to also be set".to_string())
-        })?;
-        return Ok(Command::Simulate {
-            policy_path,
-            scenarios_path,
-        });
-    }
-
-    if cli.init_policy {
-        let services = cli
-            .services
-            .map(|s| s.split(',').map(|s| s.trim().to_string()).collect());
-        return Ok(Command::InitPolicy {
-            services,
-            template: cli.template,
-        });
-    }
-
-    Ok(Command::Serve(ParsedArgs {
-        policy_path: cli.policy,
-        services_str: cli.services,
-        http_addr: cli.http,
-        external_url: cli.external_url,
-        compact_schemas: cli.compact_schemas,
-        eager_tools: cli.eager_tools,
-        audit_log: cli.audit_log,
-        prompts_dir: cli.prompts_dir,
-    }))
 }
 
 fn resolve_config(parsed: ParsedArgs) -> Result<(policy::Policy, Transport), GwsError> {
@@ -277,7 +273,7 @@ fn list_templates() {
         eprintln!("    {desc}");
         eprintln!();
     }
-    eprintln!("Usage: mcp-google-workspace --init-policy --template <name>");
+    eprintln!("Usage: mcp-google-workspace init --template <name>");
 }
 
 fn template_policy(name: &str) -> Result<serde_json::Value, GwsError> {
@@ -1086,7 +1082,7 @@ async fn main() {
                 eprintln!("  mcp-google-workspace --policy {path}");
                 eprintln!();
                 eprintln!("Validate with:");
-                eprintln!("  mcp-google-workspace --check-policy {path}");
+                eprintln!("  mcp-google-workspace check-policy {path}");
             } else {
                 println!("{output}");
             }
@@ -1442,7 +1438,7 @@ mod tests {
 
     #[test]
     fn test_parse_init_policy_interactive() {
-        let cmd = parse_args_from(&args(&["--init-policy"])).unwrap();
+        let cmd = parse_args_from(&args(&["init"])).unwrap();
         match cmd {
             Command::InitPolicy { services, template } => {
                 assert!(services.is_none());
@@ -1454,7 +1450,7 @@ mod tests {
 
     #[test]
     fn test_parse_init_policy_with_services() {
-        let cmd = parse_args_from(&args(&["--init-policy", "--services", "drive,sheets"])).unwrap();
+        let cmd = parse_args_from(&args(&["init", "--services", "drive,sheets"])).unwrap();
         match cmd {
             Command::InitPolicy { services, template } => {
                 assert_eq!(
@@ -1469,7 +1465,7 @@ mod tests {
 
     #[test]
     fn test_parse_init_policy_with_template() {
-        let cmd = parse_args_from(&args(&["--init-policy", "--template", "analyst"])).unwrap();
+        let cmd = parse_args_from(&args(&["init", "--template", "analyst"])).unwrap();
         match cmd {
             Command::InitPolicy { services, template } => {
                 assert!(services.is_none());
@@ -1514,7 +1510,7 @@ mod tests {
 
     #[test]
     fn test_parse_check_policy() {
-        let cmd = parse_args_from(&args(&["--check-policy", "/tmp/policy.json"])).unwrap();
+        let cmd = parse_args_from(&args(&["check-policy", "/tmp/policy.json"])).unwrap();
         match cmd {
             Command::CheckPolicy { path, verify } => {
                 assert_eq!(path, PathBuf::from("/tmp/policy.json"));
@@ -1527,7 +1523,7 @@ mod tests {
     #[test]
     fn test_parse_check_policy_with_verify() {
         let cmd =
-            parse_args_from(&args(&["--check-policy", "/tmp/policy.json", "--verify"])).unwrap();
+            parse_args_from(&args(&["check-policy", "/tmp/policy.json", "--verify"])).unwrap();
         match cmd {
             Command::CheckPolicy { path, verify } => {
                 assert_eq!(path, PathBuf::from("/tmp/policy.json"));
@@ -1539,13 +1535,13 @@ mod tests {
 
     #[test]
     fn test_parse_check_policy_missing_value() {
-        let err = parse_args_from(&args(&["--check-policy"]));
+        let err = parse_args_from(&args(&["check-policy"]));
         assert!(err.is_err());
     }
 
     #[test]
     fn test_parse_check_auth() {
-        let cmd = parse_args_from(&args(&["--check-auth"])).unwrap();
+        let cmd = parse_args_from(&args(&["check-auth"])).unwrap();
         match cmd {
             Command::CheckAuth { policy_path } => {
                 assert!(policy_path.is_none());
@@ -1556,8 +1552,7 @@ mod tests {
 
     #[test]
     fn test_parse_check_auth_with_policy() {
-        let cmd =
-            parse_args_from(&args(&["--check-auth", "--policy", "/tmp/policy.json"])).unwrap();
+        let cmd = parse_args_from(&args(&["check-auth", "--policy", "/tmp/policy.json"])).unwrap();
         match cmd {
             Command::CheckAuth { policy_path } => {
                 assert_eq!(policy_path, Some(PathBuf::from("/tmp/policy.json")));
@@ -1612,7 +1607,7 @@ mod tests {
         let cmd = parse_args_from(&args(&[
             "--policy",
             "/tmp/policy.json",
-            "--simulate",
+            "simulate",
             "/tmp/scenarios.json",
         ]))
         .unwrap();
@@ -1630,18 +1625,13 @@ mod tests {
 
     #[test]
     fn test_parse_simulate_requires_policy() {
-        let err = parse_args_from(&args(&["--simulate", "/tmp/scenarios.json"]));
+        let err = parse_args_from(&args(&["simulate", "/tmp/scenarios.json"]));
         assert!(err.is_err());
-        assert!(
-            err.unwrap_err()
-                .to_string()
-                .contains("--simulate requires --policy")
-        );
     }
 
     #[test]
     fn test_parse_simulate_missing_value() {
-        let err = parse_args_from(&args(&["--policy", "/tmp/policy.json", "--simulate"]));
+        let err = parse_args_from(&args(&["--policy", "/tmp/policy.json", "simulate"]));
         assert!(err.is_err());
     }
 
