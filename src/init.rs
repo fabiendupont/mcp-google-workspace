@@ -12,6 +12,7 @@ const SERVICES: &[(&str, &str)] = &[
     ("docs", "Google Docs — documents"),
     ("slides", "Google Slides — presentations"),
     ("people", "Google Contacts — contact lookup"),
+    ("generativelanguage", "Gemini AI — image generation"),
 ];
 
 pub const TEMPLATES: &[(&str, &str)] = &[
