@@ -172,14 +172,14 @@ pub async fn init_guided() -> Result<serde_json::Value, GwsError> {
 
     // Step 2: Services
     eprintln!("{}", style("Step 2: Services").bold());
-    eprintln!("  {}", style("Use space to toggle, enter to confirm").dim());
+
     let labels: Vec<String> = SERVICES
         .iter()
         .map(|(name, desc)| format!("{name} — {desc}"))
         .collect();
     let defaults = vec![true; SERVICES.len()];
     let selected = MultiSelect::with_theme(&theme)
-        .with_prompt("Enable services")
+        .with_prompt("Enable services (space=toggle, enter=confirm)")
         .items(&labels)
         .defaults(&defaults)
         .interact()
@@ -435,7 +435,7 @@ async fn configure_drive_guided(creds: Option<&str>) -> Result<serde_json::Value
         .map(|(id, name)| format!("{name}  {}", style(id).dim()))
         .collect();
     let selected = MultiSelect::with_theme(&theme)
-        .with_prompt("  Writable folders")
+        .with_prompt("  Writable folders (space=toggle, enter=confirm)")
         .items(&labels)
         .interact()
         .map_err(|e| GwsError::Validation(format!("Prompt failed: {e}")))?;
@@ -530,7 +530,7 @@ async fn configure_gmail_guided(creds: Option<&str>) -> Result<serde_json::Value
             style("Use space to toggle, enter to confirm").dim()
         );
         let selected = MultiSelect::with_theme(&theme)
-            .with_prompt("  Allowed labels")
+            .with_prompt("  Allowed labels (space=toggle, enter=confirm)")
             .items(&labels)
             .interact()
             .map_err(|e| GwsError::Validation(format!("Prompt failed: {e}")))?;
@@ -622,7 +622,7 @@ async fn configure_calendar_guided(creds: Option<&str>) -> Result<serde_json::Va
         style("Use space to toggle, enter to confirm").dim()
     );
     let rw_selected = MultiSelect::with_theme(&theme)
-        .with_prompt("  Read-write calendars (others become read-only)")
+        .with_prompt("  Read-write calendars (space=toggle, enter=confirm)")
         .items(&labels)
         .interact()
         .map_err(|e| GwsError::Validation(format!("Prompt failed: {e}")))?;
