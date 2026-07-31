@@ -26,6 +26,7 @@ tracing-opentelemetry = "0.33"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 yup-oauth2 = "12"
 clap = { version = "4", features = ["derive"] }
+console = "0.16"
 dialoguer = "0.12.0"
 tower-http = { version = "0.7", features = ["cors"] }
 pulldown-cmark = "0.13"

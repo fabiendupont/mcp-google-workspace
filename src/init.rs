@@ -1,19 +1,30 @@
+use console::style;
 use google_workspace::error::GwsError;
 
 use crate::auth;
 
-pub const KNOWN_SERVICES: &[(&str, &str)] = &[
-    ("drive", "Google Drive — files, folders, permissions"),
-    ("gmail", "Gmail — messages, threads, labels, drafts"),
-    ("calendar", "Google Calendar — events, calendars"),
-    ("sheets", "Google Sheets — spreadsheets, values"),
-    ("docs", "Google Docs — documents, content"),
-    ("slides", "Google Slides — presentations, pages"),
-    ("admin", "Admin SDK — users, groups, org units"),
-    ("chat", "Google Chat — spaces, messages"),
+const SERVICES: &[(&str, &str)] = &[
+    ("drive", "Google Drive — files and folders"),
+    ("gmail", "Gmail — messages, threads, labels"),
+    ("calendar", "Google Calendar — events and scheduling"),
+    ("sheets", "Google Sheets — spreadsheets"),
+    ("docs", "Google Docs — documents"),
+    ("slides", "Google Slides — presentations"),
+    ("people", "Google Contacts — contact lookup"),
+];
+
+pub const TEMPLATES: &[(&str, &str)] = &[
     (
-        "generativelanguage",
-        "Google Generative AI — models, content generation",
+        "analyst",
+        "Read-only Drive, Sheets, Docs. Gmail with safety blocks.",
+    ),
+    (
+        "assistant",
+        "Drive read-write, Gmail with safety blocks, Calendar, Sheets, Docs.",
+    ),
+    (
+        "admin-readonly",
+        "All services in read-only mode. Safe for auditing.",
     ),
 ];
 
@@ -22,7 +33,6 @@ pub fn generate_policy(services: &[String]) -> serde_json::Value {
         .iter()
         .map(|name| default_service_entry(name))
         .collect();
-
     serde_json::json!({
         "server": { "read_only": false },
         "services": svc_entries
@@ -31,118 +41,81 @@ pub fn generate_policy(services: &[String]) -> serde_json::Value {
 
 fn default_service_entry(name: &str) -> serde_json::Value {
     match name {
-        "drive" => serde_json::json!({
-            "name": "drive",
-            "constraints": [
-                { "param": "parents", "values": ["<your-folder-id>"], "access": "read-write", "location": "body" }
-            ]
-        }),
+        "drive" => serde_json::json!({ "name": "drive", "allowed_resources": ["files"] }),
         "gmail" => serde_json::json!({
             "name": "gmail",
-            "denied_methods": [
-                "messages.delete", "messages.trash", "messages.batchDelete",
-                "settings.updateAutoForwarding",
-                "settings.delegates.create",
-                "settings.forwardingAddresses.create"
-            ]
+            "allowed_resources": ["users.messages", "users.threads", "users.labels", "users.drafts"],
+            "denied_methods": gmail_safety_denylists()
         }),
         "calendar" => serde_json::json!({
             "name": "calendar",
-            "constraints": [
-                { "param": "calendarId", "values": ["primary"], "access": "read-write" }
-            ]
+            "allowed_resources": ["events"],
+            "constraints": [{ "param": "calendarId", "values": ["primary"], "access": "read-write" }]
         }),
-        _ => serde_json::json!({
-            "name": name,
-            "read_only": true
-        }),
+        "sheets" => serde_json::json!({ "name": "sheets", "allowed_resources": ["spreadsheets"] }),
+        "docs" => serde_json::json!({ "name": "docs", "allowed_resources": ["documents"] }),
+        "slides" => serde_json::json!({ "name": "slides", "allowed_resources": ["presentations"] }),
+        "people" => {
+            serde_json::json!({ "name": "people", "read_only": true, "allowed_resources": ["people", "people.connections"] })
+        }
+        _ => serde_json::json!({ "name": name }),
     }
 }
 
-pub const TEMPLATES: &[(&str, &str)] = &[
-    (
-        "analyst",
-        "Read-only Drive, Sheets, Docs. Gmail send-only. No calendar.",
-    ),
-    (
-        "assistant",
-        "Drive read-write, Gmail with safety blocks, Calendar primary read-write.",
-    ),
-    (
-        "admin-readonly",
-        "All services in read-only mode. Safe for auditing.",
-    ),
-];
-
-fn list_templates() {
-    eprintln!();
-    eprintln!("Available policy templates:");
-    eprintln!();
-    for (name, desc) in TEMPLATES {
-        eprintln!("  {name}");
-        eprintln!("    {desc}");
-        eprintln!();
-    }
-    eprintln!("Usage: mcp-google-workspace init --template <name>");
-}
-
-pub fn template_policy(name: &str) -> Result<serde_json::Value, GwsError> {
-    if name == "list" {
-        list_templates();
-        std::process::exit(0);
-    }
-
-    let gmail_safety = serde_json::json!([
+fn gmail_safety_denylists() -> serde_json::Value {
+    serde_json::json!([
         "messages.delete",
         "messages.trash",
         "messages.batchDelete",
         "settings.updateAutoForwarding",
         "settings.delegates.create",
         "settings.forwardingAddresses.create"
-    ]);
+    ])
+}
+
+pub fn template_policy(name: &str) -> Result<serde_json::Value, GwsError> {
+    if name == "list" {
+        eprintln!();
+        eprintln!("{}", style("Available policy templates:").bold());
+        eprintln!();
+        for (name, desc) in TEMPLATES {
+            eprintln!("  {} — {desc}", style(name).cyan());
+        }
+        eprintln!();
+        eprintln!("Usage: mcp-google-workspace init --template <name>");
+        std::process::exit(0);
+    }
 
     match name {
         "analyst" => Ok(serde_json::json!({
             "server": { "read_only": false },
             "services": [
-                { "name": "drive", "read_only": true },
-                { "name": "sheets", "read_only": true },
-                { "name": "docs", "read_only": true },
-                {
-                    "name": "gmail",
-                    "denied_methods": gmail_safety
-                }
+                { "name": "drive", "read_only": true, "allowed_resources": ["files"] },
+                { "name": "sheets", "read_only": true, "allowed_resources": ["spreadsheets"] },
+                { "name": "docs", "read_only": true, "allowed_resources": ["documents"] },
+                { "name": "gmail", "allowed_resources": ["users.messages", "users.threads", "users.labels", "users.drafts"], "denied_methods": gmail_safety_denylists() }
             ]
         })),
         "assistant" => Ok(serde_json::json!({
             "server": { "read_only": false },
             "services": [
-                { "name": "drive" },
-                {
-                    "name": "gmail",
-                    "denied_methods": gmail_safety
-                },
-                {
-                    "name": "calendar",
-                    "constraints": [
-                        { "param": "calendarId", "values": ["primary"], "access": "read-write" }
-                    ]
-                },
-                { "name": "sheets" },
-                { "name": "docs", "read_only": true }
+                { "name": "drive", "allowed_resources": ["files"] },
+                { "name": "gmail", "allowed_resources": ["users.messages", "users.threads", "users.labels", "users.drafts"], "denied_methods": gmail_safety_denylists() },
+                { "name": "calendar", "allowed_resources": ["events"], "constraints": [{ "param": "calendarId", "values": ["primary"], "access": "read-write" }] },
+                { "name": "sheets", "allowed_resources": ["spreadsheets"] },
+                { "name": "docs", "allowed_resources": ["documents"] },
+                { "name": "people", "read_only": true, "allowed_resources": ["people", "people.connections"] }
             ]
         })),
         "admin-readonly" => Ok(serde_json::json!({
             "server": { "read_only": true },
             "services": [
-                { "name": "drive" },
-                { "name": "gmail" },
-                { "name": "calendar" },
-                { "name": "sheets" },
-                { "name": "docs" },
-                { "name": "slides" },
-                { "name": "admin" },
-                { "name": "chat" }
+                { "name": "drive", "allowed_resources": ["files"] },
+                { "name": "gmail", "allowed_resources": ["users.messages", "users.threads", "users.labels"] },
+                { "name": "calendar", "allowed_resources": ["events"] },
+                { "name": "sheets", "allowed_resources": ["spreadsheets"] },
+                { "name": "docs", "allowed_resources": ["documents"] },
+                { "name": "slides", "allowed_resources": ["presentations"] }
             ]
         })),
         _ => {
@@ -156,16 +129,20 @@ pub fn template_policy(name: &str) -> Result<serde_json::Value, GwsError> {
 }
 
 pub async fn init_guided() -> Result<serde_json::Value, GwsError> {
-    use dialoguer::{Confirm, Input, MultiSelect};
+    use dialoguer::{Input, MultiSelect, Select};
+    let theme = dialoguer::theme::ColorfulTheme::default();
 
     eprintln!();
-    eprintln!("  MCP Google Workspace — Guided Setup");
+    eprintln!(
+        "{}",
+        style("  MCP Google Workspace — Setup Wizard").bold().cyan()
+    );
     eprintln!();
 
-    // Step 1: Auth check
-    eprintln!("Step 1: Checking authentication...");
-    let creds_file: String = Input::new()
-        .with_prompt("Path to credentials JSON (leave empty for default chain)")
+    // Step 1: Auth
+    eprintln!("{}", style("Step 1: Authentication").bold());
+    let creds_file: String = Input::with_theme(&theme)
+        .with_prompt("Credentials JSON path (empty = default chain)")
         .allow_empty(true)
         .interact_text()
         .map_err(|e| GwsError::Validation(format!("Prompt failed: {e}")))?;
@@ -175,42 +152,47 @@ pub async fn init_guided() -> Result<serde_json::Value, GwsError> {
         Some(creds_file.as_str())
     };
 
-    let scopes = &["https://www.googleapis.com/auth/drive.readonly"];
-    match auth::get_token(scopes, creds_opt, None).await {
-        Ok(_) => eprintln!("  \u{2713} Authentication working"),
+    match auth::get_token(
+        &["https://www.googleapis.com/auth/drive.readonly"],
+        creds_opt,
+        None,
+    )
+    .await
+    {
+        Ok(_) => eprintln!("  {} Authentication working", style("\u{2713}").green()),
         Err(e) => {
-            eprintln!("  \u{2717} Authentication failed: {e}");
+            eprintln!("  {} Authentication failed: {e}", style("\u{2717}").red());
             eprintln!();
-            eprintln!("  Run: gws auth login");
-            eprintln!("  Then re-run: mcp-google-workspace init");
+            eprintln!("  Run: {}", style("gws auth login").yellow());
+            eprintln!("  Then: {}", style("mcp-google-workspace init").yellow());
             return Err(GwsError::Validation("Authentication required".into()));
         }
     }
-
     eprintln!();
 
-    // Step 2: Service selection
-    eprintln!("Step 2: Select services");
-    let labels: Vec<String> = KNOWN_SERVICES
+    // Step 2: Services
+    eprintln!("{}", style("Step 2: Services").bold());
+    eprintln!("  {}", style("Use space to toggle, enter to confirm").dim());
+    let labels: Vec<String> = SERVICES
         .iter()
         .map(|(name, desc)| format!("{name} — {desc}"))
         .collect();
-    let defaults = vec![true, true, true, true, true, true, false, false, false];
-    let selected = MultiSelect::new()
-        .with_prompt("Which services?")
+    let defaults = vec![true; SERVICES.len()];
+    let selected = MultiSelect::with_theme(&theme)
+        .with_prompt("Enable services")
         .items(&labels)
-        .defaults(&defaults[..labels.len().min(defaults.len())])
+        .defaults(&defaults)
         .interact()
         .map_err(|e| GwsError::Validation(format!("Prompt failed: {e}")))?;
 
     if selected.is_empty() {
         return Err(GwsError::Validation("At least one service required".into()));
     }
-    let chosen: Vec<&str> = selected.iter().map(|&i| KNOWN_SERVICES[i].0).collect();
-
+    let chosen: Vec<&str> = selected.iter().map(|&i| SERVICES[i].0).collect();
     eprintln!();
 
-    // Step 3: Per-service configuration with live API data
+    // Step 3: Per-service config
+    eprintln!("{}", style("Step 3: Service configuration").bold());
     let mut svc_entries: Vec<serde_json::Value> = Vec::new();
 
     for &name in &chosen {
@@ -218,28 +200,19 @@ pub async fn init_guided() -> Result<serde_json::Value, GwsError> {
             "drive" => configure_drive_guided(creds_opt).await?,
             "gmail" => configure_gmail_guided(creds_opt).await?,
             "calendar" => configure_calendar_guided(creds_opt).await?,
-            _ => configure_generic(name)?,
+            _ => default_service_entry(name),
         };
         svc_entries.push(entry);
     }
-
     eprintln!();
 
-    // Step 4: Server settings
-    eprintln!("Step 4: Server settings");
-    let read_only = Confirm::new()
-        .with_prompt("Global read-only mode?")
-        .default(false)
-        .interact()
-        .map_err(|e| GwsError::Validation(format!("Prompt failed: {e}")))?;
+    // Step 4: Project ID
+    eprintln!("{}", style("Step 4: Google Cloud project").bold());
+    let project_id = detect_project_id(&theme)?;
+    eprintln!();
 
-    let project_id: String = Input::new()
-        .with_prompt("Google Cloud project ID (for quota)")
-        .allow_empty(true)
-        .interact_text()
-        .map_err(|e| GwsError::Validation(format!("Prompt failed: {e}")))?;
-
-    let mut server = serde_json::json!({ "read_only": read_only });
+    // Step 5: Server settings
+    let mut server = serde_json::json!({});
     if !project_id.is_empty() {
         server["project_id"] = serde_json::json!(project_id);
     }
@@ -247,30 +220,177 @@ pub async fn init_guided() -> Result<serde_json::Value, GwsError> {
         server["credentials_file"] = serde_json::json!(creds_file);
     }
 
-    Ok(serde_json::json!({
+    // Step 6: Save location
+    eprintln!("{}", style("Step 5: Save policy").bold());
+    let save_options = vec![
+        format!(
+            ".gws-policy.json  {} (gitignored, per-project)",
+            style("← recommended").dim()
+        ),
+        "gws-policy.json   (shared, committable)".to_string(),
+        "~/.config/gws/policy.json  (global, all projects)".to_string(),
+        "Custom path".to_string(),
+    ];
+    let save_choice = Select::with_theme(&theme)
+        .with_prompt("Where to save?")
+        .items(&save_options)
+        .default(0)
+        .interact()
+        .map_err(|e| GwsError::Validation(format!("Prompt failed: {e}")))?;
+
+    let save_path = match save_choice {
+        0 => ".gws-policy.json".to_string(),
+        1 => "gws-policy.json".to_string(),
+        2 => {
+            let dir = dirs_next::config_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join("gws");
+            std::fs::create_dir_all(&dir).ok();
+            dir.join("policy.json").display().to_string()
+        }
+        _ => Input::with_theme(&theme)
+            .with_prompt("Path")
+            .default(".gws-policy.json".to_string())
+            .interact_text()
+            .map_err(|e| GwsError::Validation(format!("Prompt failed: {e}")))?,
+    };
+
+    let policy = serde_json::json!({
         "server": server,
         "services": svc_entries
-    }))
+    });
+    let output = serde_json::to_string_pretty(&policy).unwrap();
+
+    if let Err(e) = std::fs::write(&save_path, &output) {
+        return Err(GwsError::Validation(format!(
+            "Failed to write {save_path}: {e}"
+        )));
+    }
+
+    eprintln!();
+    eprintln!(
+        "  {} Saved to {}",
+        style("\u{2713}").green(),
+        style(&save_path).cyan()
+    );
+    if save_path.starts_with('.') {
+        eprintln!();
+        eprintln!("  Add to .gitignore (contains project IDs and folder IDs):");
+        eprintln!(
+            "    {}",
+            style(format!("echo '{save_path}' >> .gitignore")).yellow()
+        );
+    }
+    eprintln!();
+    eprintln!(
+        "  The server auto-discovers {} — just run:",
+        style(&save_path).cyan()
+    );
+    eprintln!("    {}", style("mcp-google-workspace").yellow());
+    eprintln!();
+    eprintln!("  Validate with:");
+    eprintln!(
+        "    {}",
+        style(format!("mcp-google-workspace check-policy {save_path}")).yellow()
+    );
+
+    std::process::exit(0);
+}
+
+fn detect_project_id(theme: &dialoguer::theme::ColorfulTheme) -> Result<String, GwsError> {
+    use dialoguer::{Input, Select};
+
+    let mut projects = Vec::new();
+    if let Ok(output) = std::process::Command::new("gcloud")
+        .args([
+            "projects",
+            "list",
+            "--format=json(projectId,name)",
+            "--limit=20",
+        ])
+        .output()
+        && output.status.success()
+        && let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+        && let Some(arr) = parsed.as_array()
+    {
+        for p in arr {
+            let id = p.get("projectId").and_then(|v| v.as_str()).unwrap_or("");
+            let name = p.get("name").and_then(|v| v.as_str()).unwrap_or(id);
+            if !id.is_empty() {
+                projects.push((id.to_string(), name.to_string()));
+            }
+        }
+    }
+
+    if !projects.is_empty() {
+        let mut labels: Vec<String> = projects
+            .iter()
+            .map(|(id, name)| format!("{name} ({id})"))
+            .collect();
+        labels.push("Enter manually".to_string());
+        labels.push("Skip (no project ID)".to_string());
+
+        let choice = Select::with_theme(theme)
+            .with_prompt("Google Cloud project (for API quota)")
+            .items(&labels)
+            .default(0)
+            .interact()
+            .map_err(|e| GwsError::Validation(format!("Prompt failed: {e}")))?;
+
+        if choice < projects.len() {
+            return Ok(projects[choice].0.clone());
+        }
+        if choice == labels.len() - 1 {
+            return Ok(String::new());
+        }
+    }
+
+    let id: String = Input::with_theme(theme)
+        .with_prompt("Google Cloud project ID (empty to skip)")
+        .allow_empty(true)
+        .interact_text()
+        .map_err(|e| GwsError::Validation(format!("Prompt failed: {e}")))?;
+    Ok(id)
 }
 
 async fn configure_drive_guided(creds: Option<&str>) -> Result<serde_json::Value, GwsError> {
-    use dialoguer::{Confirm, MultiSelect};
+    use dialoguer::{Confirm, Input, MultiSelect};
+    let theme = dialoguer::theme::ColorfulTheme::default();
 
-    eprintln!("  Drive: Fetching your folders...");
-    let mut entry = serde_json::json!({ "name": "drive" });
-    entry["allowed_resources"] = serde_json::json!(["files"]);
+    eprintln!("  {} Fetching Drive folders...", style("Drive:").cyan());
+    let mut entry = serde_json::json!({ "name": "drive", "allowed_resources": ["files"] });
 
-    let scopes = &["https://www.googleapis.com/auth/drive.readonly"];
-    let token = auth::get_token(scopes, creds, None)
-        .await
-        .map_err(|e| GwsError::Validation(format!("Drive auth failed: {e}")))?;
+    let token = auth::get_token(
+        &["https://www.googleapis.com/auth/drive.readonly"],
+        creds,
+        None,
+    )
+    .await
+    .map_err(|e| GwsError::Validation(format!("Drive auth failed: {e}")))?;
 
     let client = reqwest::Client::new();
+
+    let search_query: String = Input::with_theme(&theme)
+        .with_prompt("  Search folders by name (empty for root folders)")
+        .allow_empty(true)
+        .interact_text()
+        .map_err(|e| GwsError::Validation(format!("Prompt failed: {e}")))?;
+
+    let q = if search_query.is_empty() {
+        "mimeType='application/vnd.google-apps.folder' and 'root' in parents and trashed=false"
+            .to_string()
+    } else {
+        format!(
+            "mimeType='application/vnd.google-apps.folder' and name contains '{}' and trashed=false",
+            search_query.replace('\'', "\\'")
+        )
+    };
+
     let resp = client
         .get("https://www.googleapis.com/drive/v3/files")
         .bearer_auth(&token)
         .query(&[
-            ("q", "mimeType='application/vnd.google-apps.folder' and 'root' in parents and trashed=false"),
+            ("q", q.as_str()),
             ("fields", "files(id,name)"),
             ("pageSize", "50"),
         ])
@@ -281,50 +401,55 @@ async fn configure_drive_guided(creds: Option<&str>) -> Result<serde_json::Value
     let data: serde_json::Value = resp
         .json()
         .await
-        .map_err(|e| GwsError::Validation(format!("Drive response parse failed: {e}")))?;
+        .map_err(|e| GwsError::Validation(format!("Drive parse failed: {e}")))?;
 
-    let folders: Vec<(&str, &str)> = data
+    let folders: Vec<(String, String)> = data
         .get("files")
         .and_then(|f| f.as_array())
         .map(|arr| {
             arr.iter()
                 .filter_map(|f| {
-                    let id = f.get("id")?.as_str()?;
-                    let name = f.get("name")?.as_str()?;
-                    Some((id, name))
+                    Some((
+                        f.get("id")?.as_str()?.to_string(),
+                        f.get("name")?.as_str()?.to_string(),
+                    ))
                 })
                 .collect()
         })
         .unwrap_or_default();
 
     if folders.is_empty() {
-        eprintln!("  No root folders found — Drive will be unrestricted");
+        eprintln!(
+            "    {} No folders found — Drive will be unrestricted",
+            style("!").yellow()
+        );
         return Ok(entry);
     }
 
+    eprintln!(
+        "    {}",
+        style("Use space to toggle, enter to confirm").dim()
+    );
     let labels: Vec<String> = folders
         .iter()
-        .map(|(id, name)| format!("{name} ({id})"))
+        .map(|(id, name)| format!("{name}  {}", style(id).dim()))
         .collect();
-    let selected = MultiSelect::new()
-        .with_prompt("  Select writable Drive folders (space to toggle)")
+    let selected = MultiSelect::with_theme(&theme)
+        .with_prompt("  Writable folders")
         .items(&labels)
         .interact()
         .map_err(|e| GwsError::Validation(format!("Prompt failed: {e}")))?;
 
     if !selected.is_empty() {
-        let folder_ids: Vec<&str> = selected.iter().map(|&i| folders[i].0).collect();
+        let ids: Vec<&str> = selected.iter().map(|&i| folders[i].0.as_str()).collect();
         entry["constraints"] = serde_json::json!([{
-            "param": "parents",
-            "values": folder_ids,
-            "access": "read-write",
-            "location": "body-write-only",
-            "mode": "restrict",
-            "recursive": true
+            "param": "parents", "values": ids,
+            "access": "read-write", "location": "body-write-only",
+            "mode": "restrict", "recursive": true
         }]);
     }
 
-    let block_delete = Confirm::new()
+    let block_delete = Confirm::with_theme(&theme)
         .with_prompt("  Block permanent file deletion?")
         .default(true)
         .interact()
@@ -338,20 +463,22 @@ async fn configure_drive_guided(creds: Option<&str>) -> Result<serde_json::Value
 
 async fn configure_gmail_guided(creds: Option<&str>) -> Result<serde_json::Value, GwsError> {
     use dialoguer::{Confirm, MultiSelect};
+    let theme = dialoguer::theme::ColorfulTheme::default();
 
-    eprintln!("  Gmail: Fetching your labels...");
-    let mut entry = configure_gmail()?;
-    entry["allowed_resources"] = serde_json::json!([
-        "users.messages",
-        "users.threads",
-        "users.labels",
-        "users.drafts"
-    ]);
+    eprintln!("  {} Fetching labels...", style("Gmail:").cyan());
+    let mut entry = serde_json::json!({
+        "name": "gmail",
+        "allowed_resources": ["users.messages", "users.threads", "users.labels", "users.drafts"],
+        "denied_methods": gmail_safety_denylists()
+    });
 
-    let scopes = &["https://www.googleapis.com/auth/gmail.readonly"];
-    let token = auth::get_token(scopes, creds, None)
-        .await
-        .map_err(|e| GwsError::Validation(format!("Gmail auth failed: {e}")))?;
+    let token = auth::get_token(
+        &["https://www.googleapis.com/auth/gmail.readonly"],
+        creds,
+        None,
+    )
+    .await
+    .map_err(|e| GwsError::Validation(format!("Gmail auth failed: {e}")))?;
 
     let client = reqwest::Client::new();
     let resp = client
@@ -364,19 +491,18 @@ async fn configure_gmail_guided(creds: Option<&str>) -> Result<serde_json::Value
     let data: serde_json::Value = resp
         .json()
         .await
-        .map_err(|e| GwsError::Validation(format!("Gmail response parse failed: {e}")))?;
+        .map_err(|e| GwsError::Validation(format!("Gmail parse failed: {e}")))?;
 
-    let user_labels: Vec<(&str, &str)> = data
+    let user_labels: Vec<String> = data
         .get("labels")
         .and_then(|l| l.as_array())
         .map(|arr| {
             arr.iter()
                 .filter_map(|l| {
-                    let id = l.get("id")?.as_str()?;
                     let name = l.get("name")?.as_str()?;
                     let ltype = l.get("type").and_then(|t| t.as_str()).unwrap_or("");
                     if ltype == "user" {
-                        Some((id, name))
+                        Some(name.to_string())
                     } else {
                         None
                     }
@@ -385,22 +511,26 @@ async fn configure_gmail_guided(creds: Option<&str>) -> Result<serde_json::Value
         })
         .unwrap_or_default();
 
-    let restrict = Confirm::new()
-        .with_prompt("  Restrict Gmail to specific labels?")
+    let restrict = Confirm::with_theme(&theme)
+        .with_prompt("  Restrict to specific labels?")
         .default(false)
         .interact()
         .map_err(|e| GwsError::Validation(format!("Prompt failed: {e}")))?;
 
     if restrict && !user_labels.is_empty() {
-        let mut labels: Vec<String> = vec![
+        let mut labels = vec![
             "INBOX".to_string(),
             "SENT".to_string(),
             "STARRED".to_string(),
         ];
-        labels.extend(user_labels.iter().map(|(_, name)| name.to_string()));
+        labels.extend(user_labels);
 
-        let selected = MultiSelect::new()
-            .with_prompt("  Select allowed labels (space to toggle)")
+        eprintln!(
+            "    {}",
+            style("Use space to toggle, enter to confirm").dim()
+        );
+        let selected = MultiSelect::with_theme(&theme)
+            .with_prompt("  Allowed labels")
             .items(&labels)
             .interact()
             .map_err(|e| GwsError::Validation(format!("Prompt failed: {e}")))?;
@@ -416,15 +546,18 @@ async fn configure_gmail_guided(creds: Option<&str>) -> Result<serde_json::Value
 
 async fn configure_calendar_guided(creds: Option<&str>) -> Result<serde_json::Value, GwsError> {
     use dialoguer::MultiSelect;
+    let theme = dialoguer::theme::ColorfulTheme::default();
 
-    eprintln!("  Calendar: Fetching your calendars...");
-    let mut entry = serde_json::json!({ "name": "calendar" });
-    entry["allowed_resources"] = serde_json::json!(["events"]);
+    eprintln!("  {} Fetching calendars...", style("Calendar:").cyan());
+    let mut entry = serde_json::json!({ "name": "calendar", "allowed_resources": ["events"] });
 
-    let scopes = &["https://www.googleapis.com/auth/calendar.readonly"];
-    let token = auth::get_token(scopes, creds, None)
-        .await
-        .map_err(|e| GwsError::Validation(format!("Calendar auth failed: {e}")))?;
+    let token = auth::get_token(
+        &["https://www.googleapis.com/auth/calendar.readonly"],
+        creds,
+        None,
+    )
+    .await
+    .map_err(|e| GwsError::Validation(format!("Calendar auth failed: {e}")))?;
 
     let client = reqwest::Client::new();
     let resp = client
@@ -437,20 +570,28 @@ async fn configure_calendar_guided(creds: Option<&str>) -> Result<serde_json::Va
     let data: serde_json::Value = resp
         .json()
         .await
-        .map_err(|e| GwsError::Validation(format!("Calendar response parse failed: {e}")))?;
+        .map_err(|e| GwsError::Validation(format!("Calendar parse failed: {e}")))?;
 
-    let calendars: Vec<(&str, &str, &str)> = data
+    let calendars: Vec<(String, String, String)> = data
         .get("items")
         .and_then(|i| i.as_array())
         .map(|arr| {
             arr.iter()
                 .filter_map(|c| {
-                    let id = c.get("id")?.as_str()?;
-                    let summary = c.get("summary").and_then(|s| s.as_str()).unwrap_or(id);
+                    let id = c.get("id")?.as_str()?.to_string();
+                    let summary = c
+                        .get("summary")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or(&id)
+                        .to_string();
                     let access = c
                         .get("accessRole")
                         .and_then(|a| a.as_str())
-                        .unwrap_or("reader");
+                        .unwrap_or("reader")
+                        .to_string();
+                    if access == "freeBusyReader" {
+                        return None;
+                    }
                     Some((id, summary, access))
                 })
                 .collect()
@@ -466,323 +607,50 @@ async fn configure_calendar_guided(creds: Option<&str>) -> Result<serde_json::Va
 
     let labels: Vec<String> = calendars
         .iter()
-        .map(|(id, name, role)| {
-            if *id == "primary" || name.contains('@') {
-                format!("{name} [{role}]")
-            } else {
-                format!("{name} [{role}] ({id})")
-            }
+        .map(|(_, name, role)| {
+            let role_style = match role.as_str() {
+                "owner" => style(role).green(),
+                "writer" => style(role).yellow(),
+                _ => style(role).dim(),
+            };
+            format!("{name}  [{role_style}]")
         })
         .collect();
 
-    let rw_selected = MultiSelect::new()
-        .with_prompt("  Select read-write calendars (space to toggle)")
+    eprintln!(
+        "    {}",
+        style("Use space to toggle, enter to confirm").dim()
+    );
+    let rw_selected = MultiSelect::with_theme(&theme)
+        .with_prompt("  Read-write calendars (others become read-only)")
         .items(&labels)
         .interact()
         .map_err(|e| GwsError::Validation(format!("Prompt failed: {e}")))?;
 
     let mut constraints = Vec::new();
-
-    let rw_ids: Vec<&str> = rw_selected.iter().map(|&i| calendars[i].0).collect();
+    let rw_ids: Vec<&str> = rw_selected
+        .iter()
+        .map(|&i| calendars[i].0.as_str())
+        .collect();
     if !rw_ids.is_empty() {
-        constraints.push(serde_json::json!({
-            "param": "calendarId",
-            "values": rw_ids,
-            "access": "read-write"
-        }));
+        constraints.push(
+            serde_json::json!({ "param": "calendarId", "values": rw_ids, "access": "read-write" }),
+        );
     }
-
     let ro_ids: Vec<&str> = calendars
         .iter()
         .enumerate()
         .filter(|(i, _)| !rw_selected.contains(i))
-        .map(|(_, (id, _, _))| *id)
+        .map(|(_, (id, _, _))| id.as_str())
         .collect();
     if !ro_ids.is_empty() {
-        constraints.push(serde_json::json!({
-            "param": "calendarId",
-            "values": ro_ids,
-            "access": "read-only"
-        }));
+        constraints.push(
+            serde_json::json!({ "param": "calendarId", "values": ro_ids, "access": "read-only" }),
+        );
     }
-
     if !constraints.is_empty() {
         entry["constraints"] = serde_json::json!(constraints);
     }
 
     Ok(entry)
-}
-
-pub fn init_policy_interactive() -> Result<serde_json::Value, GwsError> {
-    use dialoguer::{Confirm, Input, MultiSelect, Select};
-
-    eprintln!();
-    eprintln!("  MCP Google Workspace — Policy Generator");
-    eprintln!();
-
-    let mut template_labels: Vec<String> = TEMPLATES
-        .iter()
-        .map(|(name, desc)| format!("{name} — {desc}"))
-        .collect();
-    template_labels.push("Custom — configure services individually".to_string());
-
-    let choice = Select::new()
-        .with_prompt("Start from a template or configure manually?")
-        .items(&template_labels)
-        .default(template_labels.len() - 1)
-        .interact()
-        .map_err(|e| GwsError::Validation(format!("Prompt failed: {e}")))?;
-
-    if choice < TEMPLATES.len() {
-        return template_policy(TEMPLATES[choice].0);
-    }
-
-    let labels: Vec<String> = KNOWN_SERVICES
-        .iter()
-        .map(|(name, desc)| format!("{name} — {desc}"))
-        .collect();
-
-    let defaults = vec![true, true, true, false, false, false, false, false];
-    let selected = MultiSelect::new()
-        .with_prompt("Which services do you want to enable?")
-        .items(&labels)
-        .defaults(&defaults)
-        .interact()
-        .map_err(|e| GwsError::Validation(format!("Prompt failed: {e}")))?;
-
-    if selected.is_empty() {
-        return Err(GwsError::Validation(
-            "At least one service must be selected".to_string(),
-        ));
-    }
-
-    let chosen: Vec<&str> = selected.iter().map(|&i| KNOWN_SERVICES[i].0).collect();
-
-    let mut svc_entries: Vec<serde_json::Value> = Vec::new();
-
-    for &name in &chosen {
-        let entry = match name {
-            "drive" => configure_drive()?,
-            "gmail" => configure_gmail()?,
-            "calendar" => configure_calendar()?,
-            _ => configure_generic(name)?,
-        };
-        svc_entries.push(entry);
-    }
-
-    eprintln!();
-    let read_only = Confirm::new()
-        .with_prompt("Global read-only mode? (blocks all writes across all services)")
-        .default(false)
-        .interact()
-        .map_err(|e| GwsError::Validation(format!("Prompt failed: {e}")))?;
-
-    let project_id: String = Input::new()
-        .with_prompt("Google Cloud project ID (for quota)")
-        .allow_empty(true)
-        .interact_text()
-        .map_err(|e| GwsError::Validation(format!("Prompt failed: {e}")))?;
-
-    let credentials_file: String = Input::new()
-        .with_prompt("Path to credentials JSON (leave empty to use default chain)")
-        .allow_empty(true)
-        .interact_text()
-        .map_err(|e| GwsError::Validation(format!("Prompt failed: {e}")))?;
-
-    let mut server = serde_json::json!({ "read_only": read_only });
-    if !project_id.is_empty() {
-        server["project_id"] = serde_json::json!(project_id);
-    }
-    if !credentials_file.is_empty() {
-        server["credentials_file"] = serde_json::json!(credentials_file);
-    }
-
-    Ok(serde_json::json!({
-        "server": server,
-        "services": svc_entries
-    }))
-}
-
-fn configure_drive() -> Result<serde_json::Value, GwsError> {
-    use dialoguer::{Confirm, Input};
-
-    eprintln!();
-    let restrict = Confirm::new()
-        .with_prompt("Drive: Restrict access to specific folders?")
-        .default(true)
-        .interact()
-        .map_err(|e| GwsError::Validation(format!("Prompt failed: {e}")))?;
-
-    if !restrict {
-        return Ok(serde_json::json!({ "name": "drive" }));
-    }
-
-    let mut constraints: Vec<serde_json::Value> = Vec::new();
-    loop {
-        let path: String = Input::new()
-            .with_prompt("  Folder path (e.g. Projects/output, or empty to finish)")
-            .allow_empty(true)
-            .interact_text()
-            .map_err(|e| GwsError::Validation(format!("Prompt failed: {e}")))?;
-
-        if path.is_empty() {
-            break;
-        }
-
-        let rw = Confirm::new()
-            .with_prompt(format!("  Allow writes to '{path}'?"))
-            .default(true)
-            .interact()
-            .map_err(|e| GwsError::Validation(format!("Prompt failed: {e}")))?;
-
-        let access = if rw { "read-write" } else { "read-only" };
-        constraints.push(serde_json::json!({
-            "param": "parents", "values": [path], "access": access, "location": "body"
-        }));
-    }
-
-    if constraints.is_empty() {
-        Ok(serde_json::json!({ "name": "drive" }))
-    } else {
-        Ok(serde_json::json!({ "name": "drive", "constraints": constraints }))
-    }
-}
-
-fn configure_gmail() -> Result<serde_json::Value, GwsError> {
-    use dialoguer::{Confirm, Input};
-
-    eprintln!();
-    let block_delete = Confirm::new()
-        .with_prompt("Gmail: Block message deletion? (recommended)")
-        .default(true)
-        .interact()
-        .map_err(|e| GwsError::Validation(format!("Prompt failed: {e}")))?;
-
-    let block_forwarding = Confirm::new()
-        .with_prompt("Gmail: Block auto-forwarding and delegate changes? (recommended)")
-        .default(true)
-        .interact()
-        .map_err(|e| GwsError::Validation(format!("Prompt failed: {e}")))?;
-
-    let restrict_labels = Confirm::new()
-        .with_prompt("Gmail: Restrict access to specific labels only?")
-        .default(false)
-        .interact()
-        .map_err(|e| GwsError::Validation(format!("Prompt failed: {e}")))?;
-
-    let mut denied = Vec::new();
-    if block_delete {
-        denied.extend_from_slice(&["messages.delete", "messages.trash", "messages.batchDelete"]);
-    }
-    if block_forwarding {
-        denied.extend_from_slice(&[
-            "settings.updateAutoForwarding",
-            "settings.delegates.create",
-            "settings.forwardingAddresses.create",
-        ]);
-    }
-
-    let mut policy = serde_json::json!({ "name": "gmail" });
-    if !denied.is_empty() {
-        policy["denied_methods"] = serde_json::json!(denied);
-    }
-
-    if restrict_labels {
-        let labels_input: String = Input::new()
-            .with_prompt("Allowed label names (comma-separated)")
-            .interact_text()
-            .map_err(|e| GwsError::Validation(format!("Prompt failed: {e}")))?;
-        let labels: Vec<String> = labels_input
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        if !labels.is_empty() {
-            policy["allowed_labels"] = serde_json::json!(labels);
-        }
-    }
-
-    Ok(policy)
-}
-
-fn configure_calendar() -> Result<serde_json::Value, GwsError> {
-    use dialoguer::{Confirm, Input};
-
-    eprintln!();
-    let restrict = Confirm::new()
-        .with_prompt("Calendar: Restrict to specific calendars?")
-        .default(true)
-        .interact()
-        .map_err(|e| GwsError::Validation(format!("Prompt failed: {e}")))?;
-
-    if !restrict {
-        return Ok(serde_json::json!({ "name": "calendar" }));
-    }
-
-    let mut constraints: Vec<serde_json::Value> = Vec::new();
-
-    let use_primary = Confirm::new()
-        .with_prompt("  Include your primary calendar?")
-        .default(true)
-        .interact()
-        .map_err(|e| GwsError::Validation(format!("Prompt failed: {e}")))?;
-
-    if use_primary {
-        let rw = Confirm::new()
-            .with_prompt("  Allow writes to primary calendar?")
-            .default(true)
-            .interact()
-            .map_err(|e| GwsError::Validation(format!("Prompt failed: {e}")))?;
-
-        let access = if rw { "read-write" } else { "read-only" };
-        constraints.push(serde_json::json!({
-            "param": "calendarId", "values": ["primary"], "access": access
-        }));
-    }
-
-    loop {
-        let id: String = Input::new()
-            .with_prompt("  Additional calendar ID (or empty to finish)")
-            .allow_empty(true)
-            .interact_text()
-            .map_err(|e| GwsError::Validation(format!("Prompt failed: {e}")))?;
-
-        if id.is_empty() {
-            break;
-        }
-
-        let rw = Confirm::new()
-            .with_prompt(format!("  Allow writes to '{id}'?"))
-            .default(false)
-            .interact()
-            .map_err(|e| GwsError::Validation(format!("Prompt failed: {e}")))?;
-
-        let access = if rw { "read-write" } else { "read-only" };
-        constraints.push(serde_json::json!({
-            "param": "calendarId", "values": [id], "access": access
-        }));
-    }
-
-    if constraints.is_empty() {
-        Ok(serde_json::json!({ "name": "calendar" }))
-    } else {
-        Ok(serde_json::json!({ "name": "calendar", "constraints": constraints }))
-    }
-}
-
-fn configure_generic(name: &str) -> Result<serde_json::Value, GwsError> {
-    use dialoguer::Confirm;
-
-    eprintln!();
-    let read_only = Confirm::new()
-        .with_prompt(format!("{name}: Read-only access?"))
-        .default(true)
-        .interact()
-        .map_err(|e| GwsError::Validation(format!("Prompt failed: {e}")))?;
-
-    if read_only {
-        Ok(serde_json::json!({ "name": name, "read_only": true }))
-    } else {
-        Ok(serde_json::json!({ "name": name }))
-    }
 }

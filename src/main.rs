@@ -1106,7 +1106,7 @@ mod tests {
         let json = init::template_policy("admin-readonly").unwrap();
         assert_eq!(json["server"]["read_only"], true);
         let services = json["services"].as_array().unwrap();
-        assert!(services.len() >= 8);
+        assert!(services.len() >= 6);
     }
 
     #[test]
@@ -1173,7 +1173,7 @@ mod tests {
         let services = json["services"].as_array().unwrap();
         assert_eq!(services.len(), 1);
         assert_eq!(services[0]["name"], "drive");
-        assert!(services[0]["constraints"].is_array());
+        assert!(services[0]["allowed_resources"].is_array());
     }
 
     #[test]
@@ -1181,7 +1181,6 @@ mod tests {
         let json = init::generate_policy(&["tasks".to_string()]);
         let services = json["services"].as_array().unwrap();
         assert_eq!(services[0]["name"], "tasks");
-        assert_eq!(services[0]["read_only"], true);
     }
 
     #[test]

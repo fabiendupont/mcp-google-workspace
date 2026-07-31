@@ -14,6 +14,7 @@ pub mod handler;
 pub mod helpers;
 pub mod http;
 pub mod image_gen;
+pub mod init;
 pub mod marp;
 pub mod meta;
 pub mod metrics;
