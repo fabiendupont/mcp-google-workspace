@@ -1,0 +1,45 @@
+name: docs-tabs
+description: "Create a doc, list tabs, read/outline/find using tab parameter, verify error on missing tab"
+prompt_file: prompts/test-docs-tabs.md
+timeout_seconds: 300
+test_folder_id: "1VkrXx3bhkQaLJEmnY_t5VxVmBETfsbY1"
+
+rubric:
+  - id: doc_created
+    criterion: "Google Doc 'Tabs Test Report' exists in the test folder"
+    check: "gws_drive_list the test folder, look for 'Tabs Test Report'"
+    weight: 1.0
+
+  - id: content_written
+    criterion: "Document has an Overview heading and paragraph about document tabs"
+    check: "gws_docs_read the document, verify Overview heading and 'tabs' in content"
+    weight: 1.0
+
+  - id: list_tabs_called
+    criterion: "Model called gws_docs_read with list_tabs=true and reported tab count and titles"
+    check: "Tool calls log shows gws_docs_read with list_tabs=true; model reported at least 1 tab"
+    weight: 1.0
+
+  - id: read_with_tab_param
+    criterion: "Model read content using the tab parameter set to the first tab's title"
+    check: "Tool calls log shows gws_docs_read with a tab parameter; model got back the document content"
+    weight: 1.0
+
+  - id: missing_tab_error
+    criterion: "Model reported an error when reading a nonexistent tab"
+    check: "Model tried tab='Nonexistent Tab' or similar and reported the error message listing available tabs"
+    weight: 1.0
+
+  - id: outline_with_tab
+    criterion: "Model called gws_docs_outline with the tab parameter"
+    check: "Tool calls log shows gws_docs_outline with a tab parameter"
+    weight: 0.5
+
+  - id: find_with_tab
+    criterion: "Model called gws_docs_find with text='tabs' and a tab parameter, reported indexes"
+    check: "Tool calls log shows gws_docs_find with tab parameter; model reported startIndex/endIndex"
+    weight: 0.5
+
+cleanup:
+  - action: trash
+    name_pattern: "Tabs Test Report"

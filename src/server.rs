@@ -584,6 +584,7 @@ async fn execute_generate_image(
             position,
             w,
             h,
+            None,
         )];
         reqs.push(
             json!({ "insertText": { "text": "\n", "endOfSegmentLocation": { "segmentId": "" } } }),

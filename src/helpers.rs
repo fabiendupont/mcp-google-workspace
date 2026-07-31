@@ -55,11 +55,23 @@ enum LocationField {
     Index(Value),
 }
 
-fn position_to_location_field(position: &Position) -> LocationField {
+fn position_to_location_field(position: &Position, tab_id: Option<&str>) -> LocationField {
     match position {
         Position::End => LocationField::EndOfSegment,
-        Position::Start => LocationField::Index(json!({ "index": 1 })),
-        Position::Index(i) => LocationField::Index(json!({ "index": i })),
+        Position::Start => {
+            let mut loc = json!({ "index": 1 });
+            if let Some(tid) = tab_id {
+                loc["tabId"] = json!(tid);
+            }
+            LocationField::Index(loc)
+        }
+        Position::Index(i) => {
+            let mut loc = json!({ "index": i });
+            if let Some(tid) = tab_id {
+                loc["tabId"] = json!(tid);
+            }
+            LocationField::Index(loc)
+        }
     }
 }
 
@@ -69,6 +81,205 @@ fn position_to_index(position: &Position) -> i32 {
         Position::Start => 1,
         Position::Index(i) => *i,
     }
+}
+
+pub struct DocContent {
+    pub doc: Value,
+    pub tab_id: Option<String>,
+}
+
+fn find_tab_by_title<'a>(tabs: &'a [Value], title: &str) -> Option<&'a Value> {
+    for tab in tabs {
+        let tab_title = tab
+            .pointer("/tabProperties/title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if tab_title == title {
+            return Some(tab);
+        }
+        if let Some(children) = tab.get("childTabs").and_then(|v| v.as_array()) {
+            if let Some(found) = find_tab_by_title(children, title) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+fn collect_tab_tree(tabs: &[Value], depth: usize) -> Vec<Value> {
+    let mut result = Vec::new();
+    for tab in tabs {
+        let title = tab
+            .pointer("/tabProperties/title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let tab_id = tab
+            .pointer("/tabProperties/tabId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        result.push(json!({
+            "title": title,
+            "tabId": tab_id,
+            "depth": depth,
+        }));
+        if let Some(children) = tab.get("childTabs").and_then(|v| v.as_array()) {
+            result.extend(collect_tab_tree(children, depth + 1));
+        }
+    }
+    result
+}
+
+fn normalize_tab_to_doc(tab: &Value) -> Value {
+    let doc_tab = tab.get("documentTab").cloned().unwrap_or(json!({}));
+    let mut doc = json!({});
+    for key in &[
+        "body",
+        "inlineObjects",
+        "positionedObjects",
+        "headers",
+        "footers",
+        "footnotes",
+        "documentStyle",
+        "namedStyles",
+        "namedRanges",
+        "lists",
+    ] {
+        if let Some(val) = doc_tab.get(key) {
+            doc[key] = val.clone();
+        }
+    }
+    doc
+}
+
+pub(crate) async fn fetch_doc_content(
+    doc_id: &str,
+    tab: Option<&str>,
+    policy: &Policy,
+    meta: &RequestMeta,
+    state: &mut ServerState,
+) -> Result<DocContent, GwsError> {
+    let doc_ref = state.get_doc("docs").await?;
+    let resource = tools::find_resource(&doc_ref.resources, "documents")
+        .ok_or_else(|| GwsError::Validation("documents resource not found".into()))?;
+    let get_method = resource
+        .methods
+        .get("get")
+        .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
+
+    let mut get_args = json!({"params": {"documentId": doc_id}});
+    if tab.is_some() {
+        get_args["params"]["includeTabsContent"] = json!(true);
+    }
+
+    let raw_doc = crate::execute::execute_tool(
+        &doc_ref,
+        get_method,
+        "documents",
+        "get",
+        &get_args,
+        "docs",
+        policy,
+        meta,
+        None,
+        None,
+        false,
+        &mut state.token_cache,
+    )
+    .await?;
+
+    if let Some(tab_title) = tab {
+        let tabs = raw_doc
+            .get("tabs")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| {
+                GwsError::Validation("Document has no tabs in response".into())
+            })?;
+        let matched = find_tab_by_title(tabs, tab_title).ok_or_else(|| {
+            let available: Vec<&str> = tabs
+                .iter()
+                .filter_map(|t| t.pointer("/tabProperties/title").and_then(|v| v.as_str()))
+                .collect();
+            GwsError::Validation(format!(
+                "Tab '{}' not found. Available tabs: {}",
+                tab_title,
+                available.join(", ")
+            ))
+        })?;
+        let tab_id = matched
+            .pointer("/tabProperties/tabId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let doc = normalize_tab_to_doc(matched);
+        Ok(DocContent {
+            doc,
+            tab_id: Some(tab_id),
+        })
+    } else {
+        Ok(DocContent {
+            doc: raw_doc,
+            tab_id: None,
+        })
+    }
+}
+
+pub(crate) async fn fetch_doc_tab_list(
+    doc_id: &str,
+    policy: &Policy,
+    meta: &RequestMeta,
+    state: &mut ServerState,
+) -> Result<Value, GwsError> {
+    let doc_ref = state.get_doc("docs").await?;
+    let resource = tools::find_resource(&doc_ref.resources, "documents")
+        .ok_or_else(|| GwsError::Validation("documents resource not found".into()))?;
+    let get_method = resource
+        .methods
+        .get("get")
+        .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
+
+    let get_args = json!({"params": {"documentId": doc_id, "includeTabsContent": true}});
+    let raw_doc = crate::execute::execute_tool(
+        &doc_ref,
+        get_method,
+        "documents",
+        "get",
+        &get_args,
+        "docs",
+        policy,
+        meta,
+        None,
+        None,
+        false,
+        &mut state.token_cache,
+    )
+    .await?;
+
+    let tabs = raw_doc
+        .get("tabs")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let tree = collect_tab_tree(&tabs, 0);
+    Ok(json!({
+        "tabs": tree,
+        "count": tree.len(),
+    }))
+}
+
+fn end_of_segment_location(tab_id: Option<&str>) -> Value {
+    let mut loc = json!({ "segmentId": "" });
+    if let Some(tid) = tab_id {
+        loc["tabId"] = json!(tid);
+    }
+    loc
+}
+
+pub fn make_index_location(index: i32, tab_id: Option<&str>) -> Value {
+    let mut loc = json!({ "index": index });
+    if let Some(tid) = tab_id {
+        loc["tabId"] = json!(tid);
+    }
+    loc
 }
 
 fn build_text_style_value(style: &TextStyle) -> (Value, String) {
@@ -130,17 +341,18 @@ pub fn build_insert_text_requests(
     position: Position,
     style: Option<TextStyle>,
     paragraph_style: Option<&str>,
+    tab_id: Option<&str>,
 ) -> Vec<Value> {
     let mut requests = Vec::new();
 
-    let loc_field = position_to_location_field(&position);
+    let loc_field = position_to_location_field(&position, tab_id);
     let insert_index = position_to_index(&position);
 
     requests.push(match &loc_field {
         LocationField::EndOfSegment => json!({
             "insertText": {
                 "text": text,
-                "endOfSegmentLocation": { "segmentId": "" }
+                "endOfSegmentLocation": end_of_segment_location(tab_id)
             }
         }),
         LocationField::Index(loc) => json!({
@@ -164,14 +376,18 @@ pub fn build_insert_text_requests(
             } else {
                 json!(insert_index)
             };
+            let mut range = json!({
+                "startIndex": start_index,
+                "endIndex": end_index
+            });
+            if let Some(tid) = tab_id {
+                range["tabId"] = json!(tid);
+            }
             requests.push(json!({
                 "updateTextStyle": {
                     "textStyle": style_val,
                     "fields": fields_mask,
-                    "range": {
-                        "startIndex": start_index,
-                        "endIndex": end_index
-                    }
+                    "range": range
                 }
             }));
         }
@@ -188,14 +404,18 @@ pub fn build_insert_text_requests(
         } else {
             json!(insert_index)
         };
+        let mut range = json!({
+            "startIndex": start_index,
+            "endIndex": end_index
+        });
+        if let Some(tid) = tab_id {
+            range["tabId"] = json!(tid);
+        }
         requests.push(json!({
             "updateParagraphStyle": {
                 "paragraphStyle": { "namedStyleType": named_style },
                 "fields": "namedStyleType",
-                "range": {
-                    "startIndex": start_index,
-                    "endIndex": end_index
-                }
+                "range": range
             }
         }));
     }
@@ -203,13 +423,18 @@ pub fn build_insert_text_requests(
     requests
 }
 
-pub fn build_insert_table_request(rows: u32, columns: u32, position: Position) -> Value {
-    match position_to_location_field(&position) {
+pub fn build_insert_table_request(
+    rows: u32,
+    columns: u32,
+    position: Position,
+    tab_id: Option<&str>,
+) -> Value {
+    match position_to_location_field(&position, tab_id) {
         LocationField::EndOfSegment => json!({
             "insertTable": {
                 "rows": rows,
                 "columns": columns,
-                "endOfSegmentLocation": { "segmentId": "" }
+                "endOfSegmentLocation": end_of_segment_location(tab_id)
             }
         }),
         LocationField::Index(loc) => json!({
@@ -227,12 +452,13 @@ pub fn build_insert_image_request(
     position: Position,
     width_pt: Option<f64>,
     height_pt: Option<f64>,
+    tab_id: Option<&str>,
 ) -> Value {
-    let mut req = match position_to_location_field(&position) {
+    let mut req = match position_to_location_field(&position, tab_id) {
         LocationField::EndOfSegment => json!({
             "insertInlineImage": {
                 "uri": image_url,
-                "endOfSegmentLocation": { "segmentId": "" }
+                "endOfSegmentLocation": end_of_segment_location(tab_id)
             }
         }),
         LocationField::Index(loc) => json!({
@@ -361,9 +587,13 @@ enum Block {
     },
 }
 
-pub fn markdown_to_batch_requests(markdown: &str, start_index: i32) -> Vec<Value> {
+pub fn markdown_to_batch_requests(
+    markdown: &str,
+    start_index: i32,
+    tab_id: Option<&str>,
+) -> Vec<Value> {
     let blocks = parse_markdown_to_blocks(markdown);
-    generate_requests_from_blocks(&blocks, start_index)
+    generate_requests_from_blocks(&blocks, start_index, tab_id)
 }
 
 fn parse_markdown_to_blocks(markdown: &str) -> Vec<Block> {
@@ -681,7 +911,11 @@ fn emit_text_style_request(style: &InlineStyle, base_index: i32) -> Option<Value
     }))
 }
 
-fn generate_requests_from_blocks(blocks: &[Block], start_index: i32) -> Vec<Value> {
+fn generate_requests_from_blocks(
+    blocks: &[Block],
+    start_index: i32,
+    tab_id: Option<&str>,
+) -> Vec<Value> {
     let mut requests: Vec<Value> = Vec::new();
     let mut current_index = start_index;
 
@@ -722,7 +956,7 @@ fn generate_requests_from_blocks(blocks: &[Block], start_index: i32) -> Vec<Valu
                 requests.push(json!({
                     "insertText": {
                         "text": text,
-                        "location": { "index": current_index }
+                        "location": make_index_location(current_index, tab_id)
                     }
                 }));
 
@@ -771,7 +1005,7 @@ fn generate_requests_from_blocks(blocks: &[Block], start_index: i32) -> Vec<Valu
                 requests.push(json!({
                     "insertText": {
                         "text": text,
-                        "location": { "index": current_index }
+                        "location": make_index_location(current_index, tab_id)
                     }
                 }));
 
@@ -823,15 +1057,11 @@ fn generate_requests_from_blocks(blocks: &[Block], start_index: i32) -> Vec<Valu
                     continue;
                 }
 
-                // Only emit insertTable — cell population happens in a
-                // separate batchUpdate after fetching the doc to get real
-                // cell indexes (Google Docs internal table structure can't
-                // be reliably pre-calculated).
                 requests.push(json!({
                     "insertTable": {
                         "rows": num_rows,
                         "columns": num_cols,
-                        "location": { "index": current_index },
+                        "location": make_index_location(current_index, tab_id),
                         "_tableData": {
                             "rows": rows,
                             "header": header
@@ -839,7 +1069,6 @@ fn generate_requests_from_blocks(blocks: &[Block], start_index: i32) -> Vec<Valu
                     }
                 }));
 
-                // Empty table: 1 (table) + N*(1 (row) + M*2 (cell + newline)) + 1 (trailing paragraph)
                 current_index += 2 + num_rows * (2 * num_cols + 1);
             }
             Block::Image { url } => {
@@ -853,7 +1082,7 @@ fn generate_requests_from_blocks(blocks: &[Block], start_index: i32) -> Vec<Valu
                 requests.push(json!({
                     "insertInlineImage": {
                         "uri": url,
-                        "location": { "index": current_index }
+                        "location": make_index_location(current_index, tab_id)
                     }
                 }));
                 current_index += 1;
@@ -870,7 +1099,7 @@ fn generate_requests_from_blocks(blocks: &[Block], start_index: i32) -> Vec<Valu
                 requests.push(json!({
                     "insertText": {
                         "text": rule_text,
-                        "location": { "index": current_index }
+                        "location": make_index_location(current_index, tab_id)
                     }
                 }));
                 current_index += 4;
@@ -887,7 +1116,7 @@ fn generate_requests_from_blocks(blocks: &[Block], start_index: i32) -> Vec<Valu
                 requests.push(json!({
                     "insertText": {
                         "text": text,
-                        "location": { "index": current_index }
+                        "location": make_index_location(current_index, tab_id)
                     }
                 }));
 
@@ -988,7 +1217,8 @@ pub fn insert_image_tool_schema() -> Value {
                     "description": "Character index (overrides position)"
                 },
                 "width_pt": { "type": "number", "description": "Width in points" },
-                "height_pt": { "type": "number", "description": "Height in points" }
+                "height_pt": { "type": "number", "description": "Height in points" },
+                "tab": { "type": "string", "description": "Tab title. Omit for default (first) tab." }
             },
             "required": ["document_id"]
         }
@@ -1028,7 +1258,8 @@ pub fn format_tool_schema() -> Value {
                 "alignment": {
                     "type": "string",
                     "enum": ["START", "CENTER", "END", "JUSTIFIED"]
-                }
+                },
+                "tab": { "type": "string", "description": "Tab title. Omit for default (first) tab." }
             },
             "required": ["document_id"]
         }
@@ -1203,6 +1434,7 @@ pub fn build_append_section_requests(
     body: Option<&str>,
     items: Option<&[String]>,
     bullet_preset: &str,
+    tab_id: Option<&str>,
 ) -> Vec<Value> {
     let mut requests = Vec::new();
     let named_style = format!("HEADING_{}", heading_level.clamp(1, 6));
@@ -1212,7 +1444,7 @@ pub fn build_append_section_requests(
         requests.push(json!({
             "insertText": {
                 "text": text,
-                "endOfSegmentLocation": { "segmentId": "" }
+                "endOfSegmentLocation": end_of_segment_location(tab_id)
             }
         }));
         requests.push(json!({
@@ -1233,7 +1465,7 @@ pub fn build_append_section_requests(
         requests.push(json!({
             "insertText": {
                 "text": text,
-                "endOfSegmentLocation": { "segmentId": "" }
+                "endOfSegmentLocation": end_of_segment_location(tab_id)
             }
         }));
     }
@@ -1245,7 +1477,7 @@ pub fn build_append_section_requests(
         requests.push(json!({
             "insertText": {
                 "text": bullet_text,
-                "endOfSegmentLocation": { "segmentId": "" }
+                "endOfSegmentLocation": end_of_segment_location(tab_id)
             }
         }));
         requests.push(json!({
@@ -1268,7 +1500,8 @@ pub fn outline_tool_schema() -> Value {
         "inputSchema": {
             "type": "object",
             "properties": {
-                "document_id": { "type": "string", "description": "Google Docs document ID" }
+                "document_id": { "type": "string", "description": "Google Docs document ID" },
+                "tab": { "type": "string", "description": "Tab title. Omit for default (first) tab." }
             },
             "required": ["document_id"]
         },
@@ -1311,7 +1544,8 @@ pub fn find_tool_schema() -> Value {
             "properties": {
                 "document_id": { "type": "string", "description": "Google Docs document ID" },
                 "text": { "type": "string", "description": "Exact substring to search for" },
-                "occurrence": { "type": "integer", "description": "Which occurrence (1-based)", "default": 1 }
+                "occurrence": { "type": "integer", "description": "Which occurrence (1-based)", "default": 1 },
+                "tab": { "type": "string", "description": "Tab title. Omit for default (first) tab." }
             },
             "required": ["document_id", "text"]
         },
@@ -1537,7 +1771,8 @@ pub fn insert_table_tool_schema() -> Value {
                     "type": "string",
                     "enum": ["end", "start"],
                     "default": "end"
-                }
+                },
+                "tab": { "type": "string", "description": "Tab title. Omit for default (first) tab." }
             },
             "required": ["document_id"]
         }
@@ -1561,7 +1796,8 @@ pub fn read_table_tool_schema() -> Value {
                     "type": "integer",
                     "description": "Which table (0-based)",
                     "default": 0
-                }
+                },
+                "tab": { "type": "string", "description": "Tab title. Omit for default (first) tab." }
             },
             "required": ["document_id"]
         },
@@ -1616,6 +1852,10 @@ pub fn docs_write_tool_schema() -> Value {
                     "enum": ["end", "start"],
                     "default": "end"
                 },
+                "tab": {
+                    "type": "string",
+                    "description": "Tab title to write to. Omit for default (first) tab."
+                },
                 "format": {
                     "type": "string",
                     "enum": ["markdown", "plain"],
@@ -1647,6 +1887,10 @@ pub fn docs_replace_section_tool_schema() -> Value {
                 "content": {
                     "type": "string",
                     "description": "New Markdown content (include the heading itself)"
+                },
+                "tab": {
+                    "type": "string",
+                    "description": "Tab title to target. Omit for default (first) tab."
                 }
             },
             "required": ["document_id", "section", "content"]
@@ -1658,7 +1902,7 @@ pub fn docs_read_tool_schema() -> Value {
     json!({
         "name": "gws_docs_read",
         "title": "Read Google Doc",
-        "description": "Read a document as Markdown. Use section= to read one section.",
+        "description": "Read a document as Markdown. Use tab= to read a specific tab, list_tabs=true to list all tabs.",
         "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true },
         "inputSchema": {
             "type": "object",
@@ -1670,6 +1914,14 @@ pub fn docs_read_tool_schema() -> Value {
                 "section": {
                     "type": "string",
                     "description": "Heading text — returns only that section's content."
+                },
+                "tab": {
+                    "type": "string",
+                    "description": "Tab title to read. Omit to read the default (first) tab."
+                },
+                "list_tabs": {
+                    "type": "boolean",
+                    "description": "Return the tab tree (title, tabId, depth) instead of content."
                 },
                 "format": {
                     "type": "string",
@@ -1782,29 +2034,9 @@ async fn execute_docs_read_table(
     meta: &RequestMeta,
     state: &mut ServerState,
 ) -> Result<Value, GwsError> {
-    let doc_ref = state.get_doc("docs").await?;
-    let resource = tools::find_resource(&doc_ref.resources, "documents")
-        .ok_or_else(|| GwsError::Validation("documents resource not found".into()))?;
-    let get_method = resource
-        .methods
-        .get("get")
-        .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
-    let get_args = json!({"params": {"documentId": doc_id}});
-    let doc_content = crate::execute::execute_tool(
-        &doc_ref,
-        get_method,
-        "documents",
-        "get",
-        &get_args,
-        "docs",
-        policy,
-        meta,
-        None,
-        None,
-        false,
-        &mut state.token_cache,
-    )
-    .await?;
+    let tab = arguments.get("tab").and_then(|v| v.as_str());
+    let dc = fetch_doc_content(doc_id, tab, policy, meta, state).await?;
+    let doc_content = dc.doc;
     let table_index = arguments
         .get("table_index")
         .and_then(|v| v.as_u64())
@@ -1825,29 +2057,23 @@ async fn execute_docs_read_block(
     meta: &RequestMeta,
     state: &mut ServerState,
 ) -> Result<Value, GwsError> {
-    let doc_ref = state.get_doc("docs").await?;
-    let resource = tools::find_resource(&doc_ref.resources, "documents")
-        .ok_or_else(|| GwsError::Validation("documents resource not found".into()))?;
-    let get_method = resource
-        .methods
-        .get("get")
-        .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
-    let get_args = json!({"params": {"documentId": doc_id}});
-    let doc_content = crate::execute::execute_tool(
-        &doc_ref,
-        get_method,
-        "documents",
-        "get",
-        &get_args,
-        "docs",
-        policy,
-        meta,
-        None,
-        None,
-        false,
-        &mut state.token_cache,
-    )
-    .await?;
+    if tool_name == "gws_docs_read"
+        && arguments
+            .get("list_tabs")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    {
+        let result = fetch_doc_tab_list(doc_id, policy, meta, state).await?;
+        return Ok(json!({
+            "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
+            "structuredContent": result,
+            "isError": false
+        }));
+    }
+
+    let tab = arguments.get("tab").and_then(|v| v.as_str());
+    let dc = fetch_doc_content(doc_id, tab, policy, meta, state).await?;
+    let doc_content = dc.doc;
 
     if tool_name == "gws_docs_find" {
         let needle = arguments
@@ -1949,31 +2175,10 @@ async fn execute_docs_insert_text(
             || arguments.get("background_color").is_some()
             || arguments.get("paragraph_style").is_some());
 
+    let tab = arguments.get("tab").and_then(|v| v.as_str());
     let end_index = if needs_end_index && !dry_run {
-        let doc_ref = state.get_doc("docs").await?;
-        let resource = tools::find_resource(&doc_ref.resources, "documents")
-            .ok_or_else(|| GwsError::Validation("documents resource not found".into()))?;
-        let get_method = resource
-            .methods
-            .get("get")
-            .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
-        let get_args = json!({"params": {"documentId": doc_id}});
-        let doc_content = crate::execute::execute_tool(
-            &doc_ref,
-            get_method,
-            "documents",
-            "get",
-            &get_args,
-            "docs",
-            policy,
-            meta,
-            None,
-            None,
-            false,
-            &mut state.token_cache,
-        )
-        .await?;
-        doc_content["body"]["content"]
+        let dc = fetch_doc_content(doc_id, tab, policy, meta, state).await?;
+        dc.doc["body"]["content"]
             .as_array()
             .and_then(|arr| arr.last())
             .and_then(|el| el["endIndex"].as_i64())
@@ -2000,6 +2205,7 @@ async fn execute_docs_insert_text(
                 Position::End,
                 if has_style { Some(style) } else { None },
                 para,
+                None,
             ));
         }
         all_requests
@@ -2028,6 +2234,7 @@ async fn execute_docs_insert_text(
             position,
             if has_style { Some(style) } else { None },
             para.as_deref(),
+            None,
         )
     };
 
@@ -2088,7 +2295,7 @@ async fn execute_docs_insert_table(
             + data_rows.as_ref().map(|r| r.len()).unwrap_or(0)) as u32;
 
         let position = crate::shared::parse_position(arguments);
-        let insert_req = build_insert_table_request(num_rows, num_cols, position);
+        let insert_req = build_insert_table_request(num_rows, num_cols, position, None);
 
         let doc_ref = state.get_doc("docs").await?;
         let resource = tools::find_resource(&doc_ref.resources, "documents")
@@ -2192,7 +2399,7 @@ async fn execute_docs_insert_table(
         .ok_or_else(|| GwsError::Validation("Missing 'columns' or 'headers'".into()))?
         as u32;
     let position = crate::shared::parse_position(arguments);
-    let requests = vec![build_insert_table_request(rows, columns, position)];
+    let requests = vec![build_insert_table_request(rows, columns, position, None)];
 
     docs_batch_update(
         doc_id,
@@ -2239,7 +2446,7 @@ async fn execute_docs_insert_image(
     let position = crate::shared::parse_position(arguments);
     let w = arguments.get("width_pt").and_then(|v| v.as_f64());
     let h = arguments.get("height_pt").and_then(|v| v.as_f64());
-    let mut requests = vec![build_insert_image_request(&uri, position, w, h)];
+    let mut requests = vec![build_insert_image_request(&uri, position, w, h, None)];
     requests.push(json!({
         "insertText": {
             "text": "\n",
@@ -2408,7 +2615,8 @@ async fn execute_docs_append_section(
         .get("bullet_preset")
         .and_then(|v| v.as_str())
         .unwrap_or("BULLET_DISC_CIRCLE_SQUARE");
-    let requests = build_append_section_requests(heading, level, body, items.as_deref(), preset);
+    let requests =
+        build_append_section_requests(heading, level, body, items.as_deref(), preset, None);
 
     docs_batch_update(
         doc_id,
@@ -2625,6 +2833,7 @@ pub(crate) async fn execute_docs_write(
         .map(|s| s.to_string());
     let section = arguments.get("section").and_then(|v| v.as_str());
     let template_id = arguments.get("template_id").and_then(|v| v.as_str());
+    let tab_title = arguments.get("tab").and_then(|v| v.as_str());
 
     // If document_id looks like a folder (title also provided), treat it as folder_id.
     let doc_id_arg = if let (Some(id), Some(_)) = (doc_id_arg, title) {
@@ -2806,30 +3015,11 @@ pub(crate) async fn execute_docs_write(
     };
 
     // Step C: handle section replacement
+    let mut resolved_tab_id: Option<String> = None;
     let (section_delete, insert_index) = if let Some(section_text) = section {
-        let docs_doc = state.get_doc("docs").await?;
-        let resource = tools::find_resource(&docs_doc.resources, "documents")
-            .ok_or_else(|| GwsError::Validation("documents resource not found".into()))?;
-        let get_method = resource
-            .methods
-            .get("get")
-            .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
-        let get_args = json!({"params": {"documentId": doc_id}});
-        let doc_content = crate::execute::execute_tool(
-            &docs_doc,
-            get_method,
-            "documents",
-            "get",
-            &get_args,
-            "docs",
-            policy,
-            meta,
-            None,
-            None,
-            false,
-            &mut state.token_cache,
-        )
-        .await?;
+        let dc = fetch_doc_content(&doc_id, tab_title, policy, meta, state).await?;
+        resolved_tab_id = dc.tab_id;
+        let doc_content = dc.doc;
 
         match find_section_range(&doc_content, section_text) {
             Some((start, end)) => (
@@ -2856,33 +3046,10 @@ pub(crate) async fn execute_docs_write(
             match arguments.get("position").and_then(|v| v.as_str()) {
                 Some("start") => 1,
                 _ => {
-                    // Fetch document to find end index
-                    let docs_doc = state.get_doc("docs").await?;
-                    let resource = tools::find_resource(&docs_doc.resources, "documents")
-                        .ok_or_else(|| {
-                            GwsError::Validation("documents resource not found".into())
-                        })?;
-                    let get_method = resource
-                        .methods
-                        .get("get")
-                        .ok_or_else(|| GwsError::Validation("get method not found".into()))?;
-                    let get_args = json!({"params": {"documentId": doc_id}});
-                    let doc_content = crate::execute::execute_tool(
-                        &docs_doc,
-                        get_method,
-                        "documents",
-                        "get",
-                        &get_args,
-                        "docs",
-                        policy,
-                        meta,
-                        None,
-                        None,
-                        false,
-                        &mut state.token_cache,
-                    )
-                    .await?;
-                    doc_content["body"]["content"]
+                    let dc =
+                        fetch_doc_content(&doc_id, tab_title, policy, meta, state).await?;
+                    resolved_tab_id = dc.tab_id;
+                    dc.doc["body"]["content"]
                         .as_array()
                         .and_then(|arr| arr.last())
                         .and_then(|el| el["endIndex"].as_i64())
@@ -2938,6 +3105,7 @@ pub(crate) async fn execute_docs_write(
         content,
         format,
         insert_index,
+        resolved_tab_id.as_deref(),
     ));
 
     // Split at table boundaries: insertTable changes the doc's index space,
@@ -3184,7 +3352,7 @@ mod tests {
 
     #[test]
     fn test_build_insert_text_simple() {
-        let requests = build_insert_text_requests("Hello", Position::End, None, None);
+        let requests = build_insert_text_requests("Hello", Position::End, None, None, None);
         assert_eq!(requests.len(), 1);
         let req = &requests[0];
         assert_eq!(req["insertText"]["text"], "Hello");
@@ -3202,6 +3370,7 @@ mod tests {
             Position::Index(1),
             Some(style),
             Some("HEADING_1"),
+            None,
         );
         assert_eq!(requests.len(), 3);
         assert!(requests[0].get("insertText").is_some());
@@ -3220,7 +3389,7 @@ mod tests {
 
     #[test]
     fn test_build_insert_table() {
-        let req = build_insert_table_request(3, 4, Position::End);
+        let req = build_insert_table_request(3, 4, Position::End, None);
         assert_eq!(req["insertTable"]["rows"], 3);
         assert_eq!(req["insertTable"]["columns"], 4);
         assert!(req["insertTable"]["endOfSegmentLocation"].is_object());
@@ -3233,6 +3402,7 @@ mod tests {
             Position::Index(5),
             Some(300.0),
             Some(200.0),
+            None,
         );
         assert_eq!(
             req["insertInlineImage"]["uri"],
@@ -3335,7 +3505,7 @@ mod tests {
 
     #[test]
     fn test_insert_text_at_start() {
-        let requests = build_insert_text_requests("Start", Position::Start, None, None);
+        let requests = build_insert_text_requests("Start", Position::Start, None, None, None);
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0]["insertText"]["location"]["index"], 1);
     }
@@ -3343,7 +3513,7 @@ mod tests {
     #[test]
     fn test_insert_image_no_size() {
         let req =
-            build_insert_image_request("https://example.com/img.png", Position::End, None, None);
+            build_insert_image_request("https://example.com/img.png", Position::End, None, None, None);
         assert!(req["insertInlineImage"].get("objectSize").is_none());
     }
 
@@ -3353,6 +3523,7 @@ mod tests {
             "https://example.com/img.png",
             Position::Start,
             Some(400.0),
+            None,
             None,
         );
         assert_eq!(
@@ -3403,7 +3574,7 @@ mod tests {
 
     #[test]
     fn test_markdown_heading() {
-        let requests = markdown_to_batch_requests("# Title\n", 1);
+        let requests = markdown_to_batch_requests("# Title\n", 1, None);
         assert!(requests.len() >= 2);
         assert_eq!(requests[0]["insertText"]["text"], "Title\n");
         assert_eq!(requests[0]["insertText"]["location"]["index"], 1);
@@ -3422,7 +3593,7 @@ mod tests {
 
     #[test]
     fn test_markdown_bold_italic() {
-        let requests = markdown_to_batch_requests("**bold** and *italic*\n", 1);
+        let requests = markdown_to_batch_requests("**bold** and *italic*\n", 1, None);
         assert!(!requests.is_empty());
 
         let styles: Vec<&Value> = requests
@@ -3444,7 +3615,7 @@ mod tests {
 
     #[test]
     fn test_markdown_list() {
-        let requests = markdown_to_batch_requests("- item1\n- item2\n", 1);
+        let requests = markdown_to_batch_requests("- item1\n- item2\n", 1, None);
         assert!(!requests.is_empty());
 
         let bullets: Vec<&Value> = requests
@@ -3460,7 +3631,7 @@ mod tests {
 
     #[test]
     fn test_markdown_link() {
-        let requests = markdown_to_batch_requests("[click here](https://example.com)\n", 1);
+        let requests = markdown_to_batch_requests("[click here](https://example.com)\n", 1, None);
         assert!(!requests.is_empty());
 
         let styles: Vec<&Value> = requests
@@ -3479,7 +3650,7 @@ mod tests {
 
     #[test]
     fn test_markdown_code() {
-        let requests = markdown_to_batch_requests("use `code` here\n", 1);
+        let requests = markdown_to_batch_requests("use `code` here\n", 1, None);
         assert!(!requests.is_empty());
 
         let styles: Vec<&Value> = requests
@@ -3498,7 +3669,7 @@ mod tests {
     fn test_markdown_mixed() {
         let md =
             "# Welcome\n\nThis is **bold** and *italic* text.\n\n- first\n- second\n\n> a quote\n";
-        let requests = markdown_to_batch_requests(md, 1);
+        let requests = markdown_to_batch_requests(md, 1, None);
         assert!(!requests.is_empty());
 
         assert!(requests[0].get("insertText").is_some());
@@ -3546,7 +3717,7 @@ mod tests {
 
     #[test]
     fn test_markdown_ordered_list() {
-        let requests = markdown_to_batch_requests("1. first\n2. second\n", 1);
+        let requests = markdown_to_batch_requests("1. first\n2. second\n", 1, None);
         let bullets: Vec<&Value> = requests
             .iter()
             .filter(|r| r.get("createParagraphBullets").is_some())
@@ -3560,7 +3731,7 @@ mod tests {
 
     #[test]
     fn test_markdown_horizontal_rule() {
-        let requests = markdown_to_batch_requests("---\n", 1);
+        let requests = markdown_to_batch_requests("---\n", 1, None);
         assert!(!requests.is_empty());
         let text = requests[0]["insertText"]["text"].as_str().unwrap();
         assert!(text.contains('\u{2014}'));
@@ -3568,7 +3739,7 @@ mod tests {
 
     #[test]
     fn test_markdown_image() {
-        let requests = markdown_to_batch_requests("![alt](https://example.com/img.png)\n", 1);
+        let requests = markdown_to_batch_requests("![alt](https://example.com/img.png)\n", 1, None);
         let imgs: Vec<&Value> = requests
             .iter()
             .filter(|r| r.get("insertInlineImage").is_some())
@@ -3582,7 +3753,7 @@ mod tests {
 
     #[test]
     fn test_markdown_start_index_offset() {
-        let requests = markdown_to_batch_requests("**bold**\n", 50);
+        let requests = markdown_to_batch_requests("**bold**\n", 50, None);
         assert_eq!(requests[0]["insertText"]["location"]["index"], 50);
 
         let style = requests
@@ -3595,7 +3766,7 @@ mod tests {
 
     #[test]
     fn test_markdown_strikethrough() {
-        let requests = markdown_to_batch_requests("~~removed~~\n", 1);
+        let requests = markdown_to_batch_requests("~~removed~~\n", 1, None);
         let styles: Vec<&Value> = requests
             .iter()
             .filter(|r| r.get("updateTextStyle").is_some())
@@ -3609,7 +3780,7 @@ mod tests {
 
     #[test]
     fn test_markdown_code_block() {
-        let requests = markdown_to_batch_requests("```\nlet x = 1;\n```\n", 1);
+        let requests = markdown_to_batch_requests("```\nlet x = 1;\n```\n", 1, None);
         let styles: Vec<&Value> = requests
             .iter()
             .filter(|r| r.get("updateTextStyle").is_some())
@@ -3623,14 +3794,14 @@ mod tests {
 
     #[test]
     fn test_markdown_empty() {
-        let requests = markdown_to_batch_requests("", 1);
+        let requests = markdown_to_batch_requests("", 1, None);
         assert!(requests.is_empty());
     }
 
     #[test]
     fn test_markdown_table() {
         let md = "| Name | Value |\n|------|-------|\n| Alpha | 100 |\n| Beta | 200 |\n";
-        let requests = markdown_to_batch_requests(md, 1);
+        let requests = markdown_to_batch_requests(md, 1, None);
         let tables: Vec<&Value> = requests
             .iter()
             .filter(|r| r.get("insertTable").is_some())
@@ -3643,7 +3814,7 @@ mod tests {
     #[test]
     fn test_markdown_table_no_cell_inserts() {
         let md = "| A | B |\n|---|---|\n| 1 | 2 |\n";
-        let requests = markdown_to_batch_requests(md, 1);
+        let requests = markdown_to_batch_requests(md, 1, None);
         for (i, r) in requests.iter().enumerate() {
             eprintln!("req[{i}]: {}", serde_json::to_string(r).unwrap());
         }
@@ -3661,7 +3832,7 @@ mod tests {
     #[test]
     fn test_markdown_table_with_text() {
         let md = "# Title\n\nSome text.\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\nMore text.\n";
-        let requests = markdown_to_batch_requests(md, 1);
+        let requests = markdown_to_batch_requests(md, 1, None);
         let has_insert = requests.iter().any(|r| r.get("insertText").is_some());
         let has_table = requests.iter().any(|r| r.get("insertTable").is_some());
         let has_heading = requests
@@ -3786,102 +3957,7 @@ mod tests {
         assert_eq!(tables[1]["rows"][0][0], "Only");
         assert_eq!(tables[1]["row_count"], 1);
     }
-}
-#[test]
-fn test_heading_level_known() {
-    assert_eq!(heading_level("HEADING_1"), Some(1));
-    assert_eq!(heading_level("HEADING_3"), Some(3));
-    assert_eq!(heading_level("HEADING_6"), Some(6));
-}
 
-#[test]
-fn test_heading_level_unknown() {
-    assert_eq!(heading_level("NORMAL_TEXT"), None);
-    assert_eq!(heading_level("TITLE"), None);
-}
-
-#[test]
-fn test_find_section_range_basic() {
-    let doc = json!({
-        "body": {
-            "content": [
-                { "startIndex": 1, "endIndex": 10, "paragraph": {
-                    "paragraphStyle": { "namedStyleType": "HEADING_1" },
-                    "elements": [{ "textRun": { "content": "Introduction\n" } }]
-                }},
-                { "startIndex": 10, "endIndex": 30, "paragraph": {
-                    "paragraphStyle": { "namedStyleType": "NORMAL_TEXT" },
-                    "elements": [{ "textRun": { "content": "Some body text\n" } }]
-                }},
-                { "startIndex": 30, "endIndex": 45, "paragraph": {
-                    "paragraphStyle": { "namedStyleType": "HEADING_1" },
-                    "elements": [{ "textRun": { "content": "Next Section\n" } }]
-                }}
-            ]
-        }
-    });
-    let range = find_section_range(&doc, "Introduction");
-    assert_eq!(range, Some((1, 30)));
-}
-
-#[test]
-fn test_find_section_range_to_end() {
-    let doc = json!({
-        "body": {
-            "content": [
-                { "startIndex": 1, "endIndex": 10, "paragraph": {
-                    "paragraphStyle": { "namedStyleType": "HEADING_2" },
-                    "elements": [{ "textRun": { "content": "Only Section\n" } }]
-                }},
-                { "startIndex": 10, "endIndex": 50, "paragraph": {
-                    "paragraphStyle": { "namedStyleType": "NORMAL_TEXT" },
-                    "elements": [{ "textRun": { "content": "Content goes here\n" } }]
-                }}
-            ]
-        }
-    });
-    let range = find_section_range(&doc, "Only Section");
-    assert_eq!(range, Some((1, 49)));
-}
-
-#[test]
-fn test_find_section_range_not_found() {
-    let doc = json!({
-        "body": {
-            "content": [
-                { "startIndex": 1, "endIndex": 10, "paragraph": {
-                    "paragraphStyle": { "namedStyleType": "HEADING_1" },
-                    "elements": [{ "textRun": { "content": "Existing\n" } }]
-                }}
-            ]
-        }
-    });
-    assert!(find_section_range(&doc, "Missing").is_none());
-}
-
-#[test]
-fn test_find_section_range_subsection_not_terminated_by_lower() {
-    let doc = json!({
-        "body": {
-            "content": [
-                { "startIndex": 1, "endIndex": 10, "paragraph": {
-                    "paragraphStyle": { "namedStyleType": "HEADING_2" },
-                    "elements": [{ "textRun": { "content": "Parent\n" } }]
-                }},
-                { "startIndex": 10, "endIndex": 20, "paragraph": {
-                    "paragraphStyle": { "namedStyleType": "HEADING_3" },
-                    "elements": [{ "textRun": { "content": "Child\n" } }]
-                }},
-                { "startIndex": 20, "endIndex": 30, "paragraph": {
-                    "paragraphStyle": { "namedStyleType": "HEADING_2" },
-                    "elements": [{ "textRun": { "content": "Sibling\n" } }]
-                }}
-            ]
-        }
-    });
-    // H2 "Parent" should include the H3 child, stopping at the next H2
-    let range = find_section_range(&doc, "Parent");
-    assert_eq!(range, Some((1, 20)));
     #[test]
     fn test_heading_level_known() {
         assert_eq!(heading_level("HEADING_1"), Some(1));
@@ -3974,8 +4050,167 @@ fn test_find_section_range_subsection_not_terminated_by_lower() {
                 ]
             }
         });
-        // H2 "Parent" should include the H3 child, stopping at the next H2
         let range = find_section_range(&doc, "Parent");
         assert_eq!(range, Some((1, 20)));
+    }
+
+    #[test]
+    fn test_find_tab_by_title_flat() {
+        let tabs = vec![
+            json!({ "tabProperties": { "title": "Tab A", "tabId": "t.1" }, "documentTab": {} }),
+            json!({ "tabProperties": { "title": "Tab B", "tabId": "t.2" }, "documentTab": {} }),
+        ];
+        let found = find_tab_by_title(&tabs, "Tab B");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap()["tabProperties"]["tabId"], "t.2");
+        assert!(find_tab_by_title(&tabs, "Missing").is_none());
+    }
+
+    #[test]
+    fn test_find_tab_by_title_nested() {
+        let tabs = vec![json!({
+            "tabProperties": { "title": "Parent", "tabId": "t.1" },
+            "documentTab": {},
+            "childTabs": [
+                {
+                    "tabProperties": { "title": "Child", "tabId": "t.1.1" },
+                    "documentTab": {},
+                    "childTabs": [{
+                        "tabProperties": { "title": "Grandchild", "tabId": "t.1.1.1" },
+                        "documentTab": {}
+                    }]
+                }
+            ]
+        })];
+        let found = find_tab_by_title(&tabs, "Grandchild");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap()["tabProperties"]["tabId"], "t.1.1.1");
+    }
+
+    #[test]
+    fn test_collect_tab_tree() {
+        let tabs = vec![
+            json!({
+                "tabProperties": { "title": "First", "tabId": "t.1" },
+                "childTabs": [{
+                    "tabProperties": { "title": "Nested", "tabId": "t.1.1" }
+                }]
+            }),
+            json!({ "tabProperties": { "title": "Second", "tabId": "t.2" } }),
+        ];
+        let tree = collect_tab_tree(&tabs, 0);
+        assert_eq!(tree.len(), 3);
+        assert_eq!(tree[0]["title"], "First");
+        assert_eq!(tree[0]["depth"], 0);
+        assert_eq!(tree[1]["title"], "Nested");
+        assert_eq!(tree[1]["depth"], 1);
+        assert_eq!(tree[2]["title"], "Second");
+        assert_eq!(tree[2]["depth"], 0);
+    }
+
+    #[test]
+    fn test_normalize_tab_to_doc() {
+        let tab = json!({
+            "tabProperties": { "title": "My Tab", "tabId": "t.1" },
+            "documentTab": {
+                "body": { "content": [{ "startIndex": 1, "endIndex": 5 }] },
+                "inlineObjects": { "obj1": {} },
+                "lists": {}
+            }
+        });
+        let doc = normalize_tab_to_doc(&tab);
+        assert!(doc["body"]["content"].is_array());
+        assert!(doc["inlineObjects"].is_object());
+        assert!(doc["lists"].is_object());
+        assert!(doc.get("tabProperties").is_none());
+    }
+
+    #[test]
+    fn test_make_index_location_without_tab() {
+        let loc = make_index_location(5, None);
+        assert_eq!(loc["index"], 5);
+        assert!(loc.get("tabId").is_none());
+    }
+
+    #[test]
+    fn test_make_index_location_with_tab() {
+        let loc = make_index_location(5, Some("t.2"));
+        assert_eq!(loc["index"], 5);
+        assert_eq!(loc["tabId"], "t.2");
+    }
+
+    #[test]
+    fn test_end_of_segment_location_without_tab() {
+        let loc = end_of_segment_location(None);
+        assert_eq!(loc["segmentId"], "");
+        assert!(loc.get("tabId").is_none());
+    }
+
+    #[test]
+    fn test_end_of_segment_location_with_tab() {
+        let loc = end_of_segment_location(Some("t.3"));
+        assert_eq!(loc["segmentId"], "");
+        assert_eq!(loc["tabId"], "t.3");
+    }
+
+    #[test]
+    fn test_insert_text_with_tab_id() {
+        let requests =
+            build_insert_text_requests("Hello", Position::End, None, None, Some("t.5"));
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]["insertText"]["endOfSegmentLocation"]["tabId"],
+            "t.5"
+        );
+    }
+
+    #[test]
+    fn test_insert_text_at_index_with_tab_id() {
+        let requests =
+            build_insert_text_requests("Hello", Position::Index(10), None, None, Some("t.5"));
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["insertText"]["location"]["tabId"], "t.5");
+        assert_eq!(requests[0]["insertText"]["location"]["index"], 10);
+    }
+
+    #[test]
+    fn test_insert_table_with_tab_id() {
+        let req = build_insert_table_request(2, 3, Position::Index(5), Some("t.7"));
+        assert_eq!(req["insertTable"]["location"]["tabId"], "t.7");
+        assert_eq!(req["insertTable"]["location"]["index"], 5);
+    }
+
+    #[test]
+    fn test_insert_image_with_tab_id() {
+        let req = build_insert_image_request(
+            "https://example.com/img.png",
+            Position::End,
+            None,
+            None,
+            Some("t.9"),
+        );
+        assert_eq!(
+            req["insertInlineImage"]["endOfSegmentLocation"]["tabId"],
+            "t.9"
+        );
+    }
+
+    #[test]
+    fn test_markdown_requests_with_tab_id() {
+        let requests = markdown_to_batch_requests("Hello\n", 1, Some("t.4"));
+        assert!(!requests.is_empty());
+        assert_eq!(requests[0]["insertText"]["location"]["tabId"], "t.4");
+    }
+
+    #[test]
+    fn test_append_section_with_tab_id() {
+        let requests =
+            build_append_section_requests(Some("Title"), 1, Some("Body\n"), None, "BULLET_DISC_CIRCLE_SQUARE", Some("t.6"));
+        let has_tab = requests.iter().any(|r| {
+            r.pointer("/insertText/endOfSegmentLocation/tabId")
+                .and_then(|v| v.as_str())
+                == Some("t.6")
+        });
+        assert!(has_tab);
     }
 }

@@ -9,7 +9,7 @@ MCP_PORT=3100
 NAVRA_PORT=9315
 
 ALL_MODELS="gemma4:e4b gemma4:26b qwen3:8b qwen3.6:35b-a3b claude-sonnet-4-5@20250929"
-ALL_SCENARIOS="drive-workflow docs-workflow docs-full full-e2e sheets-advanced slides-workflow slides-template"
+ALL_SCENARIOS="drive-workflow docs-workflow docs-full docs-tabs full-e2e sheets-advanced slides-workflow slides-template"
 
 # --- Parse args ---
 MODELS=""
@@ -121,6 +121,7 @@ prompt_file() {
         drive-workflow) echo "$PROJECT_DIR/prompts/test-drive-workflow.md" ;;
         docs-workflow)  echo "$PROJECT_DIR/prompts/test-docs-workflow.md" ;;
         docs-full)      echo "$PROJECT_DIR/prompts/test-docs-full.md" ;;
+        docs-tabs)      echo "$PROJECT_DIR/prompts/test-docs-tabs.md" ;;
         full-e2e)       echo "$PROJECT_DIR/prompts/test-e2e.md" ;;
         sheets-advanced) echo "$PROJECT_DIR/prompts/test-sheets-advanced.md" ;;
         slides-workflow) echo "$PROJECT_DIR/prompts/test-slides-workflow.md" ;;
@@ -139,6 +140,7 @@ mcp_prompt_for_scenario() {
         drive-workflow)  echo "" ;;
         docs-workflow)   echo "google-workspace:create-document" ;;
         docs-full)       echo "google-workspace:create-document" ;;
+        docs-tabs)       echo "google-workspace:create-document" ;;
         full-e2e)        echo "google-workspace:create-document" ;;
         sheets-advanced) echo "google-workspace:work-with-spreadsheet" ;;
         slides-workflow) echo "" ;;
@@ -156,7 +158,7 @@ clean_test_folder() {
         gws drive files update --params "{\"fileId\":\"$did\"}" --json '{"trashed":true}' >/dev/null 2>&1 || true
     fi
     # Also clean stray test files
-    for pattern in "Drive Test Output" "AI Infrastructure Report" "Quarterly Review" "Sales Tracker" "Template Test"; do
+    for pattern in "Drive Test Output" "AI Infrastructure Report" "Quarterly Review" "Sales Tracker" "Template Test" "Tabs Test Report"; do
         local fid
         fid=$(gws drive files list --params "{\"q\": \"name = '$pattern' and '$GWS_TEST_FOLDER_ID' in parents and trashed = false\", \"fields\": \"files(id)\"}" 2>/dev/null \
             | python3 -c "import sys,json; f=json.loads(sys.stdin.read())['files']; print(f[0]['id'] if f else '')" 2>/dev/null || true)

@@ -61,6 +61,13 @@ marp.rs           — Marp Markdown to Google Slides conversion
   and `ToolListChangedNotification` is sent. `--eager-tools` flag loads all at startup.
 - **No generic service tools**: Services with helpers (drive, docs, sheets, slides, gmail, calendar)
   suppress their generic tool. Models use helpers only — no ambiguity.
+- **Document tabs**: All Docs tools accept an optional `tab` parameter (tab title).
+  When set, `includeTabsContent=true` is added to the `documents.get` call, the
+  matching tab is resolved by title (recursive child traversal), and its
+  `documentTab` body is normalized to the top-level `body.content` shape so all
+  downstream parsers work unchanged. Write operations inject `tabId` into every
+  Location and Range object in the batchUpdate payload. `gws_docs_read` also
+  supports `list_tabs=true` to return the tab tree (title, tabId, depth).
 - **Create-on-write**: `gws_docs_write` and `gws_sheets_write` create new files
   when `title` is provided instead of `document_id`/`spreadsheet_id`. Same pattern
   for both services.

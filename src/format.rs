@@ -19,10 +19,13 @@ pub fn content_to_batch_requests(
     content: &str,
     format: ContentFormat,
     start_index: i32,
+    tab_id: Option<&str>,
 ) -> Vec<Value> {
     match format {
-        ContentFormat::Markdown => helpers::markdown_to_batch_requests(content, start_index),
-        ContentFormat::Plain => plain_to_batch_requests(content, start_index),
+        ContentFormat::Markdown => {
+            helpers::markdown_to_batch_requests(content, start_index, tab_id)
+        }
+        ContentFormat::Plain => plain_to_batch_requests(content, start_index, tab_id),
     }
 }
 
@@ -33,7 +36,7 @@ pub fn doc_to_format(doc: &Value, format: ContentFormat) -> String {
     }
 }
 
-fn plain_to_batch_requests(content: &str, start_index: i32) -> Vec<Value> {
+fn plain_to_batch_requests(content: &str, start_index: i32, tab_id: Option<&str>) -> Vec<Value> {
     let mut requests = Vec::new();
     let mut offset = start_index;
 
@@ -44,7 +47,7 @@ fn plain_to_batch_requests(content: &str, start_index: i32) -> Vec<Value> {
             requests.push(json!({
                 "insertText": {
                     "text": text,
-                    "location": { "index": offset }
+                    "location": helpers::make_index_location(offset, tab_id)
                 }
             }));
             offset += 1;
@@ -57,7 +60,7 @@ fn plain_to_batch_requests(content: &str, start_index: i32) -> Vec<Value> {
         requests.push(json!({
             "insertText": {
                 "text": text,
-                "location": { "index": offset }
+                "location": helpers::make_index_location(offset, tab_id)
             }
         }));
 
@@ -255,9 +258,8 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn test_plain_to_batch_requests() {
-        let reqs = plain_to_batch_requests("# Title\nBody text\n", 1);
+        let reqs = plain_to_batch_requests("# Title\nBody text\n", 1, None);
         assert!(reqs.len() >= 3);
         assert_eq!(reqs[0]["insertText"]["text"], "Title\n");
         let has_title_style = reqs.iter().any(|r| {

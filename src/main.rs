@@ -982,6 +982,10 @@ mod tests {
 
     #[test]
     fn test_resolve_no_source_errors() {
+        let tmp = std::env::temp_dir().join("gws_test_no_policy");
+        let _ = std::fs::create_dir_all(&tmp);
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
         let parsed = ParsedArgs {
             policy_path: None,
             services_str: None,
@@ -992,7 +996,10 @@ mod tests {
             audit_log: None,
             prompts_dir: None,
         };
-        assert!(resolve_config(parsed).is_err());
+        let result = resolve_config(parsed);
+        std::env::set_current_dir(prev).unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(result.is_err());
     }
 
     #[test]
