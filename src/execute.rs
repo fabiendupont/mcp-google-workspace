@@ -401,10 +401,15 @@ pub async fn execute_tool(
         return Ok(dry);
     }
 
-    let token = crate::auth::get_token(
+    let subject = meta
+        .user_email
+        .as_deref()
+        .or(policy.delegate_subject.as_deref());
+    let token = crate::auth::get_token_as(
         &scopes,
         policy.credentials_file.as_deref(),
         Some(token_cache),
+        subject,
     )
     .await
     .map_err(|e| GwsError::Auth(format!("Authentication failed: {e}")))?;
@@ -991,10 +996,15 @@ pub(crate) async fn initiate_resumable_upload(
     }
 
     let scopes: Vec<&str> = select_scope(&method.scopes).into_iter().collect();
-    let token = crate::auth::get_token(
+    let subject = meta
+        .user_email
+        .as_deref()
+        .or(policy.delegate_subject.as_deref());
+    let token = crate::auth::get_token_as(
         &scopes,
         policy.credentials_file.as_deref(),
         Some(token_cache),
+        subject,
     )
     .await
     .map_err(|e| GwsError::Auth(format!("Authentication failed: {e}")))?;

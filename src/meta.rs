@@ -3,6 +3,7 @@ pub struct RequestMeta {
     pub trace_parent: Option<String>,
     pub trace_state: Option<String>,
     pub baggage: Option<String>,
+    pub user_email: Option<String>,
 }
 
 impl RequestMeta {
@@ -21,6 +22,11 @@ impl RequestMeta {
             baggage: meta
                 .0
                 .get("baggage")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            user_email: meta
+                .0
+                .get("user_email")
                 .and_then(|v| v.as_str())
                 .map(String::from),
         }

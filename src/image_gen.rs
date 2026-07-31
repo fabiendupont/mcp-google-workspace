@@ -128,10 +128,11 @@ pub async fn generate_image(
     if let Some(ref key) = api_key {
         req = req.header("x-goog-api-key", key);
     } else {
-        let token = crate::auth::get_token(
+        let token = crate::auth::get_token_as(
             &["https://www.googleapis.com/auth/generative-language"],
             credentials_file,
             Some(token_cache),
+            None,
         )
         .await
         .map_err(|_| {

@@ -67,22 +67,34 @@ pub async fn get_token(
     credentials_file: Option<&str>,
     cache: Option<&mut Option<TokenCache>>,
 ) -> anyhow::Result<String> {
+    get_token_as(scopes, credentials_file, cache, None).await
+}
+
+pub async fn get_token_as(
+    scopes: &[&str],
+    credentials_file: Option<&str>,
+    cache: Option<&mut Option<TokenCache>>,
+    subject: Option<&str>,
+) -> anyhow::Result<String> {
     if let Ok(token) = std::env::var("GOOGLE_WORKSPACE_CLI_TOKEN")
         && !token.is_empty()
     {
         return Ok(token);
     }
 
-    if let Some(&mut Some(ref c)) = cache
+    if subject.is_none()
+        && let Some(&mut Some(ref c)) = cache
         && c.is_valid()
     {
         return Ok(c.token.clone());
     }
 
     let creds = load_credentials(credentials_file).await?;
-    let token = get_token_inner(scopes, creds).await?;
+    let token = get_token_inner(scopes, creds, subject).await?;
 
-    if let Some(slot) = cache {
+    if subject.is_none()
+        && let Some(slot) = cache
+    {
         *slot = Some(TokenCache {
             token: token.clone(),
             expires_at: Instant::now() + std::time::Duration::from_secs(3500),
@@ -175,9 +187,20 @@ async fn try_gws_export() -> Option<Credential> {
     }
 }
 
-async fn get_token_inner(scopes: &[&str], creds: Credential) -> anyhow::Result<String> {
+async fn get_token_inner(
+    scopes: &[&str],
+    creds: Credential,
+    subject: Option<&str>,
+) -> anyhow::Result<String> {
     match creds {
         Credential::AuthorizedUser(secret) => {
+            if subject.is_some() {
+                anyhow::bail!(
+                    "Domain-wide delegation requires a service account credential. \
+                     Current credential is an authorized user (OAuth2). \
+                     Fix: set credentials_file to a service account key with domain-wide delegation enabled."
+                );
+            }
             let auth = yup_oauth2::AuthorizedUserAuthenticator::builder(secret)
                 .build()
                 .await
@@ -192,7 +215,12 @@ async fn get_token_inner(scopes: &[&str], creds: Credential) -> anyhow::Result<S
                 .to_string())
         }
         Credential::ServiceAccount(key) => {
-            let auth = yup_oauth2::ServiceAccountAuthenticator::builder(key)
+            let mut builder = yup_oauth2::ServiceAccountAuthenticator::builder(key);
+            if let Some(email) = subject {
+                tracing::info!(subject = email, "Using domain-wide delegation");
+                builder = builder.subject(email.to_string());
+            }
+            let auth = builder
                 .build()
                 .await
                 .context("Failed to build service account authenticator")?;

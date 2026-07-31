@@ -42,10 +42,11 @@ pub async fn watch_resource(
     );
 
     let scopes = &["https://www.googleapis.com/auth/drive.readonly"];
-    let token = crate::auth::get_token(
+    let token = crate::auth::get_token_as(
         scopes,
         policy.credentials_file.as_deref(),
         Some(token_cache),
+        policy.delegate_subject.as_deref(),
     )
     .await
     .map_err(|e| GwsError::Auth(format!("Authentication failed: {e}")))?;
@@ -94,10 +95,11 @@ pub async fn stop_watch(
     policy: &crate::policy::Policy,
 ) -> Result<(), GwsError> {
     let scopes = &["https://www.googleapis.com/auth/drive.readonly"];
-    let token = crate::auth::get_token(
+    let token = crate::auth::get_token_as(
         scopes,
         policy.credentials_file.as_deref(),
         Some(token_cache),
+        policy.delegate_subject.as_deref(),
     )
     .await
     .map_err(|e| GwsError::Auth(format!("Authentication failed: {e}")))?;

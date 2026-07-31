@@ -73,6 +73,8 @@ pub struct ServerPolicy {
     pub credentials_file: Option<String>,
     #[serde(default)]
     pub project_id: Option<String>,
+    #[serde(default)]
+    pub delegate_subject: Option<String>,
 }
 
 impl Default for ServerPolicy {
@@ -85,6 +87,7 @@ impl Default for ServerPolicy {
             allowed_origins: Vec::new(),
             credentials_file: None,
             project_id: None,
+            delegate_subject: None,
         }
     }
 }
@@ -117,6 +120,7 @@ pub struct Policy {
     pub allowed_origins: Vec<String>,
     pub credentials_file: Option<String>,
     pub project_id: Option<String>,
+    pub delegate_subject: Option<String>,
     pub compact_schemas: bool,
     services: HashMap<String, ServicePolicy>,
     templates: Vec<TemplateEntry>,
@@ -195,6 +199,7 @@ impl Policy {
             allowed_origins: file.server.allowed_origins,
             credentials_file: file.server.credentials_file,
             project_id: file.server.project_id,
+            delegate_subject: file.server.delegate_subject,
             compact_schemas: false,
             services,
             templates: file.templates,
