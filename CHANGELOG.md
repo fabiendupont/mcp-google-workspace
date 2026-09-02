@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.8.2] - 2026-09-02
+
+### Added
+- **Policy templates**: `content-writer` (Drive/Docs/Slides/Sheets RW, Gmail draft-only) and `it-admin` (all services, most read-only, Calendar RW)
+- **Integration tests**: 54 tests covering policy enforcement, template round-trips, origin security, and policy.example.json validation
+
+### Fixed
+- **IPv6 origin matching**: `http://[::1]:3000` now correctly matches the loopback allowlist
+- **Doc/code drift**: architecture.md module map aligned with actual source, TOML→JSON references corrected, README CLI syntax updated to subcommand form
+
+### Changed
+- **rmcp 2.2 → 3.2**: Migrated to TaskManager API, updated return types (CallToolResponse, ReadResourceResponse, GetPromptResponse), added SEP-2322 result_type fields
+- **Dependencies**: base64 0.23.1, clap 4.6.6, tower-http 0.7.1, h2 0.4.19 (RUSTSEC-2026-0258)
+
 ## [0.1.0] - 2026-06-12
 
 ### Added
