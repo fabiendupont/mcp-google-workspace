@@ -7,24 +7,28 @@ pub struct RequestMeta {
 }
 
 impl RequestMeta {
-    pub fn from_rmcp_meta(meta: &rmcp::model::Meta) -> Self {
+    pub fn from_rmcp_meta(meta: &rmcp::model::RequestMetaObject) -> Self {
         Self {
             trace_parent: meta
+                .0
                 .0
                 .get("traceparent")
                 .and_then(|v| v.as_str())
                 .map(String::from),
             trace_state: meta
                 .0
+                .0
                 .get("tracestate")
                 .and_then(|v| v.as_str())
                 .map(String::from),
             baggage: meta
                 .0
+                .0
                 .get("baggage")
                 .and_then(|v| v.as_str())
                 .map(String::from),
             user_email: meta
+                .0
                 .0
                 .get("user_email")
                 .and_then(|v| v.as_str())
@@ -52,7 +56,7 @@ mod tests {
         map.insert("traceparent".to_string(), json!("00-abc123-def456-01"));
         map.insert("tracestate".to_string(), json!("vendor=value"));
         map.insert("baggage".to_string(), json!("userId=alice"));
-        let meta = rmcp::model::Meta(map);
+        let meta = rmcp::model::RequestMetaObject(rmcp::model::MetaObject(map));
 
         let rm = RequestMeta::from_rmcp_meta(&meta);
         assert_eq!(rm.trace_parent.as_deref(), Some("00-abc123-def456-01"));
@@ -62,7 +66,7 @@ mod tests {
 
     #[test]
     fn test_from_rmcp_meta_empty() {
-        let meta = rmcp::model::Meta::default();
+        let meta = rmcp::model::RequestMetaObject::default();
         let rm = RequestMeta::from_rmcp_meta(&meta);
         assert!(rm.trace_parent.is_none());
     }

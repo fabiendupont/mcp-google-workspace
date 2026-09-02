@@ -2,9 +2,7 @@ use std::sync::Arc;
 
 use rmcp::model::*;
 use rmcp::service::RequestContext;
-use rmcp::task_manager::{
-    OperationDescriptor, OperationMessage, OperationProcessor, ToolCallTaskResult,
-};
+use rmcp::task_manager::TaskManager;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock};
@@ -15,7 +13,7 @@ use crate::shared::ServerState;
 pub struct GwsHandler {
     pub(crate) state: Arc<Mutex<ServerState>>,
     pub(crate) policy: Arc<RwLock<Policy>>,
-    pub(crate) processor: Arc<Mutex<OperationProcessor>>,
+    pub(crate) task_manager: TaskManager,
 }
 
 impl GwsHandler {
@@ -32,7 +30,7 @@ impl GwsHandler {
         Self {
             state: Arc::new(Mutex::new(state)),
             policy: Arc::new(RwLock::new(policy)),
-            processor: Arc::new(Mutex::new(OperationProcessor::new())),
+            task_manager: TaskManager::new(),
         }
     }
 
@@ -40,7 +38,7 @@ impl GwsHandler {
         Self {
             state,
             policy,
-            processor: Arc::new(Mutex::new(OperationProcessor::new())),
+            task_manager: TaskManager::new(),
         }
     }
 }
@@ -85,8 +83,11 @@ impl ServerHandler for GwsHandler {
             }
             let tools = st.tools.as_ref().unwrap().clone();
             Ok(ListToolsResult {
+                result_type: Some(ResultType::COMPLETE),
                 meta: None,
                 next_cursor: None,
+                ttl_ms: None,
+                cache_scope: None,
                 tools,
             })
         }
@@ -96,7 +97,7 @@ impl ServerHandler for GwsHandler {
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<CallToolResult, McpError>> + Send + '_ {
+    ) -> impl std::future::Future<Output = Result<CallToolResponse, McpError>> + Send + '_ {
         let peer = context.peer.clone();
         let progress_token = context.meta.get_progress_token();
         let request_meta = crate::meta::RequestMeta::from_rmcp_meta(&context.meta);
@@ -160,13 +161,14 @@ impl ServerHandler for GwsHandler {
                     } else {
                         tracing::info!(tool = %tool_name, duration_ms = start.elapsed().as_millis() as u64, "Tool ok");
                     }
-                    Ok(value_to_call_tool_result(result.unwrap()))
+                    Ok(value_to_call_tool_result(result.unwrap()).into())
                 }
                 Err(e) => {
                     tracing::warn!(tool = %tool_name, error = %e, duration_ms = start.elapsed().as_millis() as u64, "Tool failed");
                     Ok(CallToolResult::error(vec![ContentBlock::text(
                         e.to_string(),
-                    )]))
+                    )])
+                    .into())
                 }
             }
         }
@@ -217,7 +219,7 @@ impl ServerHandler for GwsHandler {
         &self,
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<ReadResourceResult, McpError>> + Send + '_ {
+    ) -> impl std::future::Future<Output = Result<ReadResourceResponse, McpError>> + Send + '_ {
         async move {
             let parsed = crate::resources::parse_gws_uri(&request.uri).ok_or_else(|| {
                 McpError::invalid_params(
@@ -354,7 +356,7 @@ impl ServerHandler for GwsHandler {
             let text = serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
             let contents = rmcp::model::ResourceContents::text(&text, &request.uri)
                 .with_mime_type("application/json");
-            Ok(ReadResourceResult::new(vec![contents]))
+            Ok(ReadResourceResult::new(vec![contents]).into())
         }
     }
 
@@ -494,8 +496,11 @@ impl ServerHandler for GwsHandler {
                 })
                 .collect();
             Ok(ListPromptsResult {
+                result_type: Some(ResultType::COMPLETE),
                 meta: None,
                 next_cursor: None,
+                ttl_ms: None,
+                cache_scope: None,
                 prompts,
             })
         }
@@ -505,7 +510,7 @@ impl ServerHandler for GwsHandler {
         &self,
         request: GetPromptRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<GetPromptResult, McpError>> + Send + '_ {
+    ) -> impl std::future::Future<Output = Result<GetPromptResponse, McpError>> + Send + '_ {
         async move {
             let st = self.state.lock().await;
             let args_value = match &request.arguments {
@@ -532,160 +537,18 @@ impl ServerHandler for GwsHandler {
             if let Some(desc) = description {
                 r = r.with_description(desc);
             }
-            Ok(r)
+            Ok(r.into())
         }
     }
 
-    fn enqueue_task(
-        &self,
-        request: CallToolRequestParams,
-        context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<CreateTaskResult, McpError>> + Send + '_ {
-        let task_id = context.id.to_string();
-        let processor = self.processor.clone();
-        async move {
-            let now = rmcp::task_manager::current_timestamp();
-            let descriptor = OperationDescriptor::new(&task_id, request.name.to_string());
-
-            let state = self.state.clone();
-            let policy = self.policy.clone();
-            let peer = context.peer.clone();
-            let progress_token = context.meta.get_progress_token();
-            let request_meta = crate::meta::RequestMeta::from_rmcp_meta(&context.meta);
-            let tid = task_id.clone();
-
-            let future = Box::pin(async move {
-                let tool_name = request.name.to_string();
-                let arguments = match request.arguments {
-                    Some(map) => Value::Object(map),
-                    None => json!({}),
-                };
-                let params = json!({ "name": tool_name, "arguments": arguments });
-                let policy = policy.read().await;
-
-                let result = crate::server::handle_tool_call_concurrent(
-                    &params,
-                    &request_meta,
-                    &policy,
-                    &state,
-                    Some(&peer),
-                    progress_token.as_ref(),
-                )
-                .await;
-
-                let call_result = match result {
-                    Ok(value) => Ok(value_to_call_tool_result(value)),
-                    Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(
-                        e.to_string(),
-                    )])),
-                };
-
-                Ok(Box::new(ToolCallTaskResult::new(tid, call_result))
-                    as Box<dyn rmcp::task_manager::OperationResultTransport>)
-            });
-
-            let message = OperationMessage::new(descriptor, future);
-            processor
-                .lock()
-                .await
-                .submit_operation(message)
-                .map_err(|e| {
-                    McpError::internal_error(format!("Failed to enqueue task: {e}"), None)
-                })?;
-
-            let task = rmcp::model::Task::new(task_id, TaskStatus::Working, now.clone(), now)
-                .with_poll_interval(2000);
-
-            Ok(CreateTaskResult::new(task))
-        }
-    }
-
-    fn list_tasks(
-        &self,
-        _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<ListTasksResult, McpError>> + Send + '_ {
-        async move {
-            let mut proc = self.processor.lock().await;
-            let running = proc.list_running();
-            let now = rmcp::task_manager::current_timestamp();
-            let tasks: Vec<rmcp::model::Task> = running
-                .into_iter()
-                .map(|id| rmcp::model::Task::new(id, TaskStatus::Working, now.clone(), now.clone()))
-                .collect();
-            Ok(ListTasksResult::new(tasks))
-        }
-    }
-
-    fn get_task_info(
+    fn get_task(
         &self,
         request: GetTaskParams,
         _context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<GetTaskResult, McpError>> + Send + '_ {
         async move {
-            let mut proc = self.processor.lock().await;
-            let now = rmcp::task_manager::current_timestamp();
-
-            for result in proc.peek_completed() {
-                if result.descriptor.operation_id == request.task_id {
-                    let status = if result.result.is_ok() {
-                        TaskStatus::Completed
-                    } else {
-                        TaskStatus::Failed
-                    };
-                    let task = rmcp::model::Task::new(request.task_id, status, now.clone(), now);
-                    return Ok(GetTaskResult::new(task));
-                }
-            }
-
-            if proc.list_running().contains(&request.task_id) {
-                let task =
-                    rmcp::model::Task::new(request.task_id, TaskStatus::Working, now.clone(), now);
-                return Ok(GetTaskResult::new(task));
-            }
-
-            Err(McpError::invalid_params(
-                format!("Task '{}' not found", request.task_id),
-                None,
-            ))
-        }
-    }
-
-    fn get_task_result(
-        &self,
-        request: GetTaskPayloadParams,
-        _context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<GetTaskPayloadResult, McpError>> + Send + '_ {
-        async move {
-            loop {
-                let mut proc = self.processor.lock().await;
-                if let Some(result) = proc.take_completed_result(&request.task_id) {
-                    match result.result {
-                        Ok(boxed) => {
-                            let any = boxed.as_any();
-                            if let Some(tcr) = any.downcast_ref::<ToolCallTaskResult>() {
-                                let value = match &tcr.result {
-                                    Ok(ctr) => serde_json::to_value(ctr).unwrap_or(json!({})),
-                                    Err(e) => json!({"error": e.message}),
-                                };
-                                return Ok(GetTaskPayloadResult::new(value));
-                            }
-                            return Err(McpError::internal_error(
-                                "Unexpected task result type",
-                                None,
-                            ));
-                        }
-                        Err(e) => {
-                            return Err(McpError::internal_error(
-                                format!("Task failed: {e}"),
-                                None,
-                            ));
-                        }
-                    }
-                }
-                drop(proc);
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
+            let detailed = self.task_manager.get_task(&request.task_id)?;
+            Ok(GetTaskResult::new(detailed))
         }
     }
 
@@ -693,25 +556,8 @@ impl ServerHandler for GwsHandler {
         &self,
         request: CancelTaskParams,
         _context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<CancelTaskResult, McpError>> + Send + '_ {
-        async move {
-            let mut proc = self.processor.lock().await;
-            let now = rmcp::task_manager::current_timestamp();
-            if proc.cancel_task(&request.task_id) {
-                let task = rmcp::model::Task::new(
-                    request.task_id,
-                    TaskStatus::Cancelled,
-                    now.clone(),
-                    now,
-                );
-                Ok(CancelTaskResult::new(task))
-            } else {
-                Err(McpError::invalid_params(
-                    format!("Task '{}' not found or already completed", request.task_id),
-                    None,
-                ))
-            }
-        }
+    ) -> impl std::future::Future<Output = Result<(), McpError>> + Send + '_ {
+        async move { self.task_manager.cancel_task(&request.task_id) }
     }
 }
 
