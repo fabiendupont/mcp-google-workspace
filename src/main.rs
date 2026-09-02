@@ -1117,6 +1117,32 @@ mod tests {
     }
 
     #[test]
+    fn test_template_content_writer() {
+        let json = init::template_policy("content-writer").unwrap();
+        let services = json["services"].as_array().unwrap();
+        assert_eq!(services.len(), 5);
+        assert!(services.iter().any(|s| s["name"] == "drive"));
+        assert!(services.iter().any(|s| s["name"] == "docs"));
+        assert!(services.iter().any(|s| s["name"] == "slides"));
+        assert!(services.iter().any(|s| s["name"] == "sheets"));
+        let gmail = services.iter().find(|s| s["name"] == "gmail").unwrap();
+        let denied = gmail["denied_methods"].as_array().unwrap();
+        assert!(denied.iter().any(|m| m == "messages.send"));
+    }
+
+    #[test]
+    fn test_template_it_admin() {
+        let json = init::template_policy("it-admin").unwrap();
+        let services = json["services"].as_array().unwrap();
+        assert_eq!(services.len(), 7);
+        assert!(
+            services
+                .iter()
+                .any(|s| s["name"] == "drive" && s["read_only"] == true)
+        );
+    }
+
+    #[test]
     fn test_template_unknown() {
         assert!(init::template_policy("nonexistent").is_err());
     }

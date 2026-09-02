@@ -150,7 +150,7 @@ impl Policy {
         Self::from_policy_file(file)
     }
 
-    pub(crate) fn from_policy_file(file: PolicyFile) -> Self {
+    pub fn from_policy_file(file: PolicyFile) -> Self {
         let mut services: HashMap<String, ServicePolicy> = file
             .services
             .into_iter()
@@ -275,6 +275,8 @@ impl Policy {
         let Some(host) = host else {
             return false;
         };
+
+        let host = host.trim_start_matches('[').trim_end_matches(']');
 
         if self.allowed_origins.is_empty() {
             return host == "localhost" || host == "127.0.0.1" || host == "::1";
@@ -1150,6 +1152,8 @@ mod tests {
         let p = test_policy();
         assert!(p.is_origin_allowed("http://localhost:3000"));
         assert!(p.is_origin_allowed("http://127.0.0.1:8080"));
+        assert!(p.is_origin_allowed("http://[::1]:3000"));
+        assert!(p.is_origin_allowed("http://[::1]"));
     }
 
     #[test]

@@ -28,6 +28,14 @@ pub const TEMPLATES: &[(&str, &str)] = &[
         "admin-readonly",
         "All services in read-only mode. Safe for auditing.",
     ),
+    (
+        "content-writer",
+        "Drive, Docs, Slides, Sheets read-write. Gmail draft-only. No Calendar.",
+    ),
+    (
+        "it-admin",
+        "All services. Drive read-only, Gmail read-only, Calendar read-write.",
+    ),
 ];
 
 pub fn generate_policy(services: &[String]) -> serde_json::Value {
@@ -101,6 +109,31 @@ pub fn template_policy(name: &str) -> Result<serde_json::Value, GwsError> {
                 {"name":"sheets","allowed_resources":["spreadsheets"]},
                 {"name":"docs","allowed_resources":["documents"]},
                 {"name":"slides","allowed_resources":["presentations"]}
+            ]}),
+        ),
+        "content-writer" => {
+            let mut deny = gmail_deny()
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            deny.push(serde_json::json!("messages.send"));
+            Ok(serde_json::json!({ "server": {"read_only":false}, "services": [
+                {"name":"drive","allowed_resources":["files"]},
+                {"name":"docs","allowed_resources":["documents"]},
+                {"name":"slides","allowed_resources":["presentations"]},
+                {"name":"sheets","allowed_resources":["spreadsheets"]},
+                {"name":"gmail","allowed_resources":["users.messages","users.threads","users.labels","users.drafts"],"denied_methods":deny}
+            ]}))
+        }
+        "it-admin" => Ok(
+            serde_json::json!({ "server": {"read_only":false}, "services": [
+                {"name":"drive","read_only":true,"allowed_resources":["files"]},
+                {"name":"gmail","read_only":true,"allowed_resources":["users.messages","users.threads","users.labels"]},
+                {"name":"calendar","allowed_resources":["events"],"constraints":[{"param":"calendarId","values":["primary"],"access":"read-write"}]},
+                {"name":"sheets","read_only":true,"allowed_resources":["spreadsheets"]},
+                {"name":"docs","read_only":true,"allowed_resources":["documents"]},
+                {"name":"slides","read_only":true,"allowed_resources":["presentations"]},
+                {"name":"people","read_only":true,"allowed_resources":["people","people.connections"]}
             ]}),
         ),
         _ => Err(GwsError::Validation(format!(
