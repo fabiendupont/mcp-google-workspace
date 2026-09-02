@@ -97,10 +97,10 @@ fn find_tab_by_title<'a>(tabs: &'a [Value], title: &str) -> Option<&'a Value> {
         if tab_title == title {
             return Some(tab);
         }
-        if let Some(children) = tab.get("childTabs").and_then(|v| v.as_array()) {
-            if let Some(found) = find_tab_by_title(children, title) {
-                return Some(found);
-            }
+        if let Some(children) = tab.get("childTabs").and_then(|v| v.as_array())
+            && let Some(found) = find_tab_by_title(children, title)
+        {
+            return Some(found);
         }
     }
     None
@@ -191,9 +191,7 @@ pub(crate) async fn fetch_doc_content(
         let tabs = raw_doc
             .get("tabs")
             .and_then(|v| v.as_array())
-            .ok_or_else(|| {
-                GwsError::Validation("Document has no tabs in response".into())
-            })?;
+            .ok_or_else(|| GwsError::Validation("Document has no tabs in response".into()))?;
         let matched = find_tab_by_title(tabs, tab_title).ok_or_else(|| {
             let available: Vec<&str> = tabs
                 .iter()
@@ -3046,8 +3044,7 @@ pub(crate) async fn execute_docs_write(
             match arguments.get("position").and_then(|v| v.as_str()) {
                 Some("start") => 1,
                 _ => {
-                    let dc =
-                        fetch_doc_content(&doc_id, tab_title, policy, meta, state).await?;
+                    let dc = fetch_doc_content(&doc_id, tab_title, policy, meta, state).await?;
                     resolved_tab_id = dc.tab_id;
                     dc.doc["body"]["content"]
                         .as_array()
@@ -3512,8 +3509,13 @@ mod tests {
 
     #[test]
     fn test_insert_image_no_size() {
-        let req =
-            build_insert_image_request("https://example.com/img.png", Position::End, None, None, None);
+        let req = build_insert_image_request(
+            "https://example.com/img.png",
+            Position::End,
+            None,
+            None,
+            None,
+        );
         assert!(req["insertInlineImage"].get("objectSize").is_none());
     }
 
@@ -4155,8 +4157,7 @@ mod tests {
 
     #[test]
     fn test_insert_text_with_tab_id() {
-        let requests =
-            build_insert_text_requests("Hello", Position::End, None, None, Some("t.5"));
+        let requests = build_insert_text_requests("Hello", Position::End, None, None, Some("t.5"));
         assert_eq!(requests.len(), 1);
         assert_eq!(
             requests[0]["insertText"]["endOfSegmentLocation"]["tabId"],
@@ -4204,8 +4205,14 @@ mod tests {
 
     #[test]
     fn test_append_section_with_tab_id() {
-        let requests =
-            build_append_section_requests(Some("Title"), 1, Some("Body\n"), None, "BULLET_DISC_CIRCLE_SQUARE", Some("t.6"));
+        let requests = build_append_section_requests(
+            Some("Title"),
+            1,
+            Some("Body\n"),
+            None,
+            "BULLET_DISC_CIRCLE_SQUARE",
+            Some("t.6"),
+        );
         let has_tab = requests.iter().any(|r| {
             r.pointer("/insertText/endOfSegmentLocation/tabId")
                 .and_then(|v| v.as_str())

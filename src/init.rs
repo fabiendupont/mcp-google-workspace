@@ -289,26 +289,21 @@ fn pick_project() -> Result<String, GwsError> {
     if let Ok(out) = std::process::Command::new("gws")
         .args(["auth", "status"])
         .output()
+        && out.status.success()
+        && let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout)
+        && let Some(pid) = v.get("project_id").and_then(|v| v.as_str())
     {
-        if out.status.success() {
-            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
-                if let Some(pid) = v.get("project_id").and_then(|v| v.as_str()) {
-                    gws_project = pid.to_string();
-                }
-            }
-        }
+        gws_project = pid.to_string();
     }
 
     let mut current_project = gws_project.clone();
-    if current_project.is_empty() {
-        if let Ok(out) = std::process::Command::new("gcloud")
+    if current_project.is_empty()
+        && let Ok(out) = std::process::Command::new("gcloud")
             .args(["config", "get-value", "project"])
             .output()
-        {
-            if out.status.success() {
-                current_project = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            }
-        }
+        && out.status.success()
+    {
+        current_project = String::from_utf8_lossy(&out.stdout).trim().to_string();
     }
 
     let mut projects = Vec::new();
