@@ -17,7 +17,7 @@
   - SSE notification stream on `GET /mcp`
   - Graceful shutdown on SIGTERM/SIGINT
 
-- **Policy Engine**: TOML-based per-project access control
+- **Policy Engine**: JSON-based per-project access control
   - Service allow-list (only listed services are exposed)
   - Folder-level Drive ACLs (read-only / read-write per folder)
   - Per-calendar permissions with access levels

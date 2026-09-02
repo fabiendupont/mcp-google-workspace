@@ -149,13 +149,16 @@ cargo build --release
 Use a template for quick setup:
 
 ```bash
-mcp-google-workspace --init-policy --template assistant > gws-policy.json
+mcp-google-workspace init --template assistant > gws-policy.json
 ```
+
+Available templates: `analyst`, `assistant`, `admin-readonly`, `content-writer`, `it-admin`.
+Use `mcp-google-workspace init --template list` to see descriptions.
 
 Or run the interactive wizard:
 
 ```bash
-mcp-google-workspace --init-policy
+mcp-google-workspace init
 ```
 
 See [`policy.example.json`](policy.example.json) for a full example with constraints.
