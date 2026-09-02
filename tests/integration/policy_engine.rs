@@ -153,10 +153,7 @@ fn drive_get_merges_existing_query() {
     let policy = complex_policy();
     let method = get_method();
     let mut params = serde_json::Map::new();
-    params.insert(
-        "q".into(),
-        json!("mimeType='application/pdf'"),
-    );
+    params.insert("q".into(), json!("mimeType='application/pdf'"));
 
     policy
         .enforce_constraints("drive", "list", &method, &mut params, &None)
@@ -174,9 +171,11 @@ fn drive_post_to_allowed_folder_passes() {
     let mut params = serde_json::Map::new();
     let body = Some(json!({ "parents": ["folder-rw"], "name": "doc.txt" }));
 
-    assert!(policy
-        .enforce_constraints("drive", "create", &method, &mut params, &body)
-        .is_ok());
+    assert!(
+        policy
+            .enforce_constraints("drive", "create", &method, &mut params, &body)
+            .is_ok()
+    );
 }
 
 #[test]
@@ -212,9 +211,11 @@ fn drive_post_without_parents_fails() {
     let mut params = serde_json::Map::new();
     let body = Some(json!({ "name": "doc.txt" }));
 
-    assert!(policy
-        .enforce_constraints("drive", "create", &method, &mut params, &body)
-        .is_err());
+    assert!(
+        policy
+            .enforce_constraints("drive", "create", &method, &mut params, &body)
+            .is_err()
+    );
 }
 
 #[test]
@@ -222,9 +223,11 @@ fn gmail_list_allowed() {
     let policy = complex_policy();
     let method = get_method();
 
-    assert!(policy
-        .check_method("gmail", "users.messages", "list", &method)
-        .is_ok());
+    assert!(
+        policy
+            .check_method("gmail", "users.messages", "list", &method)
+            .is_ok()
+    );
 }
 
 #[test]
@@ -243,9 +246,11 @@ fn gmail_trash_denied() {
     let policy = complex_policy();
     let method = post_method();
 
-    assert!(policy
-        .check_method("gmail", "users.messages", "trash", &method)
-        .is_err());
+    assert!(
+        policy
+            .check_method("gmail", "users.messages", "trash", &method)
+            .is_err()
+    );
 }
 
 #[test]
@@ -253,9 +258,11 @@ fn gmail_batch_delete_denied() {
     let policy = complex_policy();
     let method = post_method();
 
-    assert!(policy
-        .check_method("gmail", "users.messages", "batchDelete", &method)
-        .is_err());
+    assert!(
+        policy
+            .check_method("gmail", "users.messages", "batchDelete", &method)
+            .is_err()
+    );
 }
 
 #[test]
@@ -281,9 +288,11 @@ fn sheets_read_allowed() {
     let policy = complex_policy();
     let method = get_method();
 
-    assert!(policy
-        .check_method("sheets", "spreadsheets", "get", &method)
-        .is_ok());
+    assert!(
+        policy
+            .check_method("sheets", "spreadsheets", "get", &method)
+            .is_ok()
+    );
 }
 
 #[test]
@@ -293,9 +302,11 @@ fn calendar_get_with_allowed_id_passes() {
     let mut params = serde_json::Map::new();
     params.insert("calendarId".into(), json!("primary"));
 
-    assert!(policy
-        .enforce_constraints("calendar", "get", &method, &mut params, &None)
-        .is_ok());
+    assert!(
+        policy
+            .enforce_constraints("calendar", "get", &method, &mut params, &None)
+            .is_ok()
+    );
 }
 
 #[test]
@@ -308,9 +319,11 @@ fn calendar_get_with_readonly_id_passes() {
         json!("holidays@group.calendar.google.com"),
     );
 
-    assert!(policy
-        .enforce_constraints("calendar", "get", &method, &mut params, &None)
-        .is_ok());
+    assert!(
+        policy
+            .enforce_constraints("calendar", "get", &method, &mut params, &None)
+            .is_ok()
+    );
 }
 
 #[test]
@@ -336,9 +349,11 @@ fn calendar_post_to_primary_passes() {
     let mut params = serde_json::Map::new();
     params.insert("calendarId".into(), json!("primary"));
 
-    assert!(policy
-        .enforce_constraints("calendar", "create", &method, &mut params, &None)
-        .is_ok());
+    assert!(
+        policy
+            .enforce_constraints("calendar", "create", &method, &mut params, &None)
+            .is_ok()
+    );
 }
 
 #[test]
@@ -347,9 +362,11 @@ fn calendar_missing_calendar_id_fails() {
     let method = get_method();
     let mut params = serde_json::Map::new();
 
-    assert!(policy
-        .enforce_constraints("calendar", "get", &method, &mut params, &None)
-        .is_err());
+    assert!(
+        policy
+            .enforce_constraints("calendar", "get", &method, &mut params, &None)
+            .is_err()
+    );
 }
 
 #[test]
@@ -370,9 +387,11 @@ fn docs_protect_mode_allows_read() {
     let mut params = serde_json::Map::new();
     params.insert("documentId".into(), json!("template-doc-id"));
 
-    assert!(policy
-        .enforce_constraints("docs", "get", &method, &mut params, &None)
-        .is_ok());
+    assert!(
+        policy
+            .enforce_constraints("docs", "get", &method, &mut params, &None)
+            .is_ok()
+    );
 }
 
 #[test]
@@ -395,9 +414,11 @@ fn docs_protect_mode_allows_write_to_other() {
     let mut params = serde_json::Map::new();
     params.insert("documentId".into(), json!("my-own-doc"));
 
-    assert!(policy
-        .enforce_constraints("docs", "batchUpdate", &method, &mut params, &None)
-        .is_ok());
+    assert!(
+        policy
+            .enforce_constraints("docs", "batchUpdate", &method, &mut params, &None)
+            .is_ok()
+    );
 }
 
 #[test]
@@ -407,9 +428,11 @@ fn slides_protect_allows_copy_of_template() {
     let mut params = serde_json::Map::new();
     params.insert("presentationId".into(), json!("template-pres-id"));
 
-    assert!(policy
-        .enforce_constraints("slides", "copy", &method, &mut params, &None)
-        .is_ok());
+    assert!(
+        policy
+            .enforce_constraints("slides", "copy", &method, &mut params, &None)
+            .is_ok()
+    );
 }
 
 #[test]
@@ -419,9 +442,11 @@ fn slides_protect_blocks_update_of_template() {
     let mut params = serde_json::Map::new();
     params.insert("presentationId".into(), json!("template-pres-id"));
 
-    assert!(policy
-        .enforce_constraints("slides", "batchUpdate", &method, &mut params, &None)
-        .is_err());
+    assert!(
+        policy
+            .enforce_constraints("slides", "batchUpdate", &method, &mut params, &None)
+            .is_err()
+    );
 }
 
 // -- Policy file validation (policy.example.json) --
@@ -500,10 +525,12 @@ fn generate_policy_round_trip_single_service() {
 
 #[test]
 fn generate_policy_round_trip_all_services() {
-    let services: Vec<String> = ["drive", "gmail", "calendar", "sheets", "docs", "slides", "people"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    let services: Vec<String> = [
+        "drive", "gmail", "calendar", "sheets", "docs", "slides", "people",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
     let json = init::generate_policy(&services);
 
     let file: PolicyFile = serde_json::from_value(json).unwrap();
@@ -542,9 +569,11 @@ fn generate_policy_calendar_has_primary_constraint() {
         !constraints.is_empty(),
         "generate_policy for calendar should include calendarId constraints"
     );
-    assert!(constraints
-        .iter()
-        .any(|c| c.param == "calendarId" && c.values.contains(&"primary".to_string())));
+    assert!(
+        constraints
+            .iter()
+            .any(|c| c.param == "calendarId" && c.values.contains(&"primary".to_string()))
+    );
 }
 
 #[test]
@@ -652,9 +681,11 @@ fn empty_policy_denies_everything() {
 
     assert!(policy.allowed_services().is_empty());
     assert!(!policy.is_service_allowed("drive"));
-    assert!(policy
-        .check_method("drive", "files", "list", &get_method())
-        .is_err());
+    assert!(
+        policy
+            .check_method("drive", "files", "list", &get_method())
+            .is_err()
+    );
 }
 
 #[test]
@@ -668,9 +699,11 @@ fn global_read_only_overrides_service() {
 
     assert!(policy.is_read_only("drive"));
     assert!(policy.is_read_only("gmail"));
-    assert!(policy
-        .check_method("drive", "files", "create", &post_method())
-        .is_err());
+    assert!(
+        policy
+            .check_method("drive", "files", "create", &post_method())
+            .is_err()
+    );
 }
 
 #[test]
@@ -732,9 +765,11 @@ fn templates_auto_protect_docs() {
     let mut params = serde_json::Map::new();
     params.insert("documentId".into(), json!("doc-tpl-456"));
 
-    assert!(policy
-        .enforce_constraints("docs", "batchUpdate", &method, &mut params, &None)
-        .is_err());
+    assert!(
+        policy
+            .enforce_constraints("docs", "batchUpdate", &method, &mut params, &None)
+            .is_err()
+    );
 }
 
 #[test]
@@ -770,8 +805,5 @@ fn delegate_subject_parsed() {
     }))
     .unwrap();
     let policy = Policy::from_policy_file(file);
-    assert_eq!(
-        policy.delegate_subject.as_deref(),
-        Some("user@example.com")
-    );
+    assert_eq!(policy.delegate_subject.as_deref(), Some("user@example.com"));
 }

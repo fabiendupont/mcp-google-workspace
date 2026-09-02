@@ -112,18 +112,17 @@ pub fn template_policy(name: &str) -> Result<serde_json::Value, GwsError> {
             ]}),
         ),
         "content-writer" => {
-            let mut deny = gmail_deny()
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
+            let mut deny = gmail_deny().as_array().cloned().unwrap_or_default();
             deny.push(serde_json::json!("messages.send"));
-            Ok(serde_json::json!({ "server": {"read_only":false}, "services": [
-                {"name":"drive","allowed_resources":["files"]},
-                {"name":"docs","allowed_resources":["documents"]},
-                {"name":"slides","allowed_resources":["presentations"]},
-                {"name":"sheets","allowed_resources":["spreadsheets"]},
-                {"name":"gmail","allowed_resources":["users.messages","users.threads","users.labels","users.drafts"],"denied_methods":deny}
-            ]}))
+            Ok(
+                serde_json::json!({ "server": {"read_only":false}, "services": [
+                    {"name":"drive","allowed_resources":["files"]},
+                    {"name":"docs","allowed_resources":["documents"]},
+                    {"name":"slides","allowed_resources":["presentations"]},
+                    {"name":"sheets","allowed_resources":["spreadsheets"]},
+                    {"name":"gmail","allowed_resources":["users.messages","users.threads","users.labels","users.drafts"],"denied_methods":deny}
+                ]}),
+            )
         }
         "it-admin" => Ok(
             serde_json::json!({ "server": {"read_only":false}, "services": [

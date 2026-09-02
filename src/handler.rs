@@ -165,10 +165,7 @@ impl ServerHandler for GwsHandler {
                 }
                 Err(e) => {
                     tracing::warn!(tool = %tool_name, error = %e, duration_ms = start.elapsed().as_millis() as u64, "Tool failed");
-                    Ok(CallToolResult::error(vec![ContentBlock::text(
-                        e.to_string(),
-                    )])
-                    .into())
+                    Ok(CallToolResult::error(vec![ContentBlock::text(e.to_string())]).into())
                 }
             }
         }
