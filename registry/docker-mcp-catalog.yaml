@@ -1,0 +1,54 @@
+# Docker MCP Catalog submission payload
+#
+# Submit as servers/mcp-google-workspace/metadata.yaml in
+# https://github.com/docker/mcp-registry (follow its CONTRIBUTING).
+#
+# NOTE: the Docker MCP Catalog serves images from Docker Hub, so the
+# multi-arch image currently published to ghcr.io must be mirrored to a
+# Docker Hub namespace first, e.g.:
+#
+#   docker buildx imagetools create \
+#     -t fabiendupont/mcp-google-workspace:0.8.2 \
+#     -t fabiendupont/mcp-google-workspace:latest \
+#     ghcr.io/fabiendupont/mcp-google-workspace:0.8.2
+#
+# (or add a mirroring step to .github/workflows/release.yml)
+
+name: mcp-google-workspace
+display_name: Google Workspace MCP
+description: >-
+  MCP server for Google Workspace (Gmail, Drive, Calendar, Docs, Sheets,
+  Slides, Tasks, and every other Google API via Discovery) with
+  per-project safety policies: read-only modes, per-folder and
+  per-recipient constraints, method denylists, write approval via MCP
+  elicitation, audit logs, and multi-user HTTP deployment.
+image: docker.io/fabiendupont/mcp-google-workspace:latest
+type: server
+license: Apache-2.0
+source:
+  project: https://github.com/fabiendupont/mcp-google-workspace
+meta:
+  category: productivity
+  tags:
+    - google
+    - gmail
+    - drive
+    - calendar
+    - docs
+    - sheets
+    - slides
+    - tasks
+    - workspace
+    - security
+about:
+  title: Google Workspace MCP
+  description: >-
+    Give AI agents safe access to Google Workspace: curated tools for the
+    core services plus auto-generated tools for any Google Discovery API,
+    behind a declarative policy engine with human-in-the-loop write
+    approval and audit logging.
+  icon: https://www.google.com/images/branding/googleg/1x/googleg_standard_color_48dp.png
+run:
+  cmd:
+    - --services
+    - ${GOOGLE_WORKSPACE_SERVICES:-drive,gmail,calendar}

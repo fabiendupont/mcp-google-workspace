@@ -296,6 +296,16 @@ Validate before deploying:
 mcp-google-workspace --check-policy gws-policy.json
 ```
 
+## Registry listings
+
+The repository ships submission-ready manifests for the MCP registries:
+`server.json` (official MCP Registry / GitHub MCP Registry format),
+`glama.json` (Glama), and `registry/docker-mcp-catalog.yaml` (Docker MCP
+Catalog — requires mirroring the image to Docker Hub, see the file
+header). Submission status and directory checklist:
+[`registry/SUBMISSIONS.md`](registry/SUBMISSIONS.md). A CI test keeps the
+manifests in sync with the crate version.
+
 ## Claude Code Integration
 
 Add to `.claude/settings.json`:

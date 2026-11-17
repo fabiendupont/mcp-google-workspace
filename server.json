@@ -1,0 +1,52 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.fabiendupont/mcp-google-workspace",
+  "title": "Google Workspace MCP",
+  "description": "MCP server for Google Workspace with per-project safety policies",
+  "version": "0.8.2",
+  "websiteUrl": "https://fabiendupont.io/mcp-google-workspace",
+  "repository": {
+    "url": "https://github.com/fabiendupont/mcp-google-workspace",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "oci",
+      "identifier": "ghcr.io/fabiendupont/mcp-google-workspace",
+      "registryBaseUrl": "https://ghcr.io",
+      "version": "0.8.2",
+      "runtimeHint": "docker",
+      "runtimeArguments": [
+        {
+          "type": "positional",
+          "value": "run",
+          "valueHint": "docker_subcommand"
+        },
+        {
+          "type": "positional",
+          "value": "--rm",
+          "valueHint": "remove_after_exit"
+        },
+        {
+          "type": "positional",
+          "value": "-i",
+          "valueHint": "interactive_stdio"
+        }
+      ],
+      "packageArguments": [
+        {
+          "type": "named",
+          "name": "--services",
+          "valueHint": "services",
+          "placeholder": "Comma-separated Google services to expose",
+          "default": "drive,gmail,calendar",
+          "description": "Google services the agent may use (e.g. drive,gmail,calendar,sheets,docs,slides,tasks). Finer control via a policy file: see the repository README.",
+          "isRequired": true
+        }
+      ],
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}
