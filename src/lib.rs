@@ -5,7 +5,6 @@ pub mod auth;
 pub mod cache;
 pub mod calendar_helpers;
 pub mod completions;
-pub mod composites;
 pub mod drive_helpers;
 pub mod elicitation;
 pub mod execute;

@@ -423,14 +423,6 @@ pub async fn build_tools_list(
         crate::tasks_helpers::tasks_clear_tool_schema(),
     ));
 
-    // Cross-service composite tools
-    tools.push(tool_from_json(
-        crate::composites::compose_thread_to_doc_tool_schema(),
-    ));
-    tools.push(tool_from_json(
-        crate::composites::compose_doc_to_slides_tool_schema(),
-    ));
-
     if eager {
         return Ok(tools);
     }
@@ -455,10 +447,6 @@ pub async fn build_tools_list(
             Some("calendar")
         } else if name.starts_with("gws_tasks_") {
             Some("tasks")
-        } else if name == "gws_compose_thread_to_doc" {
-            Some("gmail")
-        } else if name == "gws_compose_doc_to_slides" {
-            Some("docs")
         } else {
             None
         }
@@ -547,8 +535,6 @@ pub(crate) fn tool_full_schema(name: &str) -> Option<Value> {
         "gws_tasks_complete" => crate::tasks_helpers::tasks_complete_tool_schema(),
         "gws_tasks_delete" => crate::tasks_helpers::tasks_delete_tool_schema(),
         "gws_tasks_clear" => crate::tasks_helpers::tasks_clear_tool_schema(),
-        "gws_compose_thread_to_doc" => crate::composites::compose_thread_to_doc_tool_schema(),
-        "gws_compose_doc_to_slides" => crate::composites::compose_doc_to_slides_tool_schema(),
         _ => return None,
     };
     let mut info = json!({

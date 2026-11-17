@@ -889,6 +889,10 @@ pub fn marp_tool_schema() -> Value {
                     "type": "string",
                     "description": "Marp Markdown source. Use --- to separate slides, # for titles, <!-- notes --> for speaker notes, ![bg](url) for backgrounds."
                 },
+                "split_headings": {
+                    "type": "boolean",
+                    "description": "Treat plain Markdown as slides: each H1/H2 heading starts a new slide (ignored if --- separators are present). Default: false"
+                },
                 "template": {
                     "type": "string",
                     "description": "Template name (from policy) or presentation ID. The template's layouts are used for branded slide creation."
@@ -1930,6 +1934,32 @@ pub(crate) async fn execute_slides_helper(
     )))
 }
 
+/// Convert plain document Markdown to Marp Markdown: every H1 or H2
+/// heading starts a new slide, everything else passes through.
+/// Used by `split_headings` on gws_slides_import_marp.
+pub fn markdown_to_marp(md: &str) -> String {
+    let mut slides: Vec<String> = Vec::new();
+    let mut current = String::new();
+
+    for line in md.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("# ") || trimmed.starts_with("## ") {
+            if !current.trim().is_empty() {
+                slides.push(current.trim().to_string());
+            }
+            current = format!("{trimmed}\n");
+        } else {
+            current.push_str(line);
+            current.push('\n');
+        }
+    }
+    if !current.trim().is_empty() {
+        slides.push(current.trim().to_string());
+    }
+
+    slides.join("\n\n---\n\n")
+}
+
 async fn execute_slides_import_marp(
     arguments: &Value,
     policy: &Policy,
@@ -1937,10 +1967,22 @@ async fn execute_slides_import_marp(
     state: &mut ServerState,
     dry_run: bool,
 ) -> Result<Value, GwsError> {
-    let marp_source = arguments
+    let marp_raw = arguments
         .get("marp")
         .and_then(|v| v.as_str())
         .ok_or_else(|| GwsError::Validation("Missing 'marp' argument".into()))?;
+
+    // split_headings: treat plain Markdown as slides — every H1/H2 starts
+    // a new slide. Applied only when the source has no slide separators.
+    let split_headings = arguments
+        .get("split_headings")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let marp_source = if split_headings && !marp_raw.contains("\n---") {
+        markdown_to_marp(marp_raw)
+    } else {
+        marp_raw.to_string()
+    };
 
     let presentation_id_arg = arguments.get("presentation_id").and_then(|v| v.as_str());
     let title = arguments.get("title").and_then(|v| v.as_str());
@@ -1955,7 +1997,7 @@ async fn execute_slides_import_marp(
     let template_id =
         template_arg.and_then(|t| policy.find_template(t).map(|e| e.id.as_str()).or(Some(t)));
 
-    let pres = crate::marp::parse_marp(marp_source)
+    let pres = crate::marp::parse_marp(&marp_source)
         .map_err(|e| GwsError::Validation(format!("Marp parse error: {e}")))?;
 
     // Step A: Resolve or create presentation
@@ -4207,5 +4249,26 @@ mod tests {
         assert_eq!(phs[1]["label"], "SUBTITLE[8]");
         assert_eq!(phs[1]["index"], 8);
         assert!(phs[1]["width_pt"].as_i64().unwrap() > 0);
+    }
+
+    #[test]
+    fn test_markdown_to_marp_splits_on_headings() {
+        let md = "# Intro\n\nfirst slide\n\n## Details\n\nsecond slide\n\nmore\n\n## End\n\nlast";
+        let marp = markdown_to_marp(md);
+        let slides: Vec<&str> = marp.split("\n\n---\n\n").collect();
+        assert_eq!(slides.len(), 3);
+        assert!(slides[0].contains("# Intro"));
+        assert!(slides[1].starts_with("## Details"));
+        assert!(slides[2].starts_with("## End"));
+    }
+
+    #[test]
+    fn test_markdown_to_marp_no_headings() {
+        assert_eq!(markdown_to_marp("just text\nmore"), "just text\nmore");
+    }
+
+    #[test]
+    fn test_markdown_to_marp_empty() {
+        assert_eq!(markdown_to_marp(""), "");
     }
 }

@@ -202,22 +202,23 @@ denied (rather than silently allowed) if the client cannot display approvals.
 `gws_batch` is disabled in this mode so every write goes through an
 individually confirmable call.
 
-### Cross-service composites
+### Workflow recipes (MCP prompts)
 
-Composite tools chain multiple services into one call, reusing the curated
-helpers (and therefore their policy enforcement, `confirm_writes`
-gating, and formatting):
+Multi-service workflows live as **editable prompt recipes** in `prompts/`
+(loaded via `--prompts-dir` or a `prompts/` directory next to your policy
+file), not as hard-coded tools — agents chain the primitive tools
+themselves, which keeps them adaptable and the recipes editable without
+recompiling. Shipped recipes include:
 
-- **`gws_compose_thread_to_doc`** — Gmail thread → formatted Google Doc
-  (one section per message, participants summary, quoted text stripped).
-  Requires the `gmail` and `docs` services. Supports `dry_run`.
-- **`gws_compose_doc_to_slides`** — Google Doc → slide deck via the Marp
-  pipeline: each H1/H2 heading becomes a slide, bullets/tables/images
-  pass through, speaker notes supported. Requires the `docs` and
-  `slides` services. Supports `dry_run` and `template`.
+- **`thread-to-doc`** — Gmail thread → formatted Google Doc
+  (one section per message, participants summary)
+- **`doc-to-slides`** — Google Doc → Marp → presentation deck
+- **`cross-service-workflow`** — email → document → spreadsheet pipeline
 
-Both return the created resource IDs (`documentId`, `presentationId`)
-in their structured output.
+For deterministic Markdown → slides conversion, `gws_slides_import_marp`
+accepts `split_headings: true`, which turns plain document Markdown into
+slides (each H1/H2 heading starts a new slide) when no `---` separators
+are present.
 
 ### Google Tasks
 

@@ -166,15 +166,6 @@ async fn handle_tool_call_inner_concurrent(
         return Ok(result);
     }
 
-    if tool_name.starts_with("gws_compose_") {
-        let mut st = state.lock().await;
-        let result = crate::composites::execute_composite(
-            tool_name, arguments, policy, meta, &mut st, dry_run,
-        )
-        .await?;
-        return Ok(result);
-    }
-
     if tool_name.starts_with("gws_tasks_") {
         let mut st = state.lock().await;
         let result =
@@ -1448,21 +1439,6 @@ mod tests {
             helper_write_summary("gws_tasks_delete", &json!({ "task_id": "abc123" })).unwrap();
         assert!(summary.contains("Delete Task"));
         assert!(summary.contains("abc123"));
-    }
-
-    #[test]
-    fn test_helper_write_summary_composites() {
-        let summary =
-            helper_write_summary("gws_compose_thread_to_doc", &json!({ "thread_id": "t99" }))
-                .unwrap();
-        assert!(summary.contains("Thread to Doc"));
-        assert!(summary.contains("t99"));
-
-        let summary =
-            helper_write_summary("gws_compose_doc_to_slides", &json!({ "document_id": "d1" }))
-                .unwrap();
-        assert!(summary.contains("Doc to Slides"));
-        assert!(summary.contains("d1"));
     }
 
     #[test]
