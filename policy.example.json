@@ -1,6 +1,7 @@
 {
   "server": {
     "read_only": false,
+    "confirm_writes": false,
     "rate_limit_rpm": 120,
     "allowed_origins": ["internal.corp.com"],
     "credentials_file": "/path/to/credentials.json",
@@ -32,6 +33,10 @@
         { "param": "calendarId", "values": ["primary"], "access": "read-write" },
         { "param": "calendarId", "values": ["company-holidays@group.calendar.google.com"], "access": "read-only" }
       ]
+    },
+    {
+      "name": "tasks",
+      "_comment": "Agent can manage Google Tasks (gws_tasks_* helper tools)"
     },
     {
       "name": "gmail",

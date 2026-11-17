@@ -30,6 +30,36 @@ pub async fn ask_folder(peer: &Peer<RoleServer>) -> Option<String> {
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[schemars(description = "Write operation approval")]
+pub struct WriteApproval {
+    #[schemars(description = "Approve this write operation?")]
+    pub approve: bool,
+}
+rmcp::elicit_safe!(WriteApproval);
+
+/// Ask the user to approve a write operation.
+/// Returns Some(true) when approved, Some(false) when declined,
+/// and None when elicitation is unavailable or failed.
+pub async fn ask_write_approval(
+    peer: &Peer<RoleServer>,
+    tool_name: &str,
+    summary: &str,
+) -> Option<bool> {
+    if !supports_form(peer) {
+        return None;
+    }
+    let message = if summary.is_empty() {
+        format!("Approve write operation '{tool_name}'?")
+    } else {
+        format!("Approve write operation '{tool_name}'?\n\n{summary}")
+    };
+    match peer.elicit::<WriteApproval>(&message).await {
+        Ok(Some(approval)) => Some(approval.approve),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[schemars(description = "Overwrite confirmation")]
 pub struct OverwriteConfirmation {
     #[schemars(description = "Overwrite the existing document?")]
@@ -123,6 +153,13 @@ mod tests {
         let schema = rmcp::schemars::schema_for!(OverwriteConfirmation);
         let json = serde_json::to_value(&schema).unwrap();
         assert!(json["properties"]["overwrite"].is_object());
+    }
+
+    #[test]
+    fn test_write_approval_schema() {
+        let schema = rmcp::schemars::schema_for!(WriteApproval);
+        let json = serde_json::to_value(&schema).unwrap();
+        assert!(json["properties"]["approve"].is_object());
     }
 
     #[test]

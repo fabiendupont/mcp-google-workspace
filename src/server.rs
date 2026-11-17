@@ -66,6 +66,25 @@ async fn handle_tool_call_inner_concurrent(
         .unwrap_or(false);
     let arguments = &strip_key(raw_arguments, "dry_run");
 
+    // confirm_writes: require explicit user approval before mutating helper tools
+    if policy.confirm_writes
+        && !dry_run
+        && let Some(summary) = helper_write_summary(tool_name, arguments)
+    {
+        let approved = match peer {
+            Some(p) => crate::elicitation::ask_write_approval(p, tool_name, &summary).await,
+            None => None,
+        };
+        if approved != Some(true) {
+            tracing::warn!(tool = tool_name, "Write denied: not approved by user");
+            return Err(GwsError::Validation(
+                "Write denied: operation was not approved by the user \
+                 (confirm_writes is enabled in the server policy)"
+                    .to_string(),
+            ));
+        }
+    }
+
     if tool_name == "gws_discover" {
         let mut st = state.lock().await;
         // Activate service for lazy tool discovery
@@ -81,6 +100,14 @@ async fn handle_tool_call_inner_concurrent(
     }
 
     if tool_name == "gws_batch" {
+        if policy.confirm_writes && !dry_run {
+            return Err(GwsError::Validation(
+                "Write denied: gws_batch is disabled while confirm_writes is enabled, \
+                 because individual requests cannot be approved. \
+                 Call tools individually so each write can be confirmed."
+                    .to_string(),
+            ));
+        }
         let service = arguments
             .get("service")
             .and_then(|v| v.as_str())
@@ -139,6 +166,14 @@ async fn handle_tool_call_inner_concurrent(
         return Ok(result);
     }
 
+    if tool_name.starts_with("gws_tasks_") {
+        let mut st = state.lock().await;
+        let result =
+            crate::tasks_helpers::execute_tasks_helper(tool_name, arguments, policy, meta, &mut st)
+                .await?;
+        return Ok(result);
+    }
+
     if tool_name == "gws_templates" {
         let mut st = state.lock().await;
         let result =
@@ -175,8 +210,9 @@ async fn handle_tool_call_inner_concurrent(
 
     let svc_alias = tool_name;
 
-    const HELPER_ONLY_SERVICES: &[&str] =
-        &["drive", "docs", "sheets", "slides", "gmail", "calendar"];
+    const HELPER_ONLY_SERVICES: &[&str] = &[
+        "drive", "docs", "sheets", "slides", "gmail", "calendar", "tasks",
+    ];
     if HELPER_ONLY_SERVICES.contains(&svc_alias) {
         tracing::warn!(
             service = svc_alias,
@@ -223,6 +259,31 @@ async fn handle_tool_call_inner_concurrent(
             "Method '{method_name}' not found in {svc_alias}.{resource_path}"
         ))
     })?;
+
+    // confirm_writes: require approval for non-GET generic API calls
+    if policy.confirm_writes && !dry_run && method.http_method != "GET" {
+        let summary = format!(
+            "{svc_alias}.{resource_path}.{method_name} [{}]",
+            method.http_method
+        );
+        let approved = match peer {
+            Some(p) => crate::elicitation::ask_write_approval(p, svc_alias, &summary).await,
+            None => None,
+        };
+        if approved != Some(true) {
+            tracing::warn!(
+                service = svc_alias,
+                resource = resource_path,
+                method = method_name,
+                "Write denied: not approved by user"
+            );
+            return Err(GwsError::Validation(
+                "Write denied: operation was not approved by the user \
+                 (confirm_writes is enabled in the server policy)"
+                    .to_string(),
+            ));
+        }
+    }
 
     if arguments
         .get("media_upload_init")
@@ -913,6 +974,63 @@ fn is_policy_denial(msg: &str) -> bool {
         || msg.contains("Write denied")
 }
 
+/// When confirm_writes is enabled, returns a human-readable summary for a
+/// mutating helper tool, or None for read-only / unknown tools (which are
+/// either safe or handled elsewhere, e.g. the generic API path).
+fn helper_write_summary(tool_name: &str, arguments: &Value) -> Option<String> {
+    let schema = tools::tool_full_schema(tool_name)?;
+    let read_only = schema
+        .get("annotations")
+        .and_then(|a| a.get("readOnlyHint"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    if read_only {
+        return None;
+    }
+
+    let title = schema
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or(tool_name);
+
+    // Include identifying arguments so the user can judge the operation
+    const SUMMARY_KEYS: &[&str] = &[
+        "to",
+        "subject",
+        "title",
+        "summary",
+        "name",
+        "event_id",
+        "task_id",
+        "file_id",
+        "folder_id",
+        "spreadsheet_id",
+        "document_id",
+        "presentation_id",
+        "range",
+        "query",
+        "message_id",
+        "thread_id",
+        "recipients",
+    ];
+    let mut details = Vec::new();
+    for key in SUMMARY_KEYS {
+        if let Some(val) = arguments.get(*key).and_then(|v| v.as_str()) {
+            let display: String = val.chars().take(80).collect();
+            details.push(format!("{key}: {display}"));
+        }
+        if details.len() >= 3 {
+            break;
+        }
+    }
+
+    Some(if details.is_empty() {
+        title.to_string()
+    } else {
+        format!("{title} — {}", details.join("; "))
+    })
+}
+
 fn explain_request(
     service: &str,
     resource: &str,
@@ -1280,6 +1398,47 @@ mod tests {
         let resp = chunk_response("dl1", "AA", 98, 100, 100, 75, "text/plain", true);
         assert_eq!(resp["structuredContent"]["status"], "complete");
         assert!(resp["structuredContent"]["is_last"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn test_helper_write_summary_read_only_tool() {
+        assert!(helper_write_summary("gws_calendar_list", &json!({})).is_none());
+        assert!(helper_write_summary("gws_gmail_search", &json!({ "query": "x" })).is_none());
+    }
+
+    #[test]
+    fn test_helper_write_summary_mutating_tool() {
+        let summary =
+            helper_write_summary("gws_calendar_create", &json!({ "summary": "Team sync" }))
+                .unwrap();
+        assert!(summary.contains("Create Event"));
+        assert!(summary.contains("Team sync"));
+    }
+
+    #[test]
+    fn test_helper_write_summary_limits_details() {
+        let args = json!({
+            "to": "alice@example.com",
+            "subject": "Hello",
+            "message": "body"
+        });
+        let summary = helper_write_summary("gws_gmail_send", &args).unwrap();
+        assert!(summary.contains("alice@example.com"));
+        assert!(summary.contains("Hello"));
+        assert!(!summary.contains("body"));
+    }
+
+    #[test]
+    fn test_helper_write_summary_unknown_tool() {
+        assert!(helper_write_summary("not_a_tool", &json!({})).is_none());
+    }
+
+    #[test]
+    fn test_helper_write_summary_tasks_delete() {
+        let summary =
+            helper_write_summary("gws_tasks_delete", &json!({ "task_id": "abc123" })).unwrap();
+        assert!(summary.contains("Delete Task"));
+        assert!(summary.contains("abc123"));
     }
 
     #[test]

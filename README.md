@@ -165,7 +165,7 @@ See [`policy.example.json`](policy.example.json) for a full example with constra
 
 ```json
 {
-  "server": { "read_only": false },
+  "server": { "read_only": false, "confirm_writes": false },
   "services": [
     {
       "name": "drive",
@@ -183,10 +183,32 @@ See [`policy.example.json`](policy.example.json) for a full example with constra
       "constraints": [
         { "param": "calendarId", "values": ["primary"], "access": "read-write" }
       ]
+    },
+    {
+      "name": "tasks"
     }
   ]
 }
 ```
+
+### Write confirmation (human in the loop)
+
+Set `"confirm_writes": true` in the `server` section to require explicit user
+approval before any mutating operation. The server sends an MCP elicitation
+request describing the operation (tool name plus identifying arguments like
+recipients, titles, or IDs); writes proceed only after approval. Read-only
+tools are never interrupted, `dry_run` calls skip confirmation, and writes are
+denied (rather than silently allowed) if the client cannot display approvals.
+`gws_batch` is disabled in this mode so every write goes through an
+individually confirmable call.
+
+### Google Tasks
+
+The `tasks` service is exposed through curated helper tools:
+`gws_tasks_lists`, `gws_tasks_list`, `gws_tasks_get`, `gws_tasks_create`,
+`gws_tasks_update`, `gws_tasks_complete`, `gws_tasks_delete`, and
+`gws_tasks_clear`. All default to the first task list when no
+`tasklist_id` is given.
 
 Validate before deploying:
 

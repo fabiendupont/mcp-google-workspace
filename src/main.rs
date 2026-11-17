@@ -397,6 +397,7 @@ fn print_effective_policy(policy: &policy::Policy) {
     }
 
     let read_only_label = if policy.global_read_only { "yes" } else { "no" };
+    let confirm_writes_label = if policy.confirm_writes { "yes" } else { "no" };
     let rate_limit_label = match policy.rate_limit_rpm {
         Some(rpm) => format!("{rpm} rpm"),
         None => "none".to_string(),
@@ -414,7 +415,7 @@ fn print_effective_policy(policy: &policy::Policy) {
         global_read_only = policy.global_read_only,
         rate_limit_rpm = ?policy.rate_limit_rpm,
         max_request_bytes = policy.max_request_bytes,
-        "  Global: read-only {read_only_label}, rate limit {rate_limit_label}, max request {max_request_label}"
+        "  Global: read-only {read_only_label}, confirm writes {confirm_writes_label}, rate limit {rate_limit_label}, max request {max_request_label}"
     );
 }
 

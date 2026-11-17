@@ -94,6 +94,7 @@ src/
 ├── helpers.rs           Google Docs enrichment (9 tools)
 ├── slides_helpers.rs    Google Slides enrichment (9 tools)
 ├── calendar_helpers.rs  Google Calendar enrichment (6 tools)
+├── tasks_helpers.rs     Google Tasks enrichment (8 tools)
 ├── format.rs            Format transformers: Markdown/Plain → Docs batchUpdate, doc → Markdown
 ├── marp.rs              Marp Markdown to Google Slides conversion
 ├── image_gen.rs         Gemini image generation and Drive upload
@@ -101,7 +102,7 @@ src/
 ├── rate_limit.rs        Per-service sliding-window rate limiter for Google API quotas
 ├── resources.rs         MCP resources: gws:// URI scheme, resource templates from Discovery Documents
 ├── completions.rs       MCP completions: autocomplete for resource URIs and prompt arguments
-├── elicitation.rs       MCP elicitation: structured user input
+├── elicitation.rs       MCP elicitation: structured user input, write approval (confirm_writes)
 ├── subscriptions.rs     MCP subscriptions: Google Drive watch channels, webhook notifications
 ├── prompts.rs           MCP prompts: load external Markdown files, argument substitution
 ├── tasks.rs             Task lifecycle for resumable uploads and chunked downloads

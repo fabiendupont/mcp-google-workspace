@@ -61,6 +61,9 @@ pub struct PolicyFile {
 pub struct ServerPolicy {
     #[serde(default)]
     pub read_only: bool,
+    /// Require explicit user approval (MCP elicitation) before any write operation
+    #[serde(default)]
+    pub confirm_writes: bool,
     #[serde(default = "default_max_request_bytes")]
     pub max_request_bytes: usize,
     #[serde(default)]
@@ -81,6 +84,7 @@ impl Default for ServerPolicy {
     fn default() -> Self {
         Self {
             read_only: false,
+            confirm_writes: false,
             max_request_bytes: default_max_request_bytes(),
             rate_limit_rpm: None,
             rate_limits: None,
@@ -114,6 +118,7 @@ pub struct ServicePolicy {
 #[derive(Debug, Clone)]
 pub struct Policy {
     pub global_read_only: bool,
+    pub confirm_writes: bool,
     pub max_request_bytes: usize,
     pub rate_limit_rpm: Option<u32>,
     pub rate_limits: Option<HashMap<String, u32>>,
@@ -193,6 +198,7 @@ impl Policy {
 
         Self {
             global_read_only: file.server.read_only,
+            confirm_writes: file.server.confirm_writes,
             max_request_bytes: file.server.max_request_bytes,
             rate_limit_rpm: file.server.rate_limit_rpm,
             rate_limits: file.server.rate_limits,
@@ -1544,5 +1550,26 @@ mod tests {
         .unwrap();
         let p = Policy::from_policy_file(file);
         assert_eq!(p.allowed_resources("drive"), &["files"]);
+    }
+
+    #[test]
+    fn test_confirm_writes_default_false() {
+        let file: PolicyFile = serde_json::from_value(serde_json::json!({
+            "services": [{ "name": "drive" }]
+        }))
+        .unwrap();
+        let p = Policy::from_policy_file(file);
+        assert!(!p.confirm_writes);
+    }
+
+    #[test]
+    fn test_confirm_writes_parsed() {
+        let file: PolicyFile = serde_json::from_value(serde_json::json!({
+            "server": { "confirm_writes": true },
+            "services": [{ "name": "drive" }]
+        }))
+        .unwrap();
+        let p = Policy::from_policy_file(file);
+        assert!(p.confirm_writes);
     }
 }

@@ -28,4 +28,5 @@ pub mod sheets_helpers;
 pub mod slides_helpers;
 pub mod subscriptions;
 pub mod tasks;
+pub mod tasks_helpers;
 pub mod tools;

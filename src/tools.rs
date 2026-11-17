@@ -24,6 +24,9 @@ fn method_hints(service: &str) -> Option<&'static str> {
         "calendar" => Some(
             "resource=events method=list params={calendarId: primary}, resource=events method=get params={calendarId: primary, eventId: ID}",
         ),
+        "tasks" => Some(
+            "helper tools: gws_tasks_list, gws_tasks_create, gws_tasks_complete (tasklist_id optional, defaults to first list)",
+        ),
         "sheets" => Some("resource=spreadsheets method=get params={spreadsheetId: ID}"),
         "slides" => Some(
             "resource=presentations method=get params={presentationId: ID}, resource=presentations method=create body={title: TITLE}",
@@ -76,8 +79,9 @@ pub async fn build_tools_list(
 ) -> Result<Vec<Tool>, GwsError> {
     let mut tools = Vec::new();
 
-    const SERVICES_WITH_HELPERS: &[&str] =
-        &["drive", "docs", "sheets", "slides", "gmail", "calendar"];
+    const SERVICES_WITH_HELPERS: &[&str] = &[
+        "drive", "docs", "sheets", "slides", "gmail", "calendar", "tasks",
+    ];
 
     // Pre-load discovery docs for all services (helpers need them)
     for svc_name in policy.allowed_services() {
@@ -395,6 +399,30 @@ pub async fn build_tools_list(
         crate::calendar_helpers::calendar_freebusy_tool_schema(),
     ));
 
+    // Tasks helper tools
+    tools.push(tool_from_json(
+        crate::tasks_helpers::tasks_lists_tool_schema(),
+    ));
+    tools.push(tool_from_json(
+        crate::tasks_helpers::tasks_list_tool_schema(),
+    ));
+    tools.push(tool_from_json(crate::tasks_helpers::tasks_get_tool_schema()));
+    tools.push(tool_from_json(
+        crate::tasks_helpers::tasks_create_tool_schema(),
+    ));
+    tools.push(tool_from_json(
+        crate::tasks_helpers::tasks_update_tool_schema(),
+    ));
+    tools.push(tool_from_json(
+        crate::tasks_helpers::tasks_complete_tool_schema(),
+    ));
+    tools.push(tool_from_json(
+        crate::tasks_helpers::tasks_delete_tool_schema(),
+    ));
+    tools.push(tool_from_json(
+        crate::tasks_helpers::tasks_clear_tool_schema(),
+    ));
+
     if eager {
         return Ok(tools);
     }
@@ -417,6 +445,8 @@ pub async fn build_tools_list(
             Some("gmail")
         } else if name.starts_with("gws_calendar_") {
             Some("calendar")
+        } else if name.starts_with("gws_tasks_") {
+            Some("tasks")
         } else {
             None
         }
@@ -439,7 +469,7 @@ pub async fn build_tools_list(
     Ok(filtered)
 }
 
-fn tool_full_schema(name: &str) -> Option<Value> {
+pub(crate) fn tool_full_schema(name: &str) -> Option<Value> {
     let schema = match name {
         "gws_drive_list" => crate::drive_helpers::drive_list_tool_schema(),
         "gws_drive_find_folder" => crate::drive_helpers::drive_find_folder_tool_schema(),
@@ -497,6 +527,14 @@ fn tool_full_schema(name: &str) -> Option<Value> {
         "gws_calendar_update" => crate::calendar_helpers::calendar_update_tool_schema(),
         "gws_calendar_delete" => crate::calendar_helpers::calendar_delete_tool_schema(),
         "gws_calendar_freebusy" => crate::calendar_helpers::calendar_freebusy_tool_schema(),
+        "gws_tasks_lists" => crate::tasks_helpers::tasks_lists_tool_schema(),
+        "gws_tasks_list" => crate::tasks_helpers::tasks_list_tool_schema(),
+        "gws_tasks_get" => crate::tasks_helpers::tasks_get_tool_schema(),
+        "gws_tasks_create" => crate::tasks_helpers::tasks_create_tool_schema(),
+        "gws_tasks_update" => crate::tasks_helpers::tasks_update_tool_schema(),
+        "gws_tasks_complete" => crate::tasks_helpers::tasks_complete_tool_schema(),
+        "gws_tasks_delete" => crate::tasks_helpers::tasks_delete_tool_schema(),
+        "gws_tasks_clear" => crate::tasks_helpers::tasks_clear_tool_schema(),
         _ => return None,
     };
     let mut info = json!({

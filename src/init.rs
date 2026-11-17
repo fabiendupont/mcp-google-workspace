@@ -96,6 +96,7 @@ pub fn template_policy(name: &str) -> Result<serde_json::Value, GwsError> {
                 {"name":"drive","allowed_resources":["files"]},
                 {"name":"gmail","allowed_resources":["users.messages","users.threads","users.labels","users.drafts"],"denied_methods":gmail_deny()},
                 {"name":"calendar","allowed_resources":["events"],"constraints":[{"param":"calendarId","values":["primary"],"access":"read-write"}]},
+                {"name":"tasks","allowed_resources":["tasks","tasklists"]},
                 {"name":"sheets","allowed_resources":["spreadsheets"]},
                 {"name":"docs","allowed_resources":["documents"]},
                 {"name":"people","read_only":true,"allowed_resources":["people","people.connections"]}
