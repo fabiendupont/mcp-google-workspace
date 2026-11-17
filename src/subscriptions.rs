@@ -16,6 +16,9 @@ pub struct Subscription {
     pub expiration: Instant,
     pub peer: Peer<RoleServer>,
     pub service: String,
+    /// Polling subscriptions watch the resource by re-reading it
+    /// periodically instead of relying on Google push channels.
+    pub polling: bool,
 }
 
 pub type SubscriptionMap = HashMap<String, Subscription>;
@@ -170,7 +173,8 @@ pub fn spawn_renewal_task(
             let expiring: Vec<String> = subs
                 .iter()
                 .filter(|(_, s)| {
-                    s.expiration.saturating_duration_since(now) < Duration::from_secs(600)
+                    !s.polling
+                        && s.expiration.saturating_duration_since(now) < Duration::from_secs(600)
                 })
                 .map(|(uri, _)| uri.clone())
                 .collect();
@@ -178,6 +182,154 @@ pub fn spawn_renewal_task(
 
             for uri in expiring {
                 tracing::info!(uri = %uri, "Subscription expiring soon, client should re-subscribe");
+            }
+        }
+    })
+}
+
+/// Configuration for a polling subscription.
+#[derive(Debug, Clone)]
+pub struct PollConfig {
+    pub service: String,
+    pub resource: String,
+    pub id: String,
+    pub interval: Duration,
+}
+
+/// Stable hash of a resource snapshot, used for change detection.
+pub fn content_hash(value: &Value) -> u64 {
+    crate::execute::simple_hash(value.to_string().as_bytes())
+}
+
+/// Read the current state of a resource for change detection.
+async fn poll_read(
+    state: &Arc<Mutex<crate::shared::ServerState>>,
+    policy: &crate::policy::Policy,
+    cfg: &PollConfig,
+) -> Result<Value, GwsError> {
+    let (mut tc, doc) = {
+        let mut st = state.lock().await;
+        let tc = st.token_cache.take();
+        let doc = st.get_doc(&cfg.service).await?;
+        (tc, doc)
+    };
+
+    let result = poll_read_inner(&doc, &mut tc, policy, cfg).await;
+
+    // Restore the token cache regardless of the outcome
+    let mut st = state.lock().await;
+    st.token_cache = tc;
+    result
+}
+
+async fn poll_read_inner(
+    doc: &Arc<google_workspace::discovery::RestDescription>,
+    tc: &mut Option<crate::auth::TokenCache>,
+    policy: &crate::policy::Policy,
+    cfg: &PollConfig,
+) -> Result<Value, GwsError> {
+    let resource = crate::tools::find_resource(&doc.resources, &cfg.resource).ok_or_else(|| {
+        GwsError::Validation(format!(
+            "Resource '{}' not found in {}",
+            cfg.resource, cfg.service
+        ))
+    })?;
+    let method = resource.methods.get("get").ok_or_else(|| {
+        GwsError::Validation(format!("Resource '{}' has no get method", cfg.resource))
+    })?;
+    let id_param = crate::resources::id_param_name(resource, "get").ok_or_else(|| {
+        GwsError::Validation(format!(
+            "Resource '{}' has no get method with path parameter",
+            cfg.resource
+        ))
+    })?;
+
+    let args = json!({ "params": { &id_param: &cfg.id } });
+    crate::execute::execute_tool(
+        doc,
+        method,
+        &cfg.resource,
+        "get",
+        &args,
+        &cfg.service,
+        policy,
+        &crate::meta::RequestMeta::default(),
+        None,
+        None,
+        false,
+        tc,
+    )
+    .await
+}
+
+/// Spawn a background task that polls a resource and emits
+/// `notifications/resources/updated` whenever its content changes.
+/// The task exits automatically once the subscription is removed.
+pub fn spawn_poll_task(
+    uri: String,
+    cfg: PollConfig,
+    state: Arc<Mutex<crate::shared::ServerState>>,
+    policy: Arc<tokio::sync::RwLock<crate::policy::Policy>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        tracing::info!(
+            uri = %uri,
+            service = %cfg.service,
+            resource = %cfg.resource,
+            interval_secs = cfg.interval.as_secs(),
+            "Polling subscription started"
+        );
+        let mut last_hash: Option<u64> = None;
+        let mut ticker = tokio::time::interval(cfg.interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            ticker.tick().await;
+
+            let still_subscribed = {
+                let st = state.lock().await;
+                st.subscriptions.lock().await.contains_key(&uri)
+            };
+            if !still_subscribed {
+                tracing::info!(uri = %uri, "Polling subscription removed, stopping");
+                break;
+            }
+
+            let policy = policy.read().await;
+            let result = poll_read(&state, &policy, &cfg).await;
+            drop(policy);
+
+            match result {
+                Ok(value) => {
+                    let hash = content_hash(&value);
+                    if let Some(prev) = last_hash
+                        && prev != hash
+                    {
+                        tracing::info!(uri = %uri, "Resource changed, notifying client");
+                        let peer = {
+                            let st = state.lock().await;
+                            st.subscriptions
+                                .lock()
+                                .await
+                                .get(&uri)
+                                .map(|s| s.peer.clone())
+                        };
+                        if let Some(peer) = peer {
+                            let _ = peer
+                                .notify_resource_updated(ResourceUpdatedNotificationParam::new(
+                                    uri.clone(),
+                                ))
+                                .await;
+                        } else {
+                            // Unsubscribed while notifying
+                            break;
+                        }
+                    }
+                    last_hash = Some(hash);
+                }
+                Err(e) => {
+                    tracing::warn!(uri = %uri, error = %e, "Polling read failed");
+                }
             }
         }
     })
@@ -191,5 +343,34 @@ mod tests {
     fn test_subscription_map() {
         let map: SubscriptionMap = HashMap::new();
         assert!(map.is_empty());
+    }
+
+    #[test]
+    fn test_content_hash_stable() {
+        let a = json!({ "id": "x", "title": "t" });
+        assert_eq!(content_hash(&a), content_hash(&a));
+    }
+
+    #[test]
+    fn test_content_hash_detects_change() {
+        let a = json!({ "id": "x", "title": "t" });
+        let b = json!({ "id": "x", "title": "changed" });
+        assert_ne!(content_hash(&a), content_hash(&b));
+    }
+
+    #[test]
+    fn test_content_hash_key_order_insensitive() {
+        // serde_json::Value uses ordered maps from JSON object syntax,
+        // so logically-equal objects constructed differently hash the same
+        let mut a = serde_json::Map::new();
+        a.insert("x".to_string(), json!(1));
+        a.insert("y".to_string(), json!(2));
+        let mut b = serde_json::Map::new();
+        b.insert("y".to_string(), json!(2));
+        b.insert("x".to_string(), json!(1));
+        assert_eq!(
+            content_hash(&Value::Object(a)),
+            content_hash(&Value::Object(b))
+        );
     }
 }

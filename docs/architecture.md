@@ -103,7 +103,7 @@ src/
 ├── resources.rs         MCP resources: gws:// URI scheme, resource templates from Discovery Documents
 ├── completions.rs       MCP completions: autocomplete for resource URIs and prompt arguments
 ├── elicitation.rs       MCP elicitation: structured user input, write approval (confirm_writes)
-├── subscriptions.rs     MCP subscriptions: Google Drive watch channels, webhook notifications
+├── subscriptions.rs     MCP subscriptions: Google Drive watch channels, webhook notifications, polling fallback for stdio mode
 ├── prompts.rs           MCP prompts: load external Markdown files, argument substitution
 ├── tasks.rs             Task lifecycle for resumable uploads and chunked downloads
 ├── metrics.rs           Prometheus counters, histograms, gauges

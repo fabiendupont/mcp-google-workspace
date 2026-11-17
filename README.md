@@ -210,6 +210,26 @@ The `tasks` service is exposed through curated helper tools:
 `gws_tasks_clear`. All default to the first task list when no
 `tasklist_id` is given.
 
+### Resource subscriptions (with polling fallback)
+
+Clients can subscribe to resources via `gws://service/resource/id` URIs.
+
+- In HTTP mode with `--external-url`, the server registers a Google Drive
+  push channel and forwards webhook notifications as
+  `notifications/resources/updated`.
+- Without webhook support (stdio mode, or HTTP without `--external-url`),
+  the server falls back to **polling**: it re-reads the resource on a
+  schedule and emits `notifications/resources/updated` whenever its
+  content changes. This works for any service with a `get` method, not
+  just Drive.
+
+The polling interval defaults to 60 seconds and can be tuned in the
+policy's `server` section:
+
+```json
+{ "server": { "subscription_poll_secs": 120 } }
+```
+
 Validate before deploying:
 
 ```bash

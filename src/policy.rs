@@ -72,6 +72,9 @@ pub struct ServerPolicy {
     pub rate_limits: Option<HashMap<String, u32>>,
     #[serde(default)]
     pub allowed_origins: Vec<String>,
+    /// Polling interval (seconds) for subscriptions without webhook support
+    #[serde(default = "default_subscription_poll_secs")]
+    pub subscription_poll_secs: u64,
     #[serde(default)]
     pub credentials_file: Option<String>,
     #[serde(default)]
@@ -89,6 +92,7 @@ impl Default for ServerPolicy {
             rate_limit_rpm: None,
             rate_limits: None,
             allowed_origins: Vec::new(),
+            subscription_poll_secs: default_subscription_poll_secs(),
             credentials_file: None,
             project_id: None,
             delegate_subject: None,
@@ -98,6 +102,10 @@ impl Default for ServerPolicy {
 
 fn default_max_request_bytes() -> usize {
     16 * 1024 * 1024
+}
+
+fn default_subscription_poll_secs() -> u64 {
+    60
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -123,6 +131,7 @@ pub struct Policy {
     pub rate_limit_rpm: Option<u32>,
     pub rate_limits: Option<HashMap<String, u32>>,
     pub allowed_origins: Vec<String>,
+    pub subscription_poll_secs: u64,
     pub credentials_file: Option<String>,
     pub project_id: Option<String>,
     pub delegate_subject: Option<String>,
@@ -203,6 +212,7 @@ impl Policy {
             rate_limit_rpm: file.server.rate_limit_rpm,
             rate_limits: file.server.rate_limits,
             allowed_origins: file.server.allowed_origins,
+            subscription_poll_secs: file.server.subscription_poll_secs,
             credentials_file: file.server.credentials_file,
             project_id: file.server.project_id,
             delegate_subject: file.server.delegate_subject,
@@ -1571,5 +1581,26 @@ mod tests {
         .unwrap();
         let p = Policy::from_policy_file(file);
         assert!(p.confirm_writes);
+    }
+
+    #[test]
+    fn test_subscription_poll_secs_default() {
+        let file: PolicyFile = serde_json::from_value(serde_json::json!({
+            "services": [{ "name": "drive" }]
+        }))
+        .unwrap();
+        let p = Policy::from_policy_file(file);
+        assert_eq!(p.subscription_poll_secs, 60);
+    }
+
+    #[test]
+    fn test_subscription_poll_secs_parsed() {
+        let file: PolicyFile = serde_json::from_value(serde_json::json!({
+            "server": { "subscription_poll_secs": 300 },
+            "services": [{ "name": "drive" }]
+        }))
+        .unwrap();
+        let p = Policy::from_policy_file(file);
+        assert_eq!(p.subscription_poll_secs, 300);
     }
 }

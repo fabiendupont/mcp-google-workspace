@@ -368,19 +368,6 @@ impl ServerHandler for GwsHandler {
                 McpError::invalid_params(format!("Invalid resource URI: {}", request.uri), None)
             })?;
 
-            let mut st = self.state.lock().await;
-            let webhook_url = st
-                .webhook_url
-                .as_ref()
-                .ok_or_else(|| {
-                    McpError::internal_error(
-                        "Subscriptions require HTTP mode with --external-url. \
-                     In stdio mode, Google cannot deliver webhook callbacks.",
-                        None,
-                    )
-                })?
-                .clone();
-
             let policy = self.policy.read().await;
             if !policy.is_service_allowed(&parsed.service) {
                 return Err(McpError::invalid_params(
@@ -389,43 +376,98 @@ impl ServerHandler for GwsHandler {
                 ));
             }
 
-            let (channel_id, resource_id, expiration_ms) = crate::subscriptions::watch_resource(
-                &parsed.service,
-                &parsed.id,
-                &webhook_url,
-                &mut st.token_cache,
-                &policy,
-            )
-            .await
-            .map_err(|e| {
-                McpError::internal_error(format!("Failed to watch resource: {e}"), None)
-            })?;
-
-            let expiration = std::time::Instant::now()
-                + std::time::Duration::from_millis(
-                    expiration_ms.saturating_sub(
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as u64,
-                    ),
-                );
-
-            let subscription = crate::subscriptions::Subscription {
-                uri: request.uri.clone(),
-                channel_id,
-                resource_id,
-                expiration,
-                peer,
-                service: parsed.service,
+            let webhook_url = {
+                let st = self.state.lock().await;
+                st.webhook_url.clone()
             };
 
-            st.subscriptions
-                .lock()
-                .await
-                .insert(request.uri, subscription);
-            tracing::info!("Subscription created for resource");
-            Ok(())
+            match webhook_url {
+                Some(webhook_url) => {
+                    let (channel_id, resource_id, expiration_ms) =
+                        crate::subscriptions::watch_resource(
+                            &parsed.service,
+                            &parsed.id,
+                            &webhook_url,
+                            &mut self.state.lock().await.token_cache,
+                            &policy,
+                        )
+                        .await
+                        .map_err(|e| {
+                            McpError::internal_error(format!("Failed to watch resource: {e}"), None)
+                        })?;
+
+                    let expiration = std::time::Instant::now()
+                        + std::time::Duration::from_millis(
+                            expiration_ms.saturating_sub(
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_millis() as u64,
+                            ),
+                        );
+
+                    let subscription = crate::subscriptions::Subscription {
+                        uri: request.uri.clone(),
+                        channel_id,
+                        resource_id,
+                        expiration,
+                        peer,
+                        service: parsed.service,
+                        polling: false,
+                    };
+
+                    let st = self.state.lock().await;
+                    st.subscriptions
+                        .lock()
+                        .await
+                        .insert(request.uri, subscription);
+                    tracing::info!("Subscription created for resource (webhook mode)");
+                    Ok(())
+                }
+                None => {
+                    // Polling fallback: no webhook URL (stdio mode or HTTP without
+                    // --external-url). Re-read the resource periodically and emit
+                    // resource-updated notifications on change.
+                    let interval =
+                        std::time::Duration::from_secs(policy.subscription_poll_secs.max(10));
+                    let cfg = crate::subscriptions::PollConfig {
+                        service: parsed.service.clone(),
+                        resource: parsed.resource,
+                        id: parsed.id,
+                        interval,
+                    };
+                    let subscription = crate::subscriptions::Subscription {
+                        uri: request.uri.clone(),
+                        channel_id: String::new(),
+                        resource_id: String::new(),
+                        expiration: std::time::Instant::now()
+                            + std::time::Duration::from_secs(10 * 365 * 24 * 3600),
+                        peer,
+                        service: parsed.service,
+                        polling: true,
+                    };
+
+                    let uri = request.uri;
+                    {
+                        let st = self.state.lock().await;
+                        st.subscriptions
+                            .lock()
+                            .await
+                            .insert(uri.clone(), subscription);
+                    }
+                    crate::subscriptions::spawn_poll_task(
+                        uri,
+                        cfg,
+                        self.state.clone(),
+                        self.policy.clone(),
+                    );
+                    tracing::info!(
+                        interval_secs = interval.as_secs(),
+                        "Subscription created for resource (polling mode)"
+                    );
+                    Ok(())
+                }
+            }
         }
     }
 
@@ -447,6 +489,12 @@ impl ServerHandler for GwsHandler {
             };
 
             let policy = self.policy.read().await;
+            if sub.polling {
+                // The poll task detects removal and exits on its own
+                tracing::info!(uri = %request.uri, "Polling subscription removed");
+                return Ok(());
+            }
+
             let _ = crate::subscriptions::stop_watch(
                 &sub.channel_id,
                 &sub.resource_id,
