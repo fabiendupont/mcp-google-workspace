@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.9.0] - 2026-11-17
+
+### Added
+- **Google Tasks service**: 8 curated `gws_tasks_*` tools (list task lists, list/get/create/update/complete/delete tasks, clear completed) with task-list auto-resolution and proper read-only/destructive annotations
+- **Write confirmation (`confirm_writes`)**: new `server.confirm_writes` policy option requiring explicit user approval via MCP elicitation before any mutating operation — data-driven from tool annotations, with identifying argument summaries (recipients, titles, IDs); `dry_run` skips confirmation, writes are denied when elicitation is unavailable, `gws_batch` is disabled in this mode
+- **Polling subscriptions**: `subscribe` now works without `--external-url` (stdio mode) by re-reading the resource on a schedule and emitting `notifications/resources/updated` on content change; works for any service with a `get` method, not just Drive; interval configurable via `server.subscription_poll_secs` (default 60s)
+- **Multi-user HTTP mode**: `--users-dir` serves many users from one process — each with isolated OAuth token cache, policy, credentials, subscriptions, tool cache, and a per-user audit log at `<user_dir>/audit.jsonl`; per-user endpoints at `/mcp/<user>` with optional `Authorization: Bearer` authentication via `server.api_token`; per-user SIGHUP policy reload; Drive webhook fan-out
+- **Workflow recipes**: `prompts/thread-to-doc.md` and `prompts/doc-to-slides.md` few-shot recipes for multi-service workflows (agents orchestrate primitive tools; recipes are user-editable without recompiling)
+- **`split_headings` option on `gws_slides_import_marp`**: deterministic plain-Markdown → slides conversion (each H1/H2 heading starts a slide)
+- **Registry manifests**: submission-ready `server.json` (official MCP Registry schema, validated), `glama.json`, Docker MCP Catalog payload, and a submissions checklist in `registry/`; 6 CI guards prevent manifest drift from the crate version
+- **`server.api_token`** and **`server.subscription_poll_secs`** policy options
+
+### Fixed
+- **Security advisories in transitive dependencies**: rustls 0.23.46 (RUSTSEC-2026-0285, RUSTSEC-2026-0346), rustls-webpki 0.103.17, tokio 1.54.1 (AsyncFd unsoundness), pulldown-cmark 0.13.6 (RUSTSEC-2026-0414/0433), rmcp 3.10.0 (RUSTSEC-2026-0457/0461/0462); chrono unmaintained advisory (RUSTSEC-2026-0543) ignored with rationale in deny.toml
+
+### Changed
+- **rmcp 3.2 → 3.10**: migrated deprecated `ServerInfo` alias to `ServerConfig`
+- **Multi-user mode limitation**: per-policy `rate_limit_rpm` is not enforced across users (logged as a warning at startup)
+
 ## [0.8.2] - 2026-09-02
 
 ### Added

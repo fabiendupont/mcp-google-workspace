@@ -3,7 +3,7 @@
   "name": "io.github.fabiendupont/mcp-google-workspace",
   "title": "Google Workspace MCP",
   "description": "MCP server for Google Workspace with per-project safety policies",
-  "version": "0.8.2",
+  "version": "0.9.0",
   "websiteUrl": "https://fabiendupont.io/mcp-google-workspace",
   "repository": {
     "url": "https://github.com/fabiendupont/mcp-google-workspace",
@@ -14,7 +14,7 @@
       "registryType": "oci",
       "identifier": "ghcr.io/fabiendupont/mcp-google-workspace",
       "registryBaseUrl": "https://ghcr.io",
-      "version": "0.8.2",
+      "version": "0.9.0",
       "runtimeHint": "docker",
       "runtimeArguments": [
         {
