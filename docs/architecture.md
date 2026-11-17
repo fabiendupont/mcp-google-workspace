@@ -96,6 +96,7 @@ src/
 ├── slides_helpers.rs    Google Slides enrichment (9 tools)
 ├── calendar_helpers.rs  Google Calendar enrichment (6 tools)
 ├── tasks_helpers.rs     Google Tasks enrichment (8 tools)
+├── composites.rs        Cross-service workflows: thread→Doc, Doc→Slides
 ├── format.rs            Format transformers: Markdown/Plain → Docs batchUpdate, doc → Markdown
 ├── marp.rs              Marp Markdown to Google Slides conversion
 ├── image_gen.rs         Gemini image generation and Drive upload

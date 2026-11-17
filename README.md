@@ -202,6 +202,23 @@ denied (rather than silently allowed) if the client cannot display approvals.
 `gws_batch` is disabled in this mode so every write goes through an
 individually confirmable call.
 
+### Cross-service composites
+
+Composite tools chain multiple services into one call, reusing the curated
+helpers (and therefore their policy enforcement, `confirm_writes`
+gating, and formatting):
+
+- **`gws_compose_thread_to_doc`** — Gmail thread → formatted Google Doc
+  (one section per message, participants summary, quoted text stripped).
+  Requires the `gmail` and `docs` services. Supports `dry_run`.
+- **`gws_compose_doc_to_slides`** — Google Doc → slide deck via the Marp
+  pipeline: each H1/H2 heading becomes a slide, bullets/tables/images
+  pass through, speaker notes supported. Requires the `docs` and
+  `slides` services. Supports `dry_run` and `template`.
+
+Both return the created resource IDs (`documentId`, `presentationId`)
+in their structured output.
+
 ### Google Tasks
 
 The `tasks` service is exposed through curated helper tools:
