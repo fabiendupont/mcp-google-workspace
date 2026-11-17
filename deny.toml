@@ -2,7 +2,12 @@
 targets = []
 
 [advisories]
-ignore = []
+ignore = [
+    # chrono is unmaintained (RUSTSEC-2026-0543). It is pulled in transitively
+    # by rmcp/schemars, not used directly by this crate. Tracked upstream in
+    # the rmcp project; revisit when rmcp migrates to jiff or time.
+    "RUSTSEC-2026-0543",
+]
 
 [licenses]
 allow = [
