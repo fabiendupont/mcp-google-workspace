@@ -1,12 +1,14 @@
 use serde_json::{Value, json};
 use std::path::Path;
 
+#[derive(Clone)]
 pub struct PromptArgument {
     pub name: String,
     pub description: String,
     pub required: bool,
 }
 
+#[derive(Clone)]
 pub struct Prompt {
     pub name: String,
     pub title: String,

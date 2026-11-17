@@ -49,6 +49,11 @@ struct Cli {
     #[arg(long)]
     audit_log: Option<PathBuf>,
 
+    /// Directory containing per-user subdirectories, each with a gws-policy.json
+    /// (multi-user HTTP mode: users are served at /mcp/<user>)
+    #[arg(long, requires = "http")]
+    users_dir: Option<PathBuf>,
+
     /// Directory containing prompt .md files
     #[arg(long)]
     prompts_dir: Option<PathBuf>,
@@ -119,6 +124,7 @@ struct ParsedArgs {
     eager_tools: bool,
     audit_log: Option<PathBuf>,
     prompts_dir: Option<PathBuf>,
+    users_dir: Option<PathBuf>,
 }
 
 fn parse_args_from(args: &[String]) -> Result<Command, GwsError> {
@@ -169,6 +175,7 @@ fn cli_to_command(cli: Cli) -> Result<Command, GwsError> {
             eager_tools: cli.eager_tools,
             audit_log: cli.audit_log,
             prompts_dir: cli.prompts_dir,
+            users_dir: cli.users_dir,
         })),
     }
 }
@@ -792,6 +799,48 @@ async fn main() {
     let external_url = parsed.external_url.clone();
     let compact_schemas = parsed.compact_schemas;
     let eager_tools = parsed.eager_tools;
+    let users_dir_flag = parsed.users_dir.clone();
+    let http_addr_flag = parsed.http_addr.clone();
+
+    // Multi-user HTTP mode: per-user policies and credentials, no global
+    // policy required. Each user is served at /mcp/<user>.
+    if let Some(users_dir) = users_dir_flag {
+        let prompts_dir = prompts_dir_flag.filter(|d| d.is_dir());
+        let prompts = prompts::load_prompts(prompts_dir.as_deref());
+        if !prompts.is_empty() {
+            tracing::info!(count = prompts.len(), "Loaded MCP prompts");
+        }
+
+        let users = match users::load_users(&users_dir, &prompts, eager_tools, external_url.clone())
+        {
+            Ok(u) => u,
+            Err(e) => {
+                eprintln!("Error loading users from {}: {e}", users_dir.display());
+                std::process::exit(1);
+            }
+        };
+        tracing::info!(
+            count = users.len(),
+            users = %users
+                .iter()
+                .map(|u| u.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            "Starting multi-user MCP HTTP server"
+        );
+        tracing::warn!(
+            "Multi-user mode: per-policy rate limits are not enforced \
+             across users in this mode"
+        );
+
+        let result =
+            http::serve_users(users, &http_addr_flag.unwrap_or_default(), external_url).await;
+        if let Err(e) = result {
+            eprintln!("Fatal: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
 
     let (mut policy, transport) = match resolve_config(parsed) {
         Ok(p) => p,
@@ -974,6 +1023,7 @@ mod tests {
             eager_tools: false,
             audit_log: None,
             prompts_dir: None,
+            users_dir: None,
         };
         let (policy, _) = resolve_config(parsed).unwrap();
         assert!(policy.is_service_allowed("drive"));
@@ -996,6 +1046,7 @@ mod tests {
             eager_tools: false,
             audit_log: None,
             prompts_dir: None,
+            users_dir: None,
         };
         let result = resolve_config(parsed);
         std::env::set_current_dir(prev).unwrap();
@@ -1014,6 +1065,7 @@ mod tests {
             eager_tools: false,
             audit_log: None,
             prompts_dir: None,
+            users_dir: None,
         };
         let (_, transport) = resolve_config(parsed).unwrap();
         assert!(matches!(transport, Transport::Http(addr) if addr == "0.0.0.0:8080"));
@@ -1030,6 +1082,7 @@ mod tests {
             eager_tools: false,
             audit_log: None,
             prompts_dir: None,
+            users_dir: None,
         };
         let (_, transport) = resolve_config(parsed).unwrap();
         assert!(matches!(transport, Transport::Stdio));
@@ -1046,6 +1099,7 @@ mod tests {
             eager_tools: false,
             audit_log: None,
             prompts_dir: None,
+            users_dir: None,
         };
         assert!(resolve_config(parsed).is_err());
     }
@@ -1348,5 +1402,39 @@ mod tests {
     fn test_parse_prompts_dir_missing_value() {
         let err = parse_args_from(&args(&["--prompts-dir"]));
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_parse_users_dir_with_http() {
+        let parsed = unwrap_serve(
+            parse_args_from(&args(&[
+                "--users-dir",
+                "/srv/gws-users",
+                "--http",
+                "0.0.0.0:3000",
+            ]))
+            .unwrap(),
+        );
+        assert_eq!(parsed.users_dir, Some(PathBuf::from("/srv/gws-users")));
+        assert_eq!(parsed.http_addr.as_deref(), Some("0.0.0.0:3000"));
+    }
+
+    #[test]
+    fn test_parse_users_dir_requires_http() {
+        // --users-dir without --http must be rejected by clap
+        let err = parse_args_from(&args(&["--users-dir", "/srv/gws-users"]));
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_parse_users_dir_missing_value() {
+        let err = parse_args_from(&args(&["--users-dir"]));
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_parse_users_dir_default_none() {
+        let parsed = unwrap_serve(parse_args_from(&args(&["--services", "drive"])).unwrap());
+        assert!(parsed.users_dir.is_none());
     }
 }

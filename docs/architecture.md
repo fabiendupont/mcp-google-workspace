@@ -80,7 +80,8 @@ src/
 ├── lib.rs               Library crate root, module declarations
 ├── handler.rs           rmcp ServerHandler: tools, prompts, resources, completions, tasks, elicitation, subscriptions, lazy discovery
 ├── server.rs            Tool dispatch, shared utilities, image gen, batch, tasks
-├── http.rs              Hybrid Axum server: rmcp StreamableHttpService + health/metrics/webhooks
+├── http.rs              Hybrid Axum server: rmcp StreamableHttpService + health/metrics/webhooks, multi-user routing and bearer auth
+├── users.rs             Multi-user mode: per-user policy/state loading from a users directory
 ├── execute.rs           HTTP execution: URL rendering, params, pagination, resumable uploads, rate limiting
 ├── policy.rs            JSON policy engine: constraints, method denylists, read-only, recursive parent ancestry
 ├── tools.rs             Builds MCP tool list, lazy filtering by activated services, compact schema mode
@@ -112,7 +113,28 @@ src/
 
 ## Multi-User Deployment
 
-Each user gets their own server instance with their own credentials and policy:
+There are two ways to run multiple users:
+
+**Single process (multi-user mode)** — run one HTTP server with a users
+directory; each user gets an isolated state, policy, credentials, and
+audit log, served at `/mcp/<user>` with optional bearer-token
+authentication (`server.api_token`):
+
+```mermaid
+graph LR
+    subgraph "One mcp-gws process"
+        M[Multi-user HTTP server]
+        M --> UA2[User alice<br/>state + policy + creds]
+        M --> UB2[User bob<br/>state + policy + creds]
+    end
+    AA[Alice's agent] -->|/mcp/alice + Bearer token| M
+    BB[Bob's agent] -->|/mcp/bob| M
+    UA2 --> GA[Google APIs<br/>Alice's data]
+    UB2 --> GB[Google APIs<br/>Bob's data]
+```
+
+**One process per user** — each user gets their own server instance with
+their own credentials and policy:
 
 ```mermaid
 graph LR

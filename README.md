@@ -230,6 +230,48 @@ policy's `server` section:
 { "server": { "subscription_poll_secs": 120 } }
 ```
 
+### Multi-user mode (single process, many users)
+
+Instead of running one server per user, a single HTTP process can serve
+many users, each with **isolated credentials, policy, token cache, audit
+log, and subscriptions**:
+
+```
+users-dir/
+├── alice/
+│   ├── gws-policy.json     # alice's services, constraints, credentials
+│   └── audit.jsonl         # created automatically: alice's audit trail
+└── bob/
+    └── gws-policy.json
+```
+
+```bash
+mcp-google-workspace --http 0.0.0.0:3000 --users-dir /srv/gws-users
+```
+
+Each user's agent connects to its own endpoint: `http://host:3000/mcp/alice`,
+`http://host:3000/mcp/bob`, and so on. Directory names must be URL-safe
+(letters, digits, `-`, `_`).
+
+**Per-user authentication**: set `server.api_token` in a user's policy to
+require `Authorization: Bearer <token>` on that user's endpoint:
+
+```json
+{ "server": { "api_token": "a-long-random-secret" }, "services": [ ... ] }
+```
+
+Requests with a missing or wrong token get `401 Unauthorized`. Users
+without an `api_token` have open endpoints — put the server behind a
+reverse proxy or network boundary in that case.
+
+Notes and limitations:
+
+- Policies reload on `SIGHUP` per user, without restarting the server.
+- Drive webhooks fan out to all users (channel IDs are globally unique).
+- Per-policy `rate_limit_rpm` is not enforced across users in this mode
+  (the limiter is process-global in single-user mode only).
+- stdio mode remains single-user by design: one process, one policy.
+
 Validate before deploying:
 
 ```bash

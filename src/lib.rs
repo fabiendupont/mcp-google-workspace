@@ -30,3 +30,4 @@ pub mod subscriptions;
 pub mod tasks;
 pub mod tasks_helpers;
 pub mod tools;
+pub mod users;

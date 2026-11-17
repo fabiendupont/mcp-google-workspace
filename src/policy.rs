@@ -81,6 +81,9 @@ pub struct ServerPolicy {
     pub project_id: Option<String>,
     #[serde(default)]
     pub delegate_subject: Option<String>,
+    /// Bearer token required to access this server instance (HTTP multi-user mode)
+    #[serde(default)]
+    pub api_token: Option<String>,
 }
 
 impl Default for ServerPolicy {
@@ -96,6 +99,7 @@ impl Default for ServerPolicy {
             credentials_file: None,
             project_id: None,
             delegate_subject: None,
+            api_token: None,
         }
     }
 }
@@ -135,6 +139,7 @@ pub struct Policy {
     pub credentials_file: Option<String>,
     pub project_id: Option<String>,
     pub delegate_subject: Option<String>,
+    pub api_token: Option<String>,
     pub compact_schemas: bool,
     services: HashMap<String, ServicePolicy>,
     templates: Vec<TemplateEntry>,
@@ -216,6 +221,7 @@ impl Policy {
             credentials_file: file.server.credentials_file,
             project_id: file.server.project_id,
             delegate_subject: file.server.delegate_subject,
+            api_token: file.server.api_token,
             compact_schemas: false,
             services,
             templates: file.templates,
