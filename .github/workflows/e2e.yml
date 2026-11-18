@@ -74,9 +74,7 @@ jobs:
         run: mkdir -p "$TMPDIR"
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@1c76d1459064d8f3d2b221b01d84c1ecc8a260fe # 1.120.0
-        with:
-          toolchain: 1.120.0
+      - uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Prepare credentials and writable TMPDIR

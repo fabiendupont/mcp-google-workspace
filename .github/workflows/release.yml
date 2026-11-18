@@ -171,6 +171,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Some runner images default to the `docker` buildx driver, which cannot
+      # attach provenance attestations ("Attestation is not supported for the
+      # docker driver"). Create the docker-container builder explicitly so both
+      # architectures produce the same attestation shape regardless of image.
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
       - name: Resolve version
         id: version
         env:
@@ -215,6 +221,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Some runner images default to the `docker` buildx driver, which cannot
+      # attach provenance attestations ("Attestation is not supported for the
+      # docker driver"). Create the docker-container builder explicitly so both
+      # architectures produce the same attestation shape regardless of image.
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
       - name: Resolve version
         id: version
         env:
@@ -240,6 +252,12 @@ jobs:
   # One scan per architecture, addressed by the digest the build job pushed so
   # the scanned bytes are provably the built bytes. Findings are blocking and
   # every architecture gets a CycloneDX SBOM.
+  #
+  # The platform is stated explicitly. A per-arch digest is a single-platform
+  # image index, and trivy's platform default is not the host architecture: an
+  # arm64 runner asked for `linux/amd64` and the remote source refused with
+  # "no child with platform linux/amd64 in index". With the platform pinned, the
+  # arm64 scan runs on the ordinary runner and still reads the arm64 bytes.
   scan:
     name: Scan ${{ matrix.arch }}
     needs: [guard, build-amd64, build-arm64]
@@ -281,6 +299,16 @@ jobs:
           fi
           echo "ref=${REGISTRY}/${IMAGE_NAME}@${digest}" >> "$GITHUB_OUTPUT"
 
+      # Passed to every trivy step as `trivy-config`, which the action maps to
+      # TRIVY_CONFIG. `image.platform` is trivy's own config key for --platform
+      # (see PlatformFlag in trivy's pkg/flag/image_flags.go).
+      - name: Pin the scan platform
+        run: |
+          set -euo pipefail
+          mkdir -p .trivy
+          printf 'image:\n  platform: linux/%s\n' "${{ matrix.arch }}" > .trivy/config.yaml
+          cat .trivy/config.yaml
+
       # SBOM first: it must exist even when the vulnerability gate below fails.
       - name: Generate CycloneDX SBOM
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
@@ -288,6 +316,7 @@ jobs:
           image-ref: ${{ steps.img.outputs.ref }}
           format: cyclonedx
           scanners: vuln
+          trivy-config: .trivy/config.yaml
           # Pinned explicitly instead of relying on the action's default.
           version: 'v0.70.0'
           output: sbom-${{ matrix.arch }}.cdx.json
@@ -317,6 +346,7 @@ jobs:
           severity: 'CRITICAL,HIGH'
           ignore-unfixed: true
           exit-code: '1'
+          trivy-config: .trivy/config.yaml
           version: 'v0.70.0'
           output: trivy-${{ matrix.arch }}.txt
 
@@ -336,6 +366,7 @@ jobs:
           ignore-unfixed: true
           # SARIF otherwise includes every severity regardless of `severity`.
           limit-severities-for-sarif: true
+          trivy-config: .trivy/config.yaml
           version: 'v0.70.0'
           output: trivy-${{ matrix.arch }}.sarif
 
@@ -350,7 +381,10 @@ jobs:
     name: Sign and publish
     needs: [guard, build-amd64, build-arm64, scan]
     runs-on: ubuntu-latest
-    # Manual approval gate before anything is published.
+    # Publishing happens inside the `release` environment so reviewer and branch
+    # rules can be attached to it in repository settings. The reference on its
+    # own gates nothing: with no protection rules configured, the job runs as
+    # soon as its dependencies pass.
     environment: release
     permissions:
       contents: write
