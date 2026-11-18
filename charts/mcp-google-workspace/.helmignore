@@ -1,0 +1,5 @@
+# Patterns are matched against the path inside the chart directory.
+ci/
+*.tgz
+*.tmp
+.DS_Store

@@ -21,6 +21,13 @@
 #   SHA256SUMS.sig          (keyless Sigstore signature over SHA256SUMS)
 #   SHA256SUMS.pem          (Fulcio certificate for that signature)
 #
+# and the `chart` job adds the Helm chart, signed the same way:
+#   mcp-google-workspace-<version>.tgz
+#   SHA256SUMS.chart / SHA256SUMS.chart.sig / SHA256SUMS.chart.pem
+#
+# The chart is also pushed (and separately signed) as an OCI artifact:
+#   oci://ghcr.io/fabiendupont/charts/mcp-google-workspace:<version>
+#
 # 1. Download the assets into one directory, then check the checksums:
 #
 #      sha256sum --check --ignore-missing SHA256SUMS
@@ -502,6 +509,135 @@ jobs:
             dist/SHA256SUMS
             dist/SHA256SUMS.sig
             dist/SHA256SUMS.pem
+
+  # The chart is published from here rather than from a separate
+  # `workflow_run` workflow so its cosign certificate is bound to the version
+  # tag, exactly like the binaries: the identity attests
+  # "release.yml on refs/tags/vX.Y.Z", not "some workflow on the default
+  # branch". A failed chart publish can be retried at the tag with
+  # `.github/workflows/chart.yml`.
+  chart:
+    name: Publish Helm chart
+    needs: [guard, release]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+      # Push the chart to GHCR.
+      packages: write
+      # Keyless Sigstore signing of the chart checksums and OCI artifact.
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.guard.outputs.sha }}
+
+      # Pinned and checksum-verified: the same binary the CI chart job uses, so
+      # packaging is identical between linting and publishing.
+      - name: Install Helm
+        env:
+          HELM_VERSION: v3.16.4
+          HELM_SHA256: fc307327959aa38ed8f9f7e66d45492bb022a66c3e5da6063958254b9767d179
+        run: |
+          set -euo pipefail
+          curl -fsSLo /tmp/helm.tar.gz "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
+          echo "${HELM_SHA256}  /tmp/helm.tar.gz" | sha256sum --check --strict
+          tar -xzf /tmp/helm.tar.gz -C /tmp
+          sudo install -m 0755 /tmp/linux-amd64/helm /usr/local/bin/helm
+          helm version --short
+
+      # The chart ships with the image it deploys, so a release without a chart
+      # bump is a bug: fail rather than publish a chart whose appVersion points
+      # at different bytes.
+      - name: Verify the chart version matches the tag
+        env:
+          TAG: ${{ needs.guard.outputs.tag }}
+          VERSION: ${{ needs.guard.outputs.version }}
+        run: |
+          set -euo pipefail
+          chart_version="$(helm show chart charts/mcp-google-workspace | awk '$1 == "version:" {print $2}')"
+          app_version="$(helm show chart charts/mcp-google-workspace | awk '$1 == "appVersion:" {print $2}' | tr -d '"')"
+          for entry in "version=${chart_version}" "appVersion=${app_version}"; do
+            field="${entry%%=*}"
+            value="${entry#*=}"
+            if [ "$value" != "$VERSION" ]; then
+              echo "::error::charts/mcp-google-workspace/Chart.yaml ${field} is '${value}', expected '${VERSION}' from ${TAG}; bump the chart with the release"
+              exit 1
+            fi
+          done
+
+      - name: Lint and render
+        run: |
+          set -euo pipefail
+          helm lint charts/mcp-google-workspace \
+            --values charts/mcp-google-workspace/ci/plain-values.yaml
+          helm template mcp-google-workspace charts/mcp-google-workspace \
+            --namespace mcp-google-workspace \
+            --values charts/mcp-google-workspace/ci/plain-values.yaml > /dev/null
+
+      - name: Package and checksum
+        env:
+          VERSION: ${{ needs.guard.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          helm package charts/mcp-google-workspace --destination dist
+          test -f "dist/mcp-google-workspace-${VERSION}.tgz"
+          # Deliberately not `SHA256SUMS`: that name already belongs to the
+          # binaries, and clobbering it would overwrite a signed asset.
+          (cd dist && sha256sum "mcp-google-workspace-${VERSION}.tgz" > SHA256SUMS.chart && cat SHA256SUMS.chart)
+
+      - uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
+        with:
+          cosign-release: 'v2.5.3'
+
+      - name: Sign chart checksums
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes \
+            --output-signature dist/SHA256SUMS.chart.sig \
+            --output-certificate dist/SHA256SUMS.chart.pem \
+            dist/SHA256SUMS.chart
+
+      - name: Log in to GHCR
+        env:
+          TOKEN: ${{ github.token }}
+        run: echo "$TOKEN" | helm registry login "$REGISTRY" --username "${{ github.actor }}" --password-stdin
+
+      - name: Push the chart
+        env:
+          VERSION: ${{ needs.guard.outputs.version }}
+        run: |
+          set -euo pipefail
+          helm push "dist/mcp-google-workspace-${VERSION}.tgz" \
+            "oci://${REGISTRY}/${{ github.repository_owner }}/charts"
+
+      # Signs the OCI manifest, then verifies the signature against the exact
+      # identity this run is allowed to have, so a signing misconfiguration
+      # fails the release instead of publishing an unverifiable chart.
+      - name: Sign and verify the published chart
+        env:
+          VERSION: ${{ needs.guard.outputs.version }}
+        run: |
+          set -euo pipefail
+          ref="${REGISTRY}/${{ github.repository_owner }}/charts/mcp-google-workspace:${VERSION}"
+          cosign sign --yes "$ref"
+          cosign verify "$ref" \
+            --certificate-identity "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/release.yml@${GITHUB_REF}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com > /dev/null
+          echo "::notice::published ${ref}"
+
+      - name: Attach the chart to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.guard.outputs.tag }}
+        run: |
+          gh release upload "$TAG" \
+            dist/*.tgz \
+            dist/SHA256SUMS.chart \
+            dist/SHA256SUMS.chart.sig \
+            dist/SHA256SUMS.chart.pem \
+            --clobber
 
   # Convenience alias, deliberately isolated from the release job: `:latest` is
   # mutable, so an erroneous or compromised push must not be able to move what a

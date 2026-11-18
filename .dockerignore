@@ -32,6 +32,8 @@ Thumbs.db
 # --- Documentation (never COPY'd; README stays for buildx/agent consumers) --
 *.md
 !README.md
+# The Helm chart is a deployment artifact, not a build input.
+charts/
 
 # --- Test harness state ----------------------------------------------------
 # The navra configs embed token_hash values, and results/ holds recorded runs.

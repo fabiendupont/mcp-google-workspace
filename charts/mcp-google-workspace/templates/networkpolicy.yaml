@@ -1,0 +1,68 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "mcp-google-workspace.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "mcp-google-workspace.labels" . | nindent 4 }}
+    app.kubernetes.io/component: network
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "mcp-google-workspace.selectorLabels" . | nindent 6 }}
+  # Ingress is default-deny: only the rules below reach the HTTP port. Egress is
+  # default-deny too: DNS, HTTPS to the public internet with link-local and the
+  # RFC1918 ranges excluded, and whatever extraRules adds. Everything else —
+  # the cloud metadata endpoint (169.254.169.254), the Kubernetes API server,
+  # in-cluster services, any non-443 protocol — is dropped.
+  #
+  # kubelet probes originate from the node's networking stack, outside the pod
+  # network, and are always permitted under ingress isolation. They must not be
+  # allowed with an ipBlock rule, which would also admit every pod on that CIDR.
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    {{- if .Values.networkPolicy.ingress.clientPeers }}
+    - from:
+        {{- toYaml .Values.networkPolicy.ingress.clientPeers | nindent 8 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.containerPort }}
+    {{- end }}
+    {{- if .Values.networkPolicy.ingress.monitoring.enabled }}
+    - from:
+        - namespaceSelector:
+            {{- toYaml .Values.networkPolicy.ingress.monitoring.namespaceSelector | nindent 12 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.containerPort }}
+    {{- end }}
+    {{- with .Values.networkPolicy.ingress.extraRules }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  egress:
+    {{- if .Values.networkPolicy.egress.dns.enabled }}
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- end }}
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            {{- with .Values.networkPolicy.egress.https.except }}
+            except:
+              {{- toYaml . | nindent 14 }}
+            {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.egress.https.port }}
+    {{- with .Values.networkPolicy.egress.extraRules }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}

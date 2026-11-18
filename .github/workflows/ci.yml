@@ -65,3 +65,107 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2.1.2
+
+  # The chart is the supported Kubernetes path; deploy/kubernetes/ stays as the
+  # kustomize alternative. Both describe the same workload, so the last step
+  # compares their renderings (scripts/chart-drift.py) and fails on drift.
+  chart:
+    name: Helm Chart
+    runs-on: ubuntu-latest
+    env:
+      HELM_VERSION: v3.16.4
+      # linux-amd64 tarball from https://get.helm.sh/helm-v3.16.4-linux-amd64.tar.gz.sha256sum
+      HELM_SHA256: fc307327959aa38ed8f9f7e66d45492bb022a66c3e5da6063958254b9767d179
+      VALUES: charts/mcp-google-workspace/ci/plain-values.yaml
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Pinned and checksum-verified rather than trusting the runner's copy, so
+      # `helm lint`/`helm template` behave the same as in the release job.
+      - name: Install Helm
+        run: |
+          set -euo pipefail
+          curl -fsSLo /tmp/helm.tar.gz "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
+          echo "${HELM_SHA256}  /tmp/helm.tar.gz" | sha256sum --check --strict
+          tar -xzf /tmp/helm.tar.gz -C /tmp
+          sudo install -m 0755 /tmp/linux-amd64/helm /usr/local/bin/helm
+          helm version --short
+
+      - name: Install PyYAML
+        run: |
+          set -euo pipefail
+          python3 -m venv /tmp/chart-venv
+          /tmp/chart-venv/bin/pip install --quiet --disable-pip-version-check pyyaml==6.0.3
+
+      - name: Lint
+        run: helm lint charts/mcp-google-workspace --values "$VALUES"
+
+      # A rendering that silently falls back to a tag is the failure this chart
+      # exists to prevent, so the missing-digest and bad-digest paths are tested
+      # rather than assumed.
+      - name: Require a digest
+        run: |
+          set -euo pipefail
+          if helm template mcp-google-workspace charts/mcp-google-workspace \
+              --set auth.token=test-token --set credentials.existingSecret=creds \
+              >/dev/null 2>/tmp/digest.err; then
+            echo "::error::chart rendered without image.digest"
+            exit 1
+          fi
+          grep -q 'image.digest is required' /tmp/digest.err
+          if helm template mcp-google-workspace charts/mcp-google-workspace \
+              --values "$VALUES" --set image.digest=sha256:abc \
+              >/dev/null 2>/tmp/digest-format.err; then
+            echo "::error::chart accepted a malformed digest"
+            exit 1
+          fi
+          grep -q 'must be a sha256' /tmp/digest-format.err
+
+      - name: Reject half-configured auth
+        run: |
+          set -euo pipefail
+          if helm template mcp-google-workspace charts/mcp-google-workspace \
+              --values "$VALUES" --set auth.token=test-token \
+              >/dev/null 2>/tmp/auth.err; then
+            echo "::error::chart accepted both auth.existingSecret and auth.token"
+            exit 1
+          fi
+          grep -q 'not both' /tmp/auth.err
+
+      - name: Render the other value paths
+        run: |
+          set -euo pipefail
+          DIGEST="sha256:$(printf 'a%.0s' {1..64})"
+          helm template mcp-google-workspace charts/mcp-google-workspace --namespace prod \
+            --set image.digest="$DIGEST" \
+            --set auth.token=test-token \
+            --set credentials.existingSecret=creds \
+            --set podDisruptionBudget.enabled=true \
+            --set metrics.serviceMonitor.enabled=true \
+            --set 'config.extraAllowedHosts={mcp.example.com}' \
+            > /tmp/alt.yaml
+          grep -q 'kind: PodDisruptionBudget' /tmp/alt.yaml
+          grep -q 'kind: ServiceMonitor' /tmp/alt.yaml
+          grep -q 'name: mcp-google-workspace-auth' /tmp/alt.yaml
+          grep -q 'mcp-google-workspace.prod.svc.cluster.local,mcp.example.com' /tmp/alt.yaml
+
+          # policy.raw is parsed at render time, so a YAML file must be rejected
+          # instead of landing in policy.json as broken JSON.
+          if helm template mcp-google-workspace charts/mcp-google-workspace \
+              --set image.digest="$DIGEST" --set auth.token=test-token \
+              --set credentials.existingSecret=creds \
+              --set-file policy.raw=charts/mcp-google-workspace/ci/plain-values.yaml \
+              >/dev/null 2>/tmp/raw.err; then
+            echo "::error::chart accepted a non-JSON policy.raw"
+            exit 1
+          fi
+          echo '{"server":{"read_only":true}}' > /tmp/policy.json
+          helm template mcp-google-workspace charts/mcp-google-workspace \
+            --set image.digest="$DIGEST" --set auth.token=test-token \
+            --set credentials.existingSecret=creds \
+            --set-file policy.raw=/tmp/policy.json \
+            | grep -q '"read_only": true'
+
+      - name: Drift check against deploy/kubernetes
+        run: /tmp/chart-venv/bin/python scripts/chart-drift.py --helm /usr/local/bin/helm
+

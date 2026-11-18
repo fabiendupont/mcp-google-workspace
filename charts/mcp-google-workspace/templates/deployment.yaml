@@ -1,0 +1,141 @@
+{{- include "mcp-google-workspace.validate" . }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "mcp-google-workspace.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "mcp-google-workspace.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "mcp-google-workspace.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mcp-google-workspace.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: server
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- if or .Values.metrics.annotations .Values.podAnnotations }}
+      annotations:
+        {{- if .Values.metrics.annotations }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.containerPort | quote }}
+        prometheus.io/path: "/metrics"
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- end }}
+    spec:
+      # The server talks to Google APIs with mounted credentials and never calls
+      # the Kubernetes API, so no service account token is needed.
+      automountServiceAccountToken: false
+      {{- if .Values.serviceAccount.create }}
+      serviceAccountName: {{ include "mcp-google-workspace.serviceAccountName" . }}
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: mcp-gws
+          image: {{ include "mcp-google-workspace.image" . }}
+          {{- with .Values.image.pullPolicy }}
+          imagePullPolicy: {{ . }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.containerPort }}
+              protocol: TCP
+          # Explicit args, so the startup policy and the audit trail do not
+          # depend on the image CMD, which omits --audit-log.
+          args:
+            - "--policy"
+            - "/etc/mcp-google-workspace/policy.json"
+            - "--http"
+            - "0.0.0.0:{{ .Values.containerPort }}"
+            {{- with .Values.audit.logPath }}
+            - "--audit-log"
+            - {{ . | quote }}
+            {{- end }}
+            {{- range .Values.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          env:
+            - name: GOOGLE_APPLICATION_CREDENTIALS
+              value: /secrets/credentials.json
+            - name: RUST_LOG
+              value: {{ .Values.config.rustLog | quote }}
+            - name: GWS_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "mcp-google-workspace.tokenSecretName" . }}
+                  key: {{ .Values.auth.secretKey }}
+            - name: GWS_ALLOWED_HOSTS
+              value: {{ include "mcp-google-workspace.allowedHosts" . | quote }}
+            {{- with .Values.config.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.startupProbe }}
+          startupProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+            - name: policy
+              mountPath: /etc/mcp-google-workspace
+              readOnly: true
+            - name: gcp-credentials
+              mountPath: /secrets
+              readOnly: true
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: policy
+          configMap:
+            name: {{ include "mcp-google-workspace.policyConfigMapName" . }}
+        - name: gcp-credentials
+          secret:
+            secretName: {{ .Values.credentials.existingSecret }}
+            # 0440, not 0400: the files are owned by root and group fsGroup
+            # (1001) while the process runs as uid 1001. 0400 would leave the
+            # server unable to read its own credentials.
+            defaultMode: 0440
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

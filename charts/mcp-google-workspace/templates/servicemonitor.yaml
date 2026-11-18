@@ -1,0 +1,31 @@
+{{- if .Values.metrics.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "mcp-google-workspace.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "mcp-google-workspace.labels" . | nindent 4 }}
+    app.kubernetes.io/component: monitoring
+    {{- with .Values.metrics.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "mcp-google-workspace.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: {{ .Values.metrics.serviceMonitor.interval }}
+      {{- with .Values.metrics.serviceMonitor.scrapeTimeout }}
+      scrapeTimeout: {{ . }}
+      {{- end }}
+      # /metrics requires the same bearer token as /mcp; without this every
+      # scrape gets a 401.
+      authorization:
+        type: Bearer
+        credentials:
+          name: {{ include "mcp-google-workspace.tokenSecretName" . }}
+          key: {{ .Values.auth.secretKey }}
+{{- end }}

@@ -1,0 +1,17 @@
+{{- if not .Values.policy.existingConfigMap }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "mcp-google-workspace.policyConfigMapName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "mcp-google-workspace.labels" . | nindent 4 }}
+    app.kubernetes.io/component: config
+data:
+  # Mounted at /etc/mcp-google-workspace/policy.json and passed with --policy.
+  # This is the live startup policy, not an example. A reduced max_request_bytes
+  # only takes effect for chunked bodies after a restart; other edits are
+  # picked up on SIGHUP, which also clears the tools cache.
+  policy.json: |
+    {{- include "mcp-google-workspace.policyJson" . | nindent 4 }}
+{{- end }}

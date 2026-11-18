@@ -1,0 +1,21 @@
+# Values that make the chart render deploy/kubernetes/ exactly.
+#
+# scripts/chart-drift.py renders this file and compares the result with the
+# plain kustomize manifests, so the two copies of the workload cannot drift.
+# Nothing here is recommended for a real install: the digest is the same
+# all-zero placeholder the Deployment ships (it fails closed) and the policy is
+# the default one, whose <FOLDER_ID> matches nothing.
+replicaCount: 1
+image:
+  digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+auth:
+  # The plain Deployment reads key api-token from this Secret.
+  existingSecret: mcp-gws-api-token
+credentials:
+  existingSecret: mcp-gws-credentials
+policy:
+  # Keep the plain ConfigMap's name so the Deployment's volume matches.
+  configMapName: mcp-gws-policy
+metrics:
+  serviceMonitor:
+    enabled: true

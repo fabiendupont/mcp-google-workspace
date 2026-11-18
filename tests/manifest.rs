@@ -1,5 +1,5 @@
-//! Guards for the registry manifests (server.json, glama.json).
-//! These prevent the manifests from drifting out of sync with the crate.
+//! Guards for the registry manifests (server.json, glama.json) and the Helm
+//! chart. These prevent the manifests from drifting out of sync with the crate.
 
 use serde_json::Value;
 
@@ -87,6 +87,69 @@ fn server_json_package_shape() {
     assert_eq!(
         oci["identifier"], "ghcr.io/fabiendupont/mcp-google-workspace",
         "oci package must reference the ghcr.io image published by release.yml"
+    );
+}
+
+/// Top-level scalar keys of the chart's Chart.yaml. The file is ours and flat at
+/// the top level, so this avoids a YAML dependency just to read two versions.
+fn chart_metadata() -> std::collections::HashMap<String, String> {
+    let path = repo_root("charts/mcp-google-workspace/Chart.yaml");
+    let content = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+    content
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#') && !line.trim().is_empty())
+        .filter_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            // Nested mappings and list items are indented.
+            if key.starts_with([' ', '\t', '-']) {
+                return None;
+            }
+            let value = value.trim();
+            let value = value
+                .strip_prefix('"')
+                .and_then(|v| v.strip_suffix('"'))
+                .unwrap_or(value);
+            Some((key.trim().to_string(), value.to_string()))
+        })
+        .collect()
+}
+
+#[test]
+fn chart_version_matches_crate() {
+    let chart = chart_metadata();
+    assert_eq!(
+        chart.get("name").map(String::as_str),
+        Some("mcp-google-workspace"),
+        "the chart directory and Chart.yaml name must stay in sync"
+    );
+    assert_eq!(
+        chart.get("version").map(String::as_str),
+        Some(env!("CARGO_PKG_VERSION")),
+        "charts/mcp-google-workspace/Chart.yaml version must match Cargo.toml — \
+         the chart is released with the image it deploys, so bump both"
+    );
+    assert_eq!(
+        chart.get("appVersion").map(String::as_str),
+        Some(env!("CARGO_PKG_VERSION")),
+        "charts/mcp-google-workspace/Chart.yaml appVersion must match Cargo.toml"
+    );
+}
+
+#[test]
+fn chart_deploys_the_published_image() {
+    let path = repo_root("charts/mcp-google-workspace/values.yaml");
+    let content = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+    let repository = content
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("repository:"))
+        .map(|value| value.trim().trim_matches('"'))
+        .expect("values.yaml must set image.repository");
+    assert_eq!(
+        repository, "ghcr.io/fabiendupont/mcp-google-workspace",
+        "the chart must default to the image release.yml publishes"
     );
 }
 

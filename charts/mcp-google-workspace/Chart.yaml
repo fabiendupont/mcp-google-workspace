@@ -1,0 +1,31 @@
+apiVersion: v2
+name: mcp-google-workspace
+description: >-
+  MCP server for Google Workspace (Drive, Gmail, Calendar) with a startup
+  policy that scopes every tool call.
+type: application
+# version and appVersion are kept equal to the crate version: the chart is
+# released with the image it deploys. `tests/manifest.rs` fails the build if
+# they drift from Cargo.toml.
+version: 0.9.1
+appVersion: "0.9.1"
+kubeVersion: ">=1.25.0-0"
+home: https://github.com/fabiendupont/mcp-google-workspace
+sources:
+  - https://github.com/fabiendupont/mcp-google-workspace
+maintainers:
+  - name: fabiendupont
+    url: https://github.com/fabiendupont
+keywords:
+  - mcp
+  - model-context-protocol
+  - google-workspace
+  - gmail
+  - google-drive
+  - google-calendar
+annotations:
+  # Artifact Hub renders the chart README and the values table.
+  artifacthub.io/license: Apache-2.0
+  artifacthub.io/changes: |
+    - Initial chart release: Deployment, Service, policy ConfigMap, NetworkPolicy,
+      optional ServiceMonitor/PDB, digest-only image references.

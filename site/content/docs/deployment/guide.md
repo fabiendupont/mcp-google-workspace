@@ -87,7 +87,52 @@ The Dockerfile uses UBI 10 as the builder with system Rust and `glibc-static` fo
 
 ## Kubernetes
 
-Manifests are in [`deploy/kubernetes/`](https://github.com/fabiendupont/mcp-google-workspace/tree/main/deploy/kubernetes).
+Two options deploy the same workload: the Helm chart in
+[`charts/mcp-google-workspace/`](https://github.com/fabiendupont/mcp-google-workspace/tree/main/charts/mcp-google-workspace)
+(recommended) and the plain manifests in
+[`deploy/kubernetes/`](https://github.com/fabiendupont/mcp-google-workspace/tree/main/deploy/kubernetes).
+CI compares the two renderings, so they cannot drift apart.
+
+### Helm chart
+
+The chart is published as a cosign-signed OCI artifact with every release.
+
+```bash
+# Digest of the release you are deploying (never a tag)
+DIGEST="$(docker buildx imagetools inspect \
+  ghcr.io/fabiendupont/mcp-google-workspace:<version> | awk '/^Digest:/{print $2}')"
+
+helm install mcp-google-workspace \
+  oci://ghcr.io/fabiendupont/charts/mcp-google-workspace --version <version> \
+  --namespace mcp-google-workspace --create-namespace \
+  --set image.digest="$DIGEST" \
+  --set auth.existingSecret=mcp-gws-api-token \
+  --set credentials.existingSecret=mcp-gws-credentials \
+  --set-file policy.raw=./gws-policy.json
+```
+
+The install fails at render time — naming the missing value — without an image
+digest, a bearer token or a credentials Secret. `policy.raw` must be a
+JSON object and is parsed during rendering; use `policy.document` for a
+structured override or `policy.existingConfigMap` for a ConfigMap you manage.
+The default policy is the fail-closed one from the plain manifests: read-only,
+with a `<FOLDER_ID>` placeholder that matches nothing.
+
+```bash
+cosign verify ghcr.io/fabiendupont/charts/mcp-google-workspace:<version> \
+  --certificate-identity-regexp '^https://github\.com/fabiendupont/mcp-google-workspace/\.github/workflows/(release|chart)\.yml@refs/tags/v[0-9].*$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+See the chart
+[README](https://github.com/fabiendupont/mcp-google-workspace/tree/main/charts/mcp-google-workspace)
+for the values table. The `restricted` Pod Security labels belong on the
+namespace, which Helm does not create.
+
+### Plain manifests
+
+The manifests in [`deploy/kubernetes/`](https://github.com/fabiendupont/mcp-google-workspace/tree/main/deploy/kubernetes)
+apply without Helm.
 
 ```bash
 kubectl create namespace mcp-google-workspace

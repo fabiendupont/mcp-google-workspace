@@ -1,0 +1,259 @@
+# Default values for the mcp-google-workspace chart.
+#
+# Three things have no usable default and are rejected at render time instead
+# of being left to fail later as ImagePullBackOff or CrashLoopBackOff:
+#
+#   * image.digest                  deployments pin by digest, never by tag
+#   * auth.existingSecret / token   the server refuses a non-loopback bind
+#                                   without a bearer token
+#   * credentials.existingSecret    the Google service-account JSON Secret
+#
+# The policy does have a default: the same fail-closed document as
+# deploy/kubernetes/configmap.yaml (read-only, with a <FOLDER_ID> placeholder
+# that matches nothing). Replace <FOLDER_ID> before expecting a Drive write to
+# succeed, and validate the result with `mcp-google-workspace check-policy`.
+
+replicaCount: 1
+
+image:
+  repository: ghcr.io/fabiendupont/mcp-google-workspace
+  # Required. A tag is not an identity: `:latest` can be re-pointed and
+  # `:<version>` can be re-pushed at different bytes. Must be a
+  # sha256:<64 lowercase hex> digest, which the template enforces. Get it with
+  #   docker buildx imagetools inspect <repository>:<appVersion>
+  digest: ""
+  # Left empty so the kubelet default applies (IfNotPresent for a digest
+  # reference). Set it explicitly only if your registry requires Always.
+  pullPolicy: ""
+
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# No ServiceAccount is created by default: the pod mounts Google credentials and
+# never calls the Kubernetes API, so a projected API token would be unneeded
+# privilege. Some clusters' admission policies require a named ServiceAccount
+# anyway; create=true gives one that still never mounts a token.
+serviceAccount:
+  create: false
+  name: ""
+  annotations: {}
+
+podAnnotations: {}
+podLabels: {}
+
+service:
+  type: ClusterIP
+  port: 3000
+  annotations: {}
+
+# Container port. Also the port in `--http 0.0.0.0:<port>`, the probe port and
+# the Service targetPort.
+containerPort: 3000
+
+# Bearer token required by /mcp and /metrics.
+auth:
+  # Preferred: a Secret you manage, holding one key (see secretKey). Nothing is
+  # rendered and the value never enters the Helm release.
+  existingSecret: ""
+  secretKey: api-token
+  # Convenience only. The value is stored in the Helm release Secret and its
+  # history in plaintext; prefer existingSecret.
+  token: ""
+
+# Google service-account JSON, mounted at /secrets/credentials.json. Always an
+# existing Secret: a private key does not belong in Helm values.
+credentials:
+  existingSecret: ""
+  secretKey: credentials.json
+
+# The startup policy. It is mounted at /etc/mcp-google-workspace/policy.json and
+# passed with --policy, so it governs the process from the first request; it is
+# not an example. Precedence: existingConfigMap, then raw, then document.
+policy:
+  # Use a ConfigMap you manage (required key: policy.json). Nothing is rendered.
+  existingConfigMap: ""
+  # Name of the chart-managed ConfigMap. Defaults to <fullname>-policy.
+  configMapName: ""
+  # Raw JSON document. Parsed at render time (invalid JSON fails the install)
+  # and re-emitted pretty-printed. Use with
+  #   --set-file policy.raw=./gws-policy.json
+  raw: ""
+  # Structured document, rendered with toPrettyJson. When overriding with
+  # -f/--set, maps merge with these defaults and lists replace wholesale.
+  document:
+    server:
+      read_only: true
+      rate_limit_rpm: 120
+      max_request_bytes: 16777216
+      allowed_origins: []
+      allowed_subjects: []
+    services:
+      - name: drive
+        allowed_resources:
+          - files
+        constraints:
+          - param: parents
+            values:
+              - "<FOLDER_ID>"
+            access: read-write
+            location: body-write-only
+            recursive: true
+            mode: restrict
+        denied_methods:
+          - files.delete
+          - files.emptyTrash
+      - name: gmail
+        denied_methods:
+          - messages.delete
+          - messages.trash
+          - messages.batchDelete
+          - settings.updateAutoForwarding
+          - settings.delegates.create
+          - settings.forwardingAddresses.create
+      - name: calendar
+        constraints:
+          - param: calendarId
+            values:
+              - primary
+            access: read-write
+            mode: restrict
+
+config:
+  rustLog: info
+  # rmcp rejects a Host header it does not know. The Service DNS names are
+  # generated and always allowed; list ingress hostnames here.
+  extraAllowedHosts: []
+  # Replaces the generated GWS_ALLOWED_HOSTS entirely (comma-separated).
+  # Prefer extraAllowedHosts, which keeps the Service DNS names.
+  allowedHosts: ""
+  clusterDomain: cluster.local
+  extraEnv: []
+
+audit:
+  # /dev/stdout keeps the JSONL records in the pod log: no writable volume, and
+  # it works under readOnlyRootFilesystem. For a file, point this at a path on a
+  # writable volume added through extraVolumes/extraVolumeMounts.
+  logPath: /dev/stdout
+
+# Appended verbatim after the flags above (for example --users-dir, which needs
+# a writable per-user directory, or a second --audit-log).
+extraArgs: []
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1001
+  fsGroup: 1001
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 32Mi
+  limits:
+    cpu: 500m
+    memory: 128Mi
+
+# /livez is a hardcoded 200 that does not touch Google APIs; /readyz reflects
+# real readiness. The startup probe gates the other two so a slow first start
+# never trips liveness.
+startupProbe:
+  httpGet:
+    path: /readyz
+    port: http
+  periodSeconds: 2
+  failureThreshold: 30
+livenessProbe:
+  httpGet:
+    path: /livez
+    port: http
+  initialDelaySeconds: 2
+  periodSeconds: 15
+  timeoutSeconds: 3
+  failureThreshold: 3
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+extraVolumes: []
+extraVolumeMounts: []
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+
+# With one replica a PDB cannot protect availability: minAvailable=1 blocks
+# every drain and maxUnavailable=1 allows every eviction. Enable it once
+# replicaCount > 1.
+podDisruptionBudget:
+  enabled: false
+  minAvailable: null
+  maxUnavailable: 1
+
+metrics:
+  # Prometheus scrape annotations on the pod template. Harmless without a
+  # scraper configured to honour them.
+  annotations: true
+  serviceMonitor:
+    # Requires the monitoring.coreos.com/v1 CRDs; the install fails otherwise.
+    enabled: false
+    interval: 30s
+    # Empty leaves Prometheus' own default.
+    scrapeTimeout: ""
+    labels: {}
+
+networkPolicy:
+  # Enforced by the CNI, not by Kubernetes. On a CNI without NetworkPolicy
+  # support (for example plain flannel) the object is accepted but has no
+  # effect.
+  enabled: true
+  ingress:
+    # Peers allowed to reach the HTTP port; entries are OR-ed. An empty list
+    # renders no client rule, which makes ingress default-deny.
+    clientPeers:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: mcp-clients
+      - podSelector:
+          matchLabels:
+            app.kubernetes.io/component: mcp-client
+    # Prometheus scraping. kubelet probes need no rule: node-originated traffic
+    # is always allowed under ingress isolation.
+    monitoring:
+      enabled: true
+      namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: monitoring
+    # Appended verbatim, for peers that need a namespace selector AND a pod
+    # selector (both fields in one peer are AND-ed).
+    extraRules: []
+  egress:
+    # UDP and TCP/53 to cluster DNS.
+    dns:
+      enabled: true
+    # HTTPS to Google APIs. RFC1918 and link-local destinations are excluded so
+    # this cannot reach in-cluster services, the node network, or the cloud
+    # metadata endpoint.
+    https:
+      port: 443
+      except:
+        - 169.254.0.0/16
+        - 10.0.0.0/8
+        - 172.16.0.0/12
+        - 192.168.0.0/16
+    extraRules: []

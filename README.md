@@ -501,7 +501,60 @@ Add to `.claude/settings.json`:
 
 ## Kubernetes Deployment
 
-Manifests are in [`deploy/kubernetes/`](deploy/kubernetes/). Before applying:
+Two options deploy the same workload:
+
+- the **Helm chart** in [`charts/mcp-google-workspace/`](charts/mcp-google-workspace/)
+  (recommended), which validates the digest, token and policy at render time;
+- the **plain manifests** in [`deploy/kubernetes/`](deploy/kubernetes/), for
+  `kubectl apply -k` without Helm.
+
+CI renders both and compares the pod spec, policy JSON, NetworkPolicy rules and
+ServiceMonitor endpoints (`scripts/chart-drift.py`), so neither can drift without
+a failing build.
+
+### Helm chart
+
+The chart is published as a cosign-signed OCI artifact with every release, and
+the same `.tgz` plus `SHA256SUMS.chart` (and its `.sig`/`.pem`) is attached to
+the GitHub release:
+
+```bash
+# Digest of the release you are deploying (never a tag)
+DIGEST="$(docker buildx imagetools inspect \
+  ghcr.io/fabiendupont/mcp-google-workspace:<version> | awk '/^Digest:/{print $2}')"
+
+helm install mcp-google-workspace \
+  oci://ghcr.io/fabiendupont/charts/mcp-google-workspace --version <version> \
+  --namespace mcp-google-workspace --create-namespace \
+  --set image.digest="$DIGEST" \
+  --set auth.existingSecret=mcp-gws-api-token \
+  --set credentials.existingSecret=mcp-gws-credentials \
+  --set-file policy.raw=./gws-policy.json
+```
+
+The render fails, naming the value, if the digest is missing or malformed, if
+there is no bearer token, or if the credentials Secret is unset. `policy.raw` is
+parsed during rendering, so a malformed policy fails the install instead of the
+process. Pass a structured policy with `-f` under `policy.document`, or point at
+a ConfigMap you manage with `policy.existingConfigMap`. The default policy is the
+same fail-closed document as the plain manifests: read-only, with a `<FOLDER_ID>`
+placeholder that matches nothing.
+
+Verify the artifact before installing:
+
+```bash
+cosign verify ghcr.io/fabiendupont/charts/mcp-google-workspace:<version> \
+  --certificate-identity-regexp '^https://github\.com/fabiendupont/mcp-google-workspace/\.github/workflows/(release|chart)\.yml@refs/tags/v[0-9].*$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+The chart's values table and the namespace/NetworkPolicy caveats are in
+[`charts/mcp-google-workspace/README.md`](charts/mcp-google-workspace/README.md).
+
+### Plain manifests
+
+The manifests in [`deploy/kubernetes/`](deploy/kubernetes/) apply without Helm.
+Before applying:
 
 1. **Replace the image digest.** The Deployment pins the image by digest, and the
    digest in the manifest is an all-zero **placeholder that fails closed** — the

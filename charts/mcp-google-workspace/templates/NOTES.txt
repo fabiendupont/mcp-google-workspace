@@ -1,0 +1,48 @@
+mcp-google-workspace is running.
+
+  Service:      {{ include "mcp-google-workspace.fullname" . }}.{{ .Release.Namespace }}:{{ .Values.service.port }}
+  Image:        {{ include "mcp-google-workspace.image" . }}
+  Token:        {{ if .Values.auth.existingSecret }}Secret {{ .Values.auth.existingSecret }} (key {{ .Values.auth.secretKey }}){{ else }}chart-managed Secret {{ include "mcp-google-workspace.tokenSecretName" . }}{{ end }}
+  Policy:       {{ if .Values.policy.existingConfigMap }}ConfigMap {{ .Values.policy.existingConfigMap }}{{ else }}ConfigMap {{ include "mcp-google-workspace.policyConfigMapName" . }}{{ end }}
+  Credentials:  Secret {{ .Values.credentials.existingSecret }} (key {{ .Values.credentials.secretKey }})
+
+`/mcp` and `/metrics` require the bearer token, and rmcp only accepts the Host
+headers listed in GWS_ALLOWED_HOSTS:
+
+  {{ include "mcp-google-workspace.allowedHosts" . }}
+
+Add any ingress hostname with --set config.extraAllowedHosts='{mcp.example.com}',
+otherwise those requests are rejected with 403.
+
+{{- if and .Values.policy.document (not .Values.policy.existingConfigMap) (not .Values.policy.raw) }}
+
+The policy still contains the <FOLDER_ID> placeholder. It matches nothing, so
+Drive writes fail closed: replace it and validate before enabling them.
+
+  kubectl -n {{ .Release.Namespace }} get cm {{ include "mcp-google-workspace.policyConfigMapName" . }} \
+    -o jsonpath='{.data.policy\.json}' > policy.json
+  mcp-google-workspace check-policy policy.json
+{{- end }}
+
+{{- if .Values.auth.token }}
+
+WARNING: auth.token was set inline, so the bearer token is stored in the Helm
+release Secret (and its history) in plaintext. Move it to a Secret you manage
+and set auth.existingSecret instead.
+{{- end }}
+
+{{- if .Values.networkPolicy.enabled }}
+
+A NetworkPolicy restricts ingress to the configured client peers and egress to
+DNS plus TCP/443 to the public internet. It is enforced by the CNI, not by
+Kubernetes: on a CNI without NetworkPolicy support it has no effect. Verify your
+CNI before relying on it, and note that `kubectl port-forward` does not go
+through the policy.
+{{- end }}
+
+{{- if not .Values.metrics.serviceMonitor.enabled }}
+
+Prometheus scraping is enabled through the pod annotations; there is no
+ServiceMonitor. Set metrics.serviceMonitor.enabled=true on a cluster with the
+Prometheus Operator CRDs.
+{{- end }}
