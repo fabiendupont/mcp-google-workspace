@@ -2,15 +2,16 @@
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-11-18
+
 ### Added
 
 - **Helm chart** (`charts/mcp-google-workspace/`) for the Kubernetes deployment:
   Deployment, Service, the policy ConfigMap, NetworkPolicy, and optional
   ServiceMonitor and PodDisruptionBudget. The image is digest-only — `image.digest`
   is required and format-checked — and rendering fails with an error naming the
-  missing value when the digest, bearer token, credentials Secret or policy is
-  absent. The default policy is the same fail-closed document as the plain
-  manifests. `Chart.yaml` `version`/`appVersion` are pinned to the crate version
+  missing value when the digest, bearer token or credentials Secret is absent.
+  The default policy is the same fail-closed document as the plain manifests. `Chart.yaml` `version`/`appVersion` are pinned to the crate version
   by `tests/manifest.rs`, and the chart ships from the release workflow as a
   cosign-signed OCI artifact (`oci://ghcr.io/fabiendupont/charts/mcp-google-workspace`)
   plus release assets; `.github/workflows/chart.yml` re-publishes it at a tag

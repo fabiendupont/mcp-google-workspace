@@ -189,7 +189,7 @@ podman run -p 3000:3000 \
   -v ./gws-policy.json:/etc/mcp-google-workspace/policy.json:ro \
   -v ./credentials.json:/secrets/credentials.json:ro \
   -e GOOGLE_APPLICATION_CREDENTIALS=/secrets/credentials.json \
-  ghcr.io/fabiendupont/mcp-google-workspace:0.9.1
+  ghcr.io/fabiendupont/mcp-google-workspace:0.9.2
 ```
 
 Pin a version tag — or better, a digest. Never rely on `:latest`: deployment

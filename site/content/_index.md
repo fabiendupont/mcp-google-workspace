@@ -5,7 +5,7 @@ title = "MCP Google Workspace"
 lead = 'Give AI agents <b>controlled access</b> to Google Workspace APIs. A JSON policy file scopes what each agent can access — folder-level Drive ACLs, per-calendar permissions, method denylists, and read-only mode.'
 url = "/docs/getting-started/quickstart/"
 url_button = "Get started"
-repo_version = "v0.9.1"
+repo_version = "v0.9.2"
 repo_license = "Open-source Apache-2.0 License."
 repo_url = "https://github.com/fabiendupont/mcp-google-workspace"
 

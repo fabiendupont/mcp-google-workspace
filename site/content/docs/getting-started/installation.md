@@ -17,7 +17,7 @@ top = false
 Available on GitHub Container Registry for `linux/amd64` and `linux/arm64`:
 
 ```bash
-podman pull ghcr.io/fabiendupont/mcp-google-workspace:0.9.1
+podman pull ghcr.io/fabiendupont/mcp-google-workspace:0.9.2
 ```
 
 The image is `FROM scratch` — only the static binary and CA certificates. About 6 MB.
@@ -25,12 +25,12 @@ The image is `FROM scratch` — only the static binary and CA certificates. Abou
 Pin the reference. A version tag can be re-pointed; a digest cannot:
 
 ```bash
-podman pull ghcr.io/fabiendupont/mcp-google-workspace:0.9.1@sha256:<digest>
+podman pull ghcr.io/fabiendupont/mcp-google-workspace:0.9.2@sha256:<digest>
 ```
 
 Get the digest for a release with
-`docker buildx imagetools inspect ghcr.io/fabiendupont/mcp-google-workspace:0.9.1`
-or `crane digest ghcr.io/fabiendupont/mcp-google-workspace:0.9.1`. Never deploy
+`docker buildx imagetools inspect ghcr.io/fabiendupont/mcp-google-workspace:0.9.2`
+or `crane digest ghcr.io/fabiendupont/mcp-google-workspace:0.9.2`. Never deploy
 `:latest` — deployment integrity depends on the image reference being immutable.
 Verify the artifact first: see
 [Verifying a release](#verifying-a-release).

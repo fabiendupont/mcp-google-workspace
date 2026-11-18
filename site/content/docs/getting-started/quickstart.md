@@ -112,7 +112,7 @@ podman run -p 3000:3000 \
   -e GWS_API_TOKEN="$GWS_API_TOKEN" \
   -v ./policy.json:/etc/mcp-google-workspace/policy.json:ro,Z \
   -v ./credentials.json:/etc/mcp-google-workspace/credentials.json:ro,Z \
-  ghcr.io/fabiendupont/mcp-google-workspace:0.9.1
+  ghcr.io/fabiendupont/mcp-google-workspace:0.9.2
 ```
 
 > On Fedora and RHEL with SELinux enabled, the `:Z` flag is required for bind mounts.
