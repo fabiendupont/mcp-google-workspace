@@ -604,6 +604,15 @@ jobs:
           TOKEN: ${{ github.token }}
         run: echo "$TOKEN" | helm registry login "$REGISTRY" --username "${{ github.actor }}" --password-stdin
 
+      # cosign does not read helm's registry config: it uses the Docker
+      # credential store, so a helm login alone leaves `cosign sign` pushing the
+      # signature anonymously and failing with UNAUTHORIZED.
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Push the chart
         env:
           VERSION: ${{ needs.guard.outputs.version }}
