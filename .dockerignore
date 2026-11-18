@@ -1,6 +1,67 @@
+# The build context is sent to the Docker daemon — on CI, to a remote builder —
+# and its inputs are recorded in provenance attestations. Treat everything in it
+# as published: no credential, token, private key, or local state belongs here.
+#
+# This file must stay at least as strict as .gitignore. The Dockerfile COPYs only
+# Cargo.toml, Cargo.lock, src/, and policy.example.json; everything excluded
+# below is either bulk that would only bloat the context or material that must
+# never reach a build machine.
+#
+# Do NOT blanket-ignore *.json: policy.example.json is COPY'd into the image.
+
+# --- Build output, VCS metadata, and local tooling -------------------------
 target/
 .git/
+.gitmodules
 .github/
+.tokensave/
 .claude/
+.vscode/
+.idea/
+.playwright-mcp/
+site/public/
+.DS_Store
+Thumbs.db
+*.log
+
+# --- Local databases and journals ------------------------------------------
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+
+# --- Documentation (never COPY'd; README stays for buildx/agent consumers) --
 *.md
 !README.md
+
+# --- Test harness state ----------------------------------------------------
+# The navra configs embed token_hash values, and results/ holds recorded runs.
+tests/e2e/results/
+tests/e2e/policy.generated.json
+tests/e2e/*.toml
+
+# --- Credentials, tokens, private keys, and local policy -------------------
+# Superset of .gitignore: same entries plus the usual secret-shaped names.
+credentials.json
+client_secret*.json
+service-account*.json
+secret*.json
+secrets*.json
+token*.json
+.gws-policy.json
+gws-policy.json
+.env*
+auth/
+secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+.htpasswd
+.netrc
+.git-credentials
+.npmrc
+.pypirc
+id_rsa*
+id_ed25519*

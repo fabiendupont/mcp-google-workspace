@@ -1,0 +1,91 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mcp-google-workspace
+  namespace: mcp-google-workspace
+  labels:
+    app.kubernetes.io/name: mcp-google-workspace
+    app.kubernetes.io/component: network
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: mcp-google-workspace
+  # Ingress is default-deny: only the explicit `ingress` rules below reach
+  # TCP/3000. Egress is default-deny too, and limited to exactly two kinds of
+  # traffic:
+  #   * DNS (UDP and TCP port 53) to any pod — cluster DNS resolution;
+  #   * TCP/443 to the public internet (0.0.0.0/0) with link-local and all
+  #     RFC1918 ranges excluded, which covers the Google API endpoints and
+  #     nothing inside the cluster's private network.
+  # Everything else on egress — the cloud metadata endpoint (169.254.169.254,
+  # covered by the 169.254.0.0/16 exclusion), the Kubernetes API server,
+  # in-cluster services, and any non-443 protocol — is dropped.
+  #
+  # A NetworkPolicy is enforced by the CNI, not by Kubernetes. On a cluster
+  # whose CNI has no NetworkPolicy support (e.g. plain flannel, or an
+  # unconfigured cloud CNI) this object is accepted by the API server but has
+  # NO effect: traffic is neither denied nor restricted. Verify with the CNI
+  # documentation before relying on it.
+  #
+  # Note on probes: kubelet liveness/readiness/startup probes originate from
+  # the node's own networking stack, outside the pod network, and are always
+  # permitted under ingress isolation. They must NOT be allowed with an
+  # ipBlock rule — doing so would also admit every pod on that CIDR.
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow MCP clients on TCP 3000.
+    #
+    # Entries in `from` are OR-ed. Both selectors below are placeholders:
+    # keep the one that matches how your clients are labelled, or replace it.
+    # An empty selector (`{}`) matches every namespace/pod, which defeats the
+    # purpose of this policy: set real labels before applying.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              # TODO: replace with the namespace label of your MCP clients.
+              kubernetes.io/metadata.name: mcp-clients
+        - podSelector:
+            matchLabels:
+              # TODO: replace with the label of your MCP client pods.
+              app.kubernetes.io/component: mcp-client
+      ports:
+        - protocol: TCP
+          port: 3000
+    # Prometheus scraping. Remove if the ServiceMonitor runs outside the
+    # cluster network policy scope or scrape traffic is allowed another way.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              # TODO: replace with your monitoring namespace label.
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 3000
+  egress:
+    # DNS. Cluster DNS often answers on both protocols (UDP for queries, TCP
+    # for truncation/large answers), so allow both.
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # HTTPS to Google APIs (oauth2.googleapis.com, *.googleapis.com, the
+    # Drive/Gmail/Calendar endpoints, and the token endpoint). RFC1918 and
+    # link-local destinations are excluded so this cannot be used to reach
+    # in-cluster services, the node network, or the metadata server.
+    # NetworkPolicy `except` only applies within the `cidr` above it.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 169.254.0.0/16
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443

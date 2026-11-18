@@ -4,3 +4,12 @@ metadata:
   name: mcp-google-workspace
   labels:
     app.kubernetes.io/name: mcp-google-workspace
+    # Pod Security Admission. The shipped pod already satisfies `restricted`
+    # (runAsNonRoot, seccompProfile RuntimeDefault, allowPrivilegeEscalation
+    # false, readOnlyRootFilesystem, capabilities drop ALL, configMap/secret
+    # volumes only), so enforcing the profile here is a no-op for this
+    # workload and blocks anything less hardened from being added later.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted

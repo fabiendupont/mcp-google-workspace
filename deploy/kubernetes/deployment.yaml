@@ -21,6 +21,9 @@ spec:
         prometheus.io/port: "3000"
         prometheus.io/path: "/metrics"
     spec:
+      # The server talks to Google APIs with mounted credentials and never
+      # calls the Kubernetes API, so no service account token is needed.
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 1001
@@ -29,28 +32,96 @@ spec:
           type: RuntimeDefault
       containers:
         - name: mcp-gws
-          image: ghcr.io/fabiendupont/mcp-google-workspace:latest
+          # Digest-only reference: a tag is not an identity, and `:latest` next
+          # to a digest invites someone to "fix" the digest by dropping it.
+          # Replace the all-zero digest with the manifest digest of the
+          # released version, e.g.
+          #   crane digest ghcr.io/fabiendupont/mcp-google-workspace:0.9.0
+          #   docker buildx imagetools inspect ghcr.io/fabiendupont/mcp-google-workspace:0.9.0
+          # The placeholder below MUST be replaced before applying. See
+          # "Before applying, review the manifests" in
+          # site/content/docs/deployment/guide.md (and README "Kubernetes
+          # Deployment"). It fails closed meanwhile: the kubelet cannot pull
+          # the all-zero digest and the pod stays in ImagePullBackOff rather
+          # than running an unintended image. Never use `:latest`.
+          image: ghcr.io/fabiendupont/mcp-google-workspace@sha256:0000000000000000000000000000000000000000000000000000000000000000
           ports:
             - name: http
               containerPort: 3000
               protocol: TCP
+          # Explicit args, so the startup policy and the audit trail do not
+          # depend on the image CMD (which omits --audit-log). These mirror
+          # Dockerfile CMD plus auditing.
+          #
+          # Audit sink: /dev/stdout is the container-correct destination — it
+          # needs no volume, survives readOnlyRootFilesystem, and keeps the
+          # JSONL records in the pod log where the cluster log pipeline
+          # already collects them. Use `kubectl logs` to read them.
+          #
+          # File alternative (needs a writable volume, and the file is lost on
+          # restart): add an emptyDir with a sizeLimit and point the flag at it.
+          #   args: [..., "--audit-log", "/var/log/mcp-gws/audit.jsonl"]
+          #   volumes:
+          #     - name: audit
+          #       emptyDir: { sizeLimit: 128Mi }
+          #   volumeMounts:
+          #     - { name: audit, mountPath: /var/log/mcp-gws }
+          # The same applies to --users-dir: it writes <user_dir>/audit.jsonl
+          # per user, so it requires a writable emptyDir too.
+          args:
+            - "--policy"
+            - "/etc/mcp-google-workspace/policy.json"
+            - "--http"
+            - "0.0.0.0:3000"
+            - "--audit-log"
+            - "/dev/stdout"
           env:
             - name: GOOGLE_APPLICATION_CREDENTIALS
               value: /secrets/credentials.json
             - name: RUST_LOG
               value: info
+            # Bearer token required by /mcp and /metrics. The server refuses
+            # to start on a non-loopback bind without a token, so this Secret
+            # is mandatory. Required key: `api-token` (any high-entropy
+            # value; see `openssl rand -hex 32`).
+            - name: GWS_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: mcp-gws-api-token
+                  key: api-token
+            # rmcp only accepts loopback Host headers by default. Extend the
+            # allowlist with the Service DNS names clients use, otherwise
+            # requests arrive with Host: mcp-google-workspace:3000 and are
+            # rejected with 403.
+            - name: GWS_ALLOWED_HOSTS
+              value: "mcp-google-workspace,mcp-google-workspace.mcp-google-workspace,mcp-google-workspace.mcp-google-workspace.svc,mcp-google-workspace.mcp-google-workspace.svc.cluster.local"
+          # Probes. /livez returns a hardcoded 200 (it does not touch Google
+          # APIs), so it can only fail if the process is wedged; /readyz
+          # reflects real readiness. The startupProbe gates the other two so a
+          # slow first start never trips liveness, and it is deliberately
+          # patient (30 x 2s = 60s budget).
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30
           livenessProbe:
             httpGet:
               path: /livez
               port: http
             initialDelaySeconds: 2
             periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 3
           readinessProbe:
             httpGet:
               path: /readyz
               port: http
             initialDelaySeconds: 5
             periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
           resources:
             requests:
               cpu: 50m
@@ -77,3 +148,8 @@ spec:
         - name: gcp-credentials
           secret:
             secretName: mcp-gws-credentials
+            # 0440, not 0400: the files are owned by root and group fsGroup
+            # (1001) while the process runs as uid 1001. 0400 would leave the
+            # server unable to read its own credentials; 0440 gives group-read
+            # only. Keep the mount readOnly.
+            defaultMode: 0440

@@ -42,6 +42,22 @@
           "default": "drive,gmail,calendar",
           "description": "Google services the agent may use (e.g. drive,gmail,calendar,sheets,docs,slides,tasks). Finer control via a policy file: see the repository README.",
           "isRequired": true
+        },
+        {
+          "type": "named",
+          "name": "--policy",
+          "placeholder": "/etc/mcp-google-workspace/policy.json",
+          "description": "Path to a policy file inside the container. The image ships only policy.example.json, so mount your policy directory read-only (docker -v /path/to/dir:/etc/mcp-google-workspace:ro) and point this at /etc/mcp-google-workspace/policy.json. When set, the policy file takes precedence over --services (the CLI resolves --policy first). Leave unset to run from the --services list.",
+          "isRequired": false
+        }
+      ],
+      "environmentVariables": [
+        {
+          "name": "GWS_API_TOKEN",
+          "description": "Bearer token for /mcp and /metrics. Required whenever the server runs in HTTP mode, including the image's default command (--http 0.0.0.0:3000). Ignored in stdio mode. On a trusted, isolated network pass --insecure-no-auth instead.",
+          "isRequired": false,
+          "isSecret": true,
+          "format": "string"
         }
       ],
       "transport": {

@@ -7,29 +7,123 @@ metadata:
     app.kubernetes.io/name: mcp-google-workspace
     app.kubernetes.io/component: config
 data:
+  # =====================================================================
+  #  READ THIS BEFORE APPLYING — THIS IS THE LIVE STARTUP POLICY
+  # =====================================================================
+  #
+  # The JSON below is mounted at /etc/mcp-google-workspace/policy.json and
+  # passed to the server at startup by the Deployment's `args:`
+  # (`--policy /etc/mcp-google-workspace/policy.json`), which overrides the
+  # image CMD. It is NOT an example: it is the policy the running process
+  # enforces from its first request onward.
+  #
+  # After editing: re-apply this ConfigMap, then either send SIGHUP to the
+  # process (the server re-reads the policy file and clears its tools cache)
+  # or simply rollout-restart the Deployment. Note that the kubelet takes up
+  # to about a minute to refresh a mounted ConfigMap, and that a *reduced*
+  # max_request_bytes only takes effect for chunked bodies after a restart.
+  #
+  # PLACEHOLDERS YOU MUST REPLACE
+  #   <FOLDER_ID> - the single Google Drive folder ID that file creation is
+  #                 confined to (the string after /folders/ in the Drive
+  #                 URL, e.g. 1AbCdEfGhIjKlMnOpQrStUvWxYz012345).
+  # Until it is replaced the value matches nothing, so Drive writes fail
+  # closed (the server denies rather than allows).
+  #
+  # SCHEMA — only these keys exist. `folders`, `calendars` and `paths` are
+  # NOT part of the schema. Because the parser does not set
+  # deny_unknown_fields, an invalid key is silently dropped instead of
+  # rejected, which is exactly how a previous revision of this file shipped
+  # with no scoping at all. Validate edits with:
+  #     kubectl get cm mcp-gws-policy -n mcp-google-workspace \
+  #       -o jsonpath='{.data.policy\.json}' > /tmp/policy.json
+  #     mcp-google-workspace check-policy /tmp/policy.json
+  # Service keys: name, read_only, denied_methods, constraints,
+  #               allowed_labels, allowed_resources.
+  # Constraint keys: param, values, access (read-only|read-write),
+  #               location (body|body-write-only), mode (restrict|protect),
+  #               recursive (bool).
+  #
+  # BASELINE DENIALS ARE NOT APPLIED AUTOMATICALLY to a policy file. The
+  # built-in `baseline_denials()` list (Gmail delete/trash/batchDelete plus
+  # forwarding and delegation; Drive files.delete/emptyTrash) is injected
+  # only by the `--services` shorthand. Every baseline denial is therefore
+  # spelled out explicitly below; do not delete them.
+  #
+  # SAFE DEFAULT: server.read_only is `true` below, so this deployment can
+  # read but not write at all, whatever the service-level constraints say.
+  # Writes are an explicit operator opt-in: set `"read_only": false` once
+  # the constraints below have been reviewed and the placeholders replaced.
+  # =====================================================================
   policy.json: |
     {
+      "_comment_READ_THIS": "Placeholder <FOLDER_ID> MUST be replaced before use; it currently matches nothing so Drive writes fail closed. server.read_only is true: this deployment is read-only until an operator opts in to writes. Do not add `folders` or `calendars` keys - they are not part of the schema and are silently ignored.",
       "server": {
-        "read_only": false,
+        "read_only": true,
+        "_comment_read_only": "Global kill switch, evaluated before every service policy: while true no write method is ever dispatched. Set to false to allow the writes described by the per-service constraints.",
         "rate_limit_rpm": 120,
-        "max_request_bytes": 16777216
+        "max_request_bytes": 16777216,
+        "allowed_origins": [],
+        "allowed_subjects": []
       },
       "services": [
         {
           "name": "drive",
-          "folders": [
-            { "path": "Projects/current-project", "access": "read-write" }
-          ]
+          "allowed_resources": ["files"],
+          "_comment_allowed_resources": "Restricts this service to Drive file resources. Add \"permissions\" only if gws_drive_share (or image insertion into Docs, which makes a temporary share) is needed. The `parents` constraint no longer blocks permissions.create: only files.create/copy (and files.update that moves a file) must carry `parents`, and every by-ID write such as permissions.create is additionally ancestry-checked against the recursive roots.",
+          "constraints": [
+            {
+              "param": "parents",
+              "values": ["<FOLDER_ID>"],
+              "access": "read-write",
+              "location": "body-write-only",
+              "recursive": true,
+              "mode": "restrict",
+              "_comment": "Every created file must land in this folder. recursive enables ancestry checks: read-by-ID scoping for files.get/export and by-ID scoping for writes such as permissions.create, files.update and files.delete. body-write-only applies the body check to writes only (no read-side q filter)."
+            }
+          ],
+          "denied_methods": ["files.delete", "files.emptyTrash"],
+          "_comment_denied_methods": "Baseline denials for drive. Denial matching is method-family aware: files.delete also blocks descendants of that family."
         },
         {
           "name": "gmail",
-          "denied_methods": ["messages.delete", "messages.trash"]
+          "denied_methods": [
+            "messages.delete",
+            "messages.trash",
+            "messages.batchDelete",
+            "settings.updateAutoForwarding",
+            "settings.delegates.create",
+            "settings.forwardingAddresses.create"
+          ],
+          "_comment_denied_methods": "Full baseline denials for gmail: permanent destruction (delete/trash/batchDelete) plus silent mail exfiltration (auto-forwarding, delegation, forwarding addresses). check-policy warns if any of the last three is missing."
         },
         {
           "name": "calendar",
-          "calendars": [
-            { "id": "primary", "access": "read-write" }
+          "constraints": [
+            {
+              "param": "calendarId",
+              "values": ["primary"],
+              "access": "read-write",
+              "mode": "restrict",
+              "_comment": "Confines the service to the primary calendar; any other calendarId is denied. Replace or extend `values` to add shared calendars."
+            }
           ]
         }
       ]
     }
+  # Notes on the server block:
+  #
+  # max_request_bytes: enforced by the HTTP server on /mcp (413 above the
+  #   limit). 16777216 = 16 MiB, the policy default. Lower it to reduce memory
+  #   pressure; the value is authoritative, including below rmcp's 4 MiB
+  #   default. The running process must be restarted (not just SIGHUP) for a
+  #   reduction to apply to chunked bodies.
+  #
+  # allowed_origins: browser origins allowed to call /mcp. Empty means only
+  #   localhost origins are accepted and all other present Origin headers are
+  #   rejected with 403 (requests without Origin keep working for MCP
+  #   clients). Add bare hostnames, e.g. ["mcp-dashboard.example.com"].
+  #
+  # allowed_subjects: service-account addresses the server may impersonate via
+  #   delegation. Empty means client-requested subjects are refused. Example:
+  #   ["agent@example.iam.gserviceaccount.com"].

@@ -14,3 +14,11 @@ spec:
     - port: http
       path: /metrics
       interval: 30s
+      # /metrics requires the same bearer token as /mcp whenever a token is
+      # configured. Prometheus reads it from the same Secret as the server
+      # (required key: `api-token`). Without this, scrapes get 401.
+      authorization:
+        type: Bearer
+        credentials:
+          name: mcp-gws-api-token
+          key: api-token
