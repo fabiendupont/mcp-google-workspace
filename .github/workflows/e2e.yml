@@ -1,0 +1,152 @@
+# End-to-end harness against the live Google Workspace API.
+#
+# This suite needs real Google credentials and a paid judge model, so it is NOT a
+# pull-request gate and must never become a required check:
+#
+#   - nightly, on a schedule;
+#   - manually via workflow_dispatch;
+#   - on a pull request only when a maintainer adds the `run-e2e` label, and only
+#     for branches in this repository (fork PRs never receive the secrets).
+#
+# Required configuration (see tests/e2e/CI.md):
+#   vars.GWS_TEST_FOLDER_ID      Drive folder the scenarios write into
+#   vars.GWS_PROJECT_ID          Google Cloud project for policy + Vertex
+#   vars.NAVRA_INSTALLER_URL     pinned navra installer/tarball
+#   secrets.GWS_CREDENTIALS_JSON service-account JSON
+#   secrets.MCPD_TOKEN           optional navra auth token (dummy token if unset)
+#
+# The service-account key is materialised at ${{ github.workspace }}/.ci/ and is
+# shredded in an `if: always()` step. `.gitignore` already ignores
+# `credentials.json`; `.ci/` itself (logs/tmp) is not ignored — see the note in
+# the repository report.
+
+name: E2E
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Nightly at 04:00 UTC.
+    - cron: '0 4 * * *'
+  pull_request:
+    types: [labeled]
+
+# Least privilege: this workflow only reads the repository.
+permissions:
+  contents: read
+
+# A second run for the same ref (a newer nightly, or a manual re-run) cancels the
+# previous one instead of queueing two live-API suites.
+concurrency:
+  group: e2e-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    name: E2E (live Google Workspace)
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule' ||
+      (github.event_name == 'pull_request' &&
+       github.event.label.name == 'run-e2e' &&
+       github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: always
+      # public identifiers, stored as repository variables
+      GWS_TEST_FOLDER_ID: ${{ vars.GWS_TEST_FOLDER_ID }}
+      GWS_PROJECT_ID: ${{ vars.GWS_PROJECT_ID }}
+      # service-account credentials, written to disk in the prep step
+      GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/.ci/credentials.json
+      # optional: defaults to the documented dummy token, which the harness hashes
+      # into a generated navra config at startup
+      MCPD_TOKEN: ${{ secrets.MCPD_TOKEN }}
+      # /tmp has a quota on some runners and the harness writes its server logs
+      # and the generated navra config there; give it a writable directory.
+      TMPDIR: ${{ github.workspace }}/.ci/tmp
+    steps:
+      # Runs before checkout so TMPDIR exists for tools that use the system temp
+      # dir. checkout's `git clean -ffdx` removes it again; the prep step below
+      # recreates it after checkout.
+      - name: Create workspace TMPDIR
+        run: mkdir -p "$TMPDIR"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@1c76d1459064d8f3d2b221b01d84c1ecc8a260fe # 1.120.0
+        with:
+          toolchain: 1.120.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Prepare credentials and writable TMPDIR
+        env:
+          GWS_CREDENTIALS_JSON: ${{ secrets.GWS_CREDENTIALS_JSON }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$TMPDIR" .ci
+          printf '%s' "$GWS_CREDENTIALS_JSON" > "$GOOGLE_APPLICATION_CREDENTIALS"
+          chmod 600 "$GOOGLE_APPLICATION_CREDENTIALS"
+
+      # navra is not published on crates.io. NAVRA_INSTALLER_URL must point at the
+      # pinned installer (internal artifact / tarball + checksum); the harness
+      # fails hard when navra is missing.
+      - name: Install navra
+        env:
+          NAVRA_INSTALLER_URL: ${{ vars.NAVRA_INSTALLER_URL }}
+        run: |
+          set -euo pipefail
+          test -n "$NAVRA_INSTALLER_URL"
+          curl -fsSL "$NAVRA_INSTALLER_URL" | sh
+          navra --version
+
+      - name: Install PyYAML (rubric parsing)
+        run: python3 -m pip install --disable-pip-version-check pyyaml
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Build container image
+        run: docker build -t mcp-google-workspace:ci .
+
+      # One model x one scenario keeps the job inside the timeout. The local
+      # gemma/qwen models need Ollama and a large runner, hence --skip-ollama;
+      # the Claude model goes through the Vertex config in navra.toml.
+      - name: Run E2E harness
+        run: |
+          set -euo pipefail
+          bash tests/e2e/run.sh \
+            --skip-build \
+            --skip-ollama \
+            --skip-gws \
+            --model claude-sonnet-4-5@20250929 \
+            --scenario full-e2e
+
+      # Must stay before the shred step: the logs live under $TMPDIR/.ci.
+      - name: Upload E2E logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: e2e-results
+          path: |
+            tests/e2e/results/
+            ${{ env.TMPDIR }}/*.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # Credentials never outlive the job. Best effort overwrite, then unlink;
+      # `rm -rf .ci` also drops the generated navra config and temp logs.
+      - name: Shred credentials
+        if: always()
+        run: |
+          set -euo pipefail
+          cred="${GOOGLE_APPLICATION_CREDENTIALS:-}"
+          if [ -n "$cred" ] && [ -f "$cred" ]; then
+            shred -u "$cred" 2>/dev/null || rm -f "$cred"
+          fi
+          if [ -n "$cred" ] && [ -e "$cred" ]; then
+            echo "::error::failed to remove ${cred}"
+            exit 1
+          fi
+          rm -rf "$TMPDIR" .ci
+          echo "Removed service-account key and .ci workspace"

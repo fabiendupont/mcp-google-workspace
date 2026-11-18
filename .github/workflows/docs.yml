@@ -9,8 +9,6 @@ on:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
   group: pages
@@ -19,26 +17,41 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
       - name: Install Zola
+        env:
+          ZOLA_VERSION: '0.22.1'
+          ZOLA_TARBALL: 'zola-v0.22.1-x86_64-unknown-linux-gnu.tar.gz'
+          # SHA-256 of zola-v0.22.1-x86_64-unknown-linux-gnu.tar.gz, computed
+          # from the pinned release artifact.
+          ZOLA_SHA256: '0ca09aa40376aaa9ddfb512ff9ad963262ef95edb0d0f2d5ec6961b6f5cf22ef'
         run: |
-          curl -sL "https://github.com/getzola/zola/releases/download/v0.22.1/zola-v0.22.1-x86_64-unknown-linux-gnu.tar.gz" -o /tmp/zola.tar.gz
+          set -euo pipefail
+          curl -sSL --fail -o /tmp/zola.tar.gz \
+            "https://github.com/getzola/zola/releases/download/v${ZOLA_VERSION}/${ZOLA_TARBALL}"
+          echo "${ZOLA_SHA256}  /tmp/zola.tar.gz" | sha256sum -c -
           tar xzf /tmp/zola.tar.gz -C /usr/local/bin
       - name: Build
         run: cd site && zola build --output-dir ../public
-      - uses: actions/upload-pages-artifact@v5
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: public
 
   deploy:
     needs: build
     runs-on: ubuntu-latest
+    # OIDC is only needed here, for the Pages deployment.
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
-        uses: actions/deploy-pages@v5
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

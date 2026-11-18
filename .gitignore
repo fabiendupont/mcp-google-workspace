@@ -1,5 +1,18 @@
 /target
 .claude/
+# Local credentials and policy artifacts created by following the docs.
+credentials.json
+token.json
+.gws-policy.json
+gws-policy.json
+.tokensave/
+.env
+.env.*
+# CI scratch space: the E2E workflow writes credentials and harness logs here.
+.ci/
+*.pem
+*.key
+service-account*.json
 /site/public/
 /.playwright-mcp/
 *.png

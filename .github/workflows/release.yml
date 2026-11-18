@@ -1,3 +1,64 @@
+# Release pipeline.
+#
+# Trust model
+# -----------
+# Everything in this workflow is keyed on one immutable value, the commit SHA
+# that triggered the run (`github.sha`). The `guard` job runs first and fails
+# the whole workflow if the tag moved after the push event or if the tag is not
+# annotated. Build jobs check out that SHA, scan jobs pull the images by digest
+# (never by tag), and the publish job re-uses the same digests. No job resolves
+# `refs/tags/<tag>` a second time.
+#
+# Tag convention enforced by `guard`: every release tag MUST be an annotated
+# tag (`git tag -a vX.Y.Z -m vX.Y.Z <sha>`). Lightweight tags are rejected.
+#
+# ## Verifying a release
+#
+# A release publishes five assets:
+#   mcp-google-workspace-linux-amd64
+#   mcp-google-workspace-linux-arm64
+#   SHA256SUMS
+#   SHA256SUMS.sig          (keyless Sigstore signature over SHA256SUMS)
+#   SHA256SUMS.pem          (Fulcio certificate for that signature)
+#
+# 1. Download the assets into one directory, then check the checksums:
+#
+#      sha256sum --check --ignore-missing SHA256SUMS
+#
+# 2. Verify that SHA256SUMS was signed by this workflow, on a tag, in this
+#    repository (cosign v2+ or v3):
+#
+#      cosign verify-blob \
+#        --certificate SHA256SUMS.pem \
+#        --signature SHA256SUMS.sig \
+#        --certificate-identity-regexp '^https://github\.com/fabiendupont/mcp-google-workspace/\.github/workflows/release\.yml@refs/tags/v[0-9].*$' \
+#        --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+#        SHA256SUMS
+#
+# 3. Verify the multi-arch image's build provenance attestation:
+#
+#      gh attestation verify \
+#        oci://ghcr.io/fabiendupont/mcp-google-workspace:<version> \
+#        --repo fabiendupont/mcp-google-workspace
+#
+# CycloneDX SBOMs for each architecture are attached to the workflow run as the
+# artifacts `sbom-linux-amd64` and `sbom-linux-arm64`.
+#
+# Published image tags
+# --------------------
+#   :<version>            immutable multi-arch manifest, built and scanned from
+#                         the guard-verified commit. Deploy this tag, or better
+#                         its digest.
+#   :<version>-amd64      per-arch image; the scan/SBOM subject.
+#   :<version>-arm64      same, arm64.
+#   :latest               convenience alias only. It is moved by a separate
+#                         `latest` job after the release job published the
+#                         manifest, and it points at that job's manifest digest.
+#                         It is not what deployments should use.
+#
+# NOTE: README/docs should carry this same block verbatim; keep them in sync when
+# the assets or the signing setup change.
+
 name: Release
 
 on:
@@ -5,105 +66,449 @@ on:
     tags:
       - 'v*'
 
+# Serialise releases per tag. `cancel-in-progress: false` means a second run for
+# the same tag waits instead of racing the first one for the same image tags
+# and release assets.
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
+# Least privilege by default; jobs opt into more.
+permissions:
+  contents: read
+
 jobs:
-  build-amd64:
-    name: Build amd64
+  # Runs first, and every other job needs it. Fails closed on a moved or
+  # lightweight tag, and is the single place where the tag's commit is resolved.
+  guard:
+    name: Verify tag immutability
     runs-on: ubuntu-latest
     permissions:
-      packages: write
+      contents: read
+    outputs:
+      sha: ${{ github.sha }}
+      tag: ${{ github.ref_name }}
+      version: ${{ steps.tag.outputs.version }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: docker/login-action@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history and tags so the tag object can be inspected locally.
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+
+      - name: Reject moved or lightweight tags
+        id: tag
+        env:
+          TAG: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          ref="refs/tags/${TAG}"
+
+          # Make the check independent of how the checkout action fetched refs:
+          # tags are refreshed from the remote and local ones that no longer
+          # exist upstream are pruned. A tag deleted or moved after the push
+          # event is therefore caught here.
+          git fetch --force --prune --prune-tags --tags origin
+
+          if ! git rev-parse --verify --quiet "$ref" > /dev/null; then
+            echo "::error::${ref} does not exist on the remote; refusing to release a tag that cannot be verified"
+            exit 1
+          fi
+
+          # `git rev-parse "$ref"` on an annotated tag yields the *tag object*,
+          # not the commit, so peel with ^{commit} before comparing.
+          object_type="$(git cat-file -t "$ref")"
+          if [ "$object_type" != "tag" ]; then
+            echo "::error::${ref} is a lightweight tag (object type '${object_type}'). Release tags must be annotated: git tag -a ${TAG} -m '${TAG}' ${SHA} && git push --force origin ${TAG}"
+            exit 1
+          fi
+
+          tagged_commit="$(git rev-parse "${ref}^{commit}")"
+          if [ "$tagged_commit" != "$SHA" ]; then
+            echo "::error::${ref} currently points at ${tagged_commit} but this run was triggered for ${SHA}: the tag moved. Refusing to build or publish anything."
+            exit 1
+          fi
+
+          # Sanity check that the peeled commit is what git reports for the tag.
+          if [ "$(git rev-parse "$ref^{commit}")" != "$(git rev-parse "$SHA^{commit}")" ]; then
+            echo "::error::tag/commit mismatch while resolving ${ref}"
+            exit 1
+          fi
+
+          version="${TAG#v}"
+          if [ -z "$version" ] || [ "$version" = "$TAG" ]; then
+            echo "::error::tag ${TAG} does not follow the vX.Y.Z convention"
+            exit 1
+          fi
+
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "Verified annotated tag ${TAG} -> ${tagged_commit}"
+
+  build-amd64:
+    name: Build amd64
+    needs: [guard]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Push the per-arch image to GHCR.
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Pin to the guard-verified commit, never to a mutable tag name.
+          ref: ${{ needs.guard.outputs.sha }}
+
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Extract version
+
+      - name: Resolve version
         id: version
-        run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
-      - uses: docker/build-push-action@v7
+        env:
+          VERSION: ${{ needs.guard.outputs.version }}
+        run: |
+          set -euo pipefail
+          [ -n "$VERSION" ] || { echo "::error::guard produced an empty version"; exit 1; }
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           platforms: linux/amd64
           push: true
-          # Plain manifests, no attestation indexes: keeps
-          # `docker manifest inspect` and older clients working.
-          provenance: false
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}-amd64
+          # Full provenance (mode=max) records build inputs and materials so
+          # consumers can verify how the image was produced.
+          provenance: mode=max
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.guard.outputs.sha }}
+            org.opencontainers.image.version=${{ needs.guard.outputs.version }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.guard.outputs.version }}-amd64
 
   build-arm64:
     name: Build arm64
+    needs: [guard]
     runs-on: ubuntu-24.04-arm
     permissions:
+      contents: read
       packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: docker/login-action@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.guard.outputs.sha }}
+
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Extract version
+
+      - name: Resolve version
         id: version
-        run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
-      - uses: docker/build-push-action@v7
+        env:
+          VERSION: ${{ needs.guard.outputs.version }}
+        run: |
+          set -euo pipefail
+          [ -n "$VERSION" ] || { echo "::error::guard produced an empty version"; exit 1; }
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           platforms: linux/arm64
           push: true
-          provenance: false
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}-arm64
+          provenance: mode=max
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.guard.outputs.sha }}
+            org.opencontainers.image.version=${{ needs.guard.outputs.version }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.guard.outputs.version }}-arm64
 
-  release:
-    name: Scan and release
-    needs: [build-amd64, build-arm64]
+  # One scan per architecture, addressed by the digest the build job pushed so
+  # the scanned bytes are provably the built bytes. Findings are blocking and
+  # every architecture gets a CycloneDX SBOM.
+  scan:
+    name: Scan ${{ matrix.arch }}
+    needs: [guard, build-amd64, build-arm64]
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-      packages: write
+      contents: read
+      # Needed by upload-sarif: it reads workflow-run metadata.
+      actions: read
+      packages: read
+      # Needed by upload-sarif.
       security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
     steps:
-      - uses: actions/checkout@v7
-
-      - uses: docker/login-action@v4
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract version
-        id: version
-        run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
-
-      # buildx imagetools creates the multi-arch manifest list from the
-      # per-arch tags. Unlike `docker manifest create`, it works with
-      # images pushed by build-push-action on any runner/CLI version.
-      - name: Create multi-arch tags
+      - name: Resolve immutable image reference
+        id: img
+        env:
+          ARCH: ${{ matrix.arch }}
+          AMD64_DIGEST: ${{ needs.build-amd64.outputs.digest }}
+          ARM64_DIGEST: ${{ needs.build-arm64.outputs.digest }}
         run: |
-          docker buildx imagetools create \
-            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }} \
-            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}-amd64 \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}-arm64
+          set -euo pipefail
+          case "$ARCH" in
+            amd64) digest="$AMD64_DIGEST" ;;
+            arm64) digest="$ARM64_DIGEST" ;;
+            *) echo "::error::unsupported architecture ${ARCH}"; exit 1 ;;
+          esac
+          if ! printf '%s' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::no valid image digest for ${ARCH} (got '${digest}'); refusing to scan a mutable tag"
+            exit 1
+          fi
+          echo "ref=${REGISTRY}/${IMAGE_NAME}@${digest}" >> "$GITHUB_OUTPUT"
 
-      - name: Scan container image
-        uses: aquasecurity/trivy-action@v0.36.0
+      # SBOM first: it must exist even when the vulnerability gate below fails.
+      - name: Generate CycloneDX SBOM
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
+          image-ref: ${{ steps.img.outputs.ref }}
+          format: cyclonedx
+          scanners: vuln
+          # Pinned explicitly instead of relying on the action's default.
+          version: 'v0.70.0'
+          output: sbom-${{ matrix.arch }}.cdx.json
+
+      - name: Upload SBOM
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sbom-linux-${{ matrix.arch }}
+          path: sbom-${{ matrix.arch }}.cdx.json
+          if-no-files-found: error
+          retention-days: 90
+
+      # Blocking gate. Table output is used because `exit-code` is unambiguous
+      # there (it is ignored by the SBOM formats). Any fixable CRITICAL or HIGH
+      # finding fails this job, which in turn blocks publishing.
+      #
+      # `ignore-unfixed: true` keeps unfixable base-image CVEs out of the gate;
+      # there are currently no documented exceptions, so no ignore file is
+      # configured. If one becomes necessary, add
+      # `.github/workflows/trivyignore.yaml` and pass `trivyignores:` here.
+      - name: Scan for CRITICAL/HIGH vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.img.outputs.ref }}
+          format: table
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
+          exit-code: '1'
+          version: 'v0.70.0'
+          output: trivy-${{ matrix.arch }}.txt
+
+      - name: Show scan results
+        if: always()
+        run: cat "trivy-${{ matrix.arch }}.txt" || true
+
+      # SARIF is rendered separately so the code-scanning view always gets the
+      # findings, including when the gate above failed.
+      - name: Render SARIF for code scanning
+        if: always()
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.img.outputs.ref }}
           format: sarif
-          output: trivy-results.sarif
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
+          # SARIF otherwise includes every severity regardless of `severity`.
+          limit-severities-for-sarif: true
+          version: 'v0.70.0'
+          output: trivy-${{ matrix.arch }}.sarif
 
       - name: Upload Trivy scan results
-        uses: github/codeql-action/upload-sarif@v4
         if: always()
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
-          sarif_file: trivy-results.sarif
+          sarif_file: trivy-${{ matrix.arch }}.sarif
+          category: trivy-${{ matrix.arch }}
+
+  release:
+    name: Sign and publish
+    needs: [guard, build-amd64, build-arm64, scan]
+    runs-on: ubuntu-latest
+    # Manual approval gate before anything is published.
+    environment: release
+    permissions:
+      contents: write
+      packages: write
+      # Keyless Sigstore signing of SHA256SUMS.
+      id-token: write
+    outputs:
+      # Digest of the multi-arch manifest published as :${VERSION}. The `latest`
+      # alias job consumes exactly this value.
+      manifest_digest: ${{ steps.manifest.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.guard.outputs.sha }}
+
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # buildx imagetools creates the multi-arch manifest list from the scanned
+      # per-arch digests. Unlike `docker manifest create`, it works with images
+      # pushed by build-push-action on any runner/CLI version, and addressing
+      # digests instead of tags means the published manifest cannot drift from
+      # what was built and scanned.
+      #
+      # Only the immutable :${VERSION} tag is written here. The mutable
+      # `:latest` alias is a separate job so it can never be the thing an
+      # operator silently receives by default.
+      - name: Create multi-arch manifest
+        id: manifest
+        env:
+          VERSION: ${{ needs.guard.outputs.version }}
+          AMD64_DIGEST: ${{ needs.build-amd64.outputs.digest }}
+          ARM64_DIGEST: ${{ needs.build-arm64.outputs.digest }}
+        run: |
+          set -euo pipefail
+          for d in "$AMD64_DIGEST" "$ARM64_DIGEST"; do
+            printf '%s' "$d" | grep -Eq '^sha256:[0-9a-f]{64}$' || {
+              echo "::error::invalid image digest '${d}'"; exit 1; }
+          done
+          docker buildx imagetools create \
+            -t "${REGISTRY}/${IMAGE_NAME}:${VERSION}" \
+            "${REGISTRY}/${IMAGE_NAME}@${AMD64_DIGEST}" \
+            "${REGISTRY}/${IMAGE_NAME}@${ARM64_DIGEST}"
+
+          # Record the manifest-list digest so every later reference (and the
+          # `latest` alias) is by digest rather than by re-resolving a tag.
+          digest="$(docker buildx imagetools inspect \
+            --format '{{json .Manifest.Digest}}' \
+            "${REGISTRY}/${IMAGE_NAME}:${VERSION}" | tr -d '"')"
+          if ! printf '%s' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::could not resolve the manifest digest for ${VERSION} (got '${digest}')"
+            exit 1
+          fi
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "Published ${REGISTRY}/${IMAGE_NAME}:${VERSION}@${digest}"
+
+      # The release binaries are the static executables baked into each
+      # per-arch image. Extract them so they can be published with checksums.
+      - name: Extract release binaries
+        env:
+          AMD64_DIGEST: ${{ needs.build-amd64.outputs.digest }}
+          ARM64_DIGEST: ${{ needs.build-arm64.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            case "$arch" in
+              amd64) digest="$AMD64_DIGEST" ;;
+              arm64) digest="$ARM64_DIGEST" ;;
+            esac
+            image="${REGISTRY}/${IMAGE_NAME}@${digest}"
+            docker pull --platform "linux/${arch}" "${image}"
+            cid=$(docker create --platform "linux/${arch}" "${image}")
+            docker cp "${cid}:/usr/local/bin/mcp-google-workspace" \
+              "dist/mcp-google-workspace-linux-${arch}"
+            docker rm -f "${cid}"
+          done
+
+      - name: Generate SHA-256 checksums
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          sha256sum mcp-google-workspace-linux-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
+        with:
+          # Pin the cosign binary so verification instructions stay stable.
+          cosign-release: 'v2.5.3'
+
+      # Keyless signature: the Fulcio certificate binds the checksum file to
+      # this workflow file running on a tag ref. See "Verifying a release".
+      - name: Sign checksums
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes \
+            --output-signature dist/SHA256SUMS.sig \
+            --output-certificate dist/SHA256SUMS.pem \
+            dist/SHA256SUMS
 
       - name: Generate release notes
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
+          # Bind the release to the guard-verified tag and commit.
+          tag_name: ${{ needs.guard.outputs.tag }}
+          target_commitish: ${{ needs.guard.outputs.sha }}
           generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/mcp-google-workspace-linux-amd64
+            dist/mcp-google-workspace-linux-arm64
+            dist/SHA256SUMS
+            dist/SHA256SUMS.sig
+            dist/SHA256SUMS.pem
+
+  # Convenience alias, deliberately isolated from the release job: `:latest` is
+  # mutable, so an erroneous or compromised push must not be able to move what a
+  # default pull receives. This job runs only after the digest-pinned publish
+  # succeeded, and it republishes the exact manifest digest that job recorded.
+  # Deployments should pin :<version> or a digest; README documents `:latest` only
+  # for quick local trials.
+  latest:
+    name: Update latest alias (convenience only)
+    needs: [guard, release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Point latest at the published manifest digest
+        env:
+          VERSION: ${{ needs.guard.outputs.version }}
+          MANIFEST_DIGEST: ${{ needs.release.outputs.manifest_digest }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$MANIFEST_DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::release job did not report a usable manifest digest (got '${MANIFEST_DIGEST}')"
+            exit 1
+          fi
+          docker buildx imagetools create \
+            -t "${REGISTRY}/${IMAGE_NAME}:latest" \
+            "${REGISTRY}/${IMAGE_NAME}@${MANIFEST_DIGEST}"
+
+          # Fail loudly if the alias does not resolve to the released digest.
+          actual="$(docker buildx imagetools inspect \
+            --format '{{json .Manifest.Digest}}' \
+            "${REGISTRY}/${IMAGE_NAME}:latest" | tr -d '"')"
+          if [ "$actual" != "$MANIFEST_DIGEST" ]; then
+            echo "::error:::latest resolves to ${actual}, expected ${MANIFEST_DIGEST}"
+            exit 1
+          fi
+          echo "::notice::latest -> ${REGISTRY}/${IMAGE_NAME}:${VERSION}@${MANIFEST_DIGEST}"
