@@ -2703,6 +2703,55 @@ mod tests {
         }
     }
 
+    impl SharedLog {
+        fn contents(&self) -> String {
+            String::from_utf8(
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            )
+            .unwrap_or_default()
+        }
+    }
+
+    /// Process-wide log capture for tests that assert on log output.
+    ///
+    /// A thread-local subscriber (`set_default`) looked isolated but was not
+    /// reliable: the webhook log line sits behind a callsite whose interest is
+    /// cached process-wide, so when a concurrently running test had already
+    /// touched that callsite the line could be dropped and the assertion saw an
+    /// empty buffer. One global subscriber writing to a shared buffer is
+    /// deterministic; each test scopes its assertions to a random channel id,
+    /// so parallel tests cannot interfere with each other.
+    fn global_log_sink() -> &'static SharedLog {
+        static SINK: std::sync::OnceLock<SharedLog> = std::sync::OnceLock::new();
+        SINK.get_or_init(|| {
+            let sink = SharedLog::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(sink.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::TRACE)
+                .finish();
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("no other test may install a global tracing subscriber");
+            sink
+        })
+    }
+
+    /// The handler logs before it returns, but it does so on the server task,
+    /// so poll briefly instead of assuming the write has already landed.
+    async fn wait_for_log(needle: &str) -> String {
+        for _ in 0..200 {
+            let logs = global_log_sink().contents();
+            if logs.contains(needle) {
+                return logs;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        global_log_sink().contents()
+    }
+
     fn webhook_router() -> Router {
         Router::new()
             .route("/webhooks/drive", post(handle_drive_webhook))
@@ -2715,17 +2764,13 @@ mod tests {
     #[tokio::test]
     async fn drive_webhook_oversized_channel_id_is_400_and_not_logged() {
         let base = spawn(webhook_router()).await;
-
-        let log = SharedLog::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(log.clone())
-            .with_ansi(false)
-            .with_max_level(tracing::Level::TRACE)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        // Install capture before the request: a callsite that is first hit with
+        // no subscriber can cache a disabled interest and drop later events.
+        global_log_sink();
+        let client = reqwest::Client::new();
 
         let oversized = "z".repeat(200);
-        let response = reqwest::Client::new()
+        let response = client
             .post(format!("{base}/webhooks/drive"))
             .header("x-goog-channel-id", &oversized)
             .header("x-goog-channel-token", "token")
@@ -2735,13 +2780,21 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
-        let logs = String::from_utf8(
-            log.0
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone(),
-        )
-        .unwrap();
+        // Positive control: an unknown channel *is* logged, which proves the
+        // capture is live and makes the absence assertion below meaningful
+        // (an empty buffer would otherwise pass it vacuously).
+        let marker = crate::subscriptions::new_channel_id();
+        let control = client
+            .post(format!("{base}/webhooks/drive"))
+            .header("x-goog-channel-id", &marker)
+            .header("x-goog-channel-token", "token")
+            .header("x-goog-resource-state", "exists")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(control.status(), StatusCode::NOT_FOUND);
+        let logs = wait_for_log(&marker[..12]).await;
+
         assert!(
             !logs.contains(&oversized),
             "full channel id reached a log line: {logs}"
@@ -2753,14 +2806,8 @@ mod tests {
     #[tokio::test]
     async fn drive_webhook_unknown_channel_is_logged_as_a_tag_only() {
         let base = spawn(webhook_router()).await;
-
-        let log = SharedLog::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(log.clone())
-            .with_ansi(false)
-            .with_max_level(tracing::Level::TRACE)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        // See the note in the oversized-id test: capture must exist first.
+        global_log_sink();
 
         let channel = crate::subscriptions::new_channel_id();
         let response = reqwest::Client::new()
@@ -2773,13 +2820,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
-        let logs = String::from_utf8(
-            log.0
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone(),
-        )
-        .unwrap();
+        let logs = wait_for_log(&channel[..12]).await;
         assert!(!logs.contains(&channel), "full channel id logged: {logs}");
         assert!(logs.contains(&channel[..12]), "short tag missing: {logs}");
     }
