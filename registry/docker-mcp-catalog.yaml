@@ -8,9 +8,9 @@
 # Docker Hub namespace first, e.g.:
 #
 #   docker buildx imagetools create \
-#     -t fabiendupont/mcp-google-workspace:0.9.0 \
+#     -t fabiendupont/mcp-google-workspace:0.9.1 \
 #     -t fabiendupont/mcp-google-workspace:latest \
-#     ghcr.io/fabiendupont/mcp-google-workspace:0.9.0
+#     ghcr.io/fabiendupont/mcp-google-workspace:0.9.1
 #
 # (or add a mirroring step to .github/workflows/release.yml)
 #

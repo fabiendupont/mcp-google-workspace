@@ -36,8 +36,8 @@ spec:
           # to a digest invites someone to "fix" the digest by dropping it.
           # Replace the all-zero digest with the manifest digest of the
           # released version, e.g.
-          #   crane digest ghcr.io/fabiendupont/mcp-google-workspace:0.9.0
-          #   docker buildx imagetools inspect ghcr.io/fabiendupont/mcp-google-workspace:0.9.0
+          #   crane digest ghcr.io/fabiendupont/mcp-google-workspace:0.9.1
+          #   docker buildx imagetools inspect ghcr.io/fabiendupont/mcp-google-workspace:0.9.1
           # The placeholder below MUST be replaced before applying. See
           # "Before applying, review the manifests" in
           # site/content/docs/deployment/guide.md (and README "Kubernetes

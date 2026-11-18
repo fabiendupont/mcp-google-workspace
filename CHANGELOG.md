@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-11-18
+
 ### Security
 
 Hardening pass that makes every previously documented security claim real. No
@@ -172,6 +174,32 @@ bearer token (or explicitly opt out) and may need to renew Drive subscriptions.
   (`userId: "me"`, `calendarId: "primary"`), and `resources/templates/list`
   loads the discovery documents so it returns the full surface on the first
   request instead of an empty list.
+- **CI installs a toolchain that exists.** The release pipeline pinned
+  `dtolnay/rust-toolchain` to the branch head for Rust 1.120.0, a version that
+  was never published, so Check, Test, Clippy and Format failed during
+  toolchain installation before running a single command. The pin is now the
+  1.100.0 branch head and the redundant `toolchain:` input (the per-version
+  branches hardcode it) is gone. Verified on 1.100.0: `fmt --check`,
+  `clippy -D warnings` and all 902 tests pass.
+- **Both image builds attach provenance.** `ubuntu-24.04-arm` defaults to the
+  `docker` buildx driver, which cannot attach attestations ("Attestation is not
+  supported for the docker driver"), while the amd64 runner image defaults to a
+  driver that can. Both build jobs now create the `docker-container` builder
+  explicitly with `docker/setup-buildx-action`, so the attestation no longer
+  depends on the runner image's default.
+- **Every scan states the architecture it is scanning.** Trivy's platform
+  default is not the host architecture — the arm64 leg asked for
+  `linux/amd64` even on an arm64 runner — and a per-architecture digest is a
+  single-platform image index, so the scan failed with "no child with platform
+  linux/amd64 in index" and took the SBOM and SARIF uploads with it. All trivy
+  steps now pin `image.platform` through `trivy-config`. Verified against a
+  per-arch index carrying provenance: the table gate exits 0, CycloneDX and
+  SARIF are produced, and the same command without the config reproduces the
+  failure.
+- **The `release` environment is described as it is.** Referencing an
+  environment with no protection rules gates nothing, so the comment no longer
+  claims a manual approval step that repository settings have not configured.
+  Reviewer rules belong there; the job proceeds as soon as its dependencies pass.
 
 ## [0.9.0] - 2026-11-17
 
