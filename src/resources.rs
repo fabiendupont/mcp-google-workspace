@@ -28,8 +28,55 @@ pub fn parse_gws_uri(uri: &str) -> Option<ParsedUri> {
     })
 }
 
+/// True when `resource_path` is covered by the `allowed_resources` allowlist.
+///
+/// An entry allows itself and every dotted descendant, so `files` covers
+/// `files` and `files.permissions`, and `users.messages` covers
+/// `users.messages.attachments`. Matching is on whole dotted segments:
+/// `files` does not cover `filesXYZ`. An empty list allows every resource.
 pub fn is_resource_allowed(allowed: &[String], resource_path: &str) -> bool {
-    allowed.is_empty() || allowed.iter().any(|a| a == resource_path)
+    allowed.is_empty()
+        || allowed.iter().any(|a| {
+            a == resource_path
+                || resource_path
+                    .strip_prefix(a.as_str())
+                    .is_some_and(|rest| rest.starts_with('.'))
+        })
+}
+
+/// Required-parameter names that identify the object being fetched.
+///
+/// Google discovery documents order `parameters` in a hash map, so "first
+/// required path parameter" is not meaningful. Gmail's `users.messages.get`
+/// has both `userId` (parent) and `id` (object); picking the parent would send
+/// the message id as `userId` and leave `id` missing.
+const PREFERRED_ID_PARAMS: &[&str] = &[
+    "id",
+    "fileId",
+    "documentId",
+    "spreadsheetId",
+    "presentationId",
+    "eventId",
+    "messageId",
+    "threadId",
+    "permissionId",
+    "commentId",
+    "replyId",
+    "task",
+    "resourceName",
+    "name",
+];
+
+fn id_param_score(name: &str) -> u8 {
+    if PREFERRED_ID_PARAMS.contains(&name) {
+        3
+    } else if (name.ends_with("Id") && name != "userId" && name != "calendarId")
+        || name.ends_with("_id")
+    {
+        2
+    } else {
+        1
+    }
 }
 
 pub fn id_param_name(resource: &RestResource, method_name: &str) -> Option<String> {
@@ -37,8 +84,36 @@ pub fn id_param_name(resource: &RestResource, method_name: &str) -> Option<Strin
     method
         .parameters
         .iter()
-        .find(|(_, p)| p.required && p.location.as_deref() == Some("path"))
+        .filter(|(_, p)| p.required && p.location.as_deref() == Some("path"))
+        .max_by_key(|(name, _)| id_param_score(name))
         .map(|(name, _)| name.clone())
+}
+
+/// Build the `params` object for a `gws://` resource read.
+///
+/// The id from the URI fills the object-id parameter; required parent path
+/// parameters are filled with their conventional defaults (`userId: "me"`,
+/// `calendarId: "primary"`) so a client can follow the advertised template
+/// literally. Anything else is left to the API to reject with a clear error.
+pub fn build_get_params(
+    method: &google_workspace::discovery::RestMethod,
+    id_param: &str,
+    id: &str,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut params = serde_json::Map::new();
+    params.insert(id_param.to_string(), serde_json::json!(id));
+    for (name, param) in &method.parameters {
+        if name == id_param || !param.required || param.location.as_deref() != Some("path") {
+            continue;
+        }
+        let default = match name.as_str() {
+            "userId" => "me",
+            "calendarId" => "primary",
+            _ => continue,
+        };
+        params.insert(name.clone(), serde_json::json!(default));
+    }
+    params
 }
 
 pub fn build_resource_templates(
@@ -74,7 +149,7 @@ fn collect_templates(
             format!("{prefix}.{name}")
         };
 
-        if !allowed.is_empty() && !allowed.iter().any(|a| a == &resource_path) {
+        if !is_resource_allowed(allowed, &resource_path) {
             if !resource.resources.is_empty() {
                 collect_templates(service, &resource.resources, &resource_path, allowed, out);
             }
@@ -82,11 +157,7 @@ fn collect_templates(
         }
 
         if let Some(get_method) = resource.methods.get("get")
-            && let Some(id_param) = get_method
-                .parameters
-                .iter()
-                .find(|(_, p)| p.required && p.location.as_deref() == Some("path"))
-                .map(|(n, _)| n.as_str())
+            && let Some(id_param) = id_param_name(resource, "get")
         {
             let uri_template = format!("gws://{service}/{resource_path}/{{{id_param}}}");
             let description = get_method.description.as_deref().unwrap_or("").to_string();
@@ -135,6 +206,35 @@ mod tests {
     }
 
     #[test]
+    fn test_is_resource_allowed_exact_and_empty() {
+        assert!(is_resource_allowed(&[], "files"));
+        assert!(is_resource_allowed(&[], "permissions.create"));
+
+        let allowed = vec!["files".to_string(), "users.messages".to_string()];
+        assert!(is_resource_allowed(&allowed, "files"));
+        assert!(is_resource_allowed(&allowed, "users.messages"));
+        assert!(!is_resource_allowed(&allowed, "permissions"));
+    }
+
+    #[test]
+    fn test_is_resource_allowed_nested_descendants() {
+        let files = vec!["files".to_string()];
+        assert!(is_resource_allowed(&files, "files"));
+        assert!(is_resource_allowed(&files, "files.anything"));
+        assert!(is_resource_allowed(&files, "files.permissions"));
+        assert!(!is_resource_allowed(&files, "filesXYZ"));
+        assert!(!is_resource_allowed(&files, "files_extra"));
+        assert!(!is_resource_allowed(&files, "permissions"));
+
+        let messages = vec!["users.messages".to_string()];
+        assert!(is_resource_allowed(&messages, "users.messages"));
+        assert!(is_resource_allowed(&messages, "users.messages.attachments"));
+        assert!(!is_resource_allowed(&messages, "users.messagesXYZ"));
+        assert!(!is_resource_allowed(&messages, "users"));
+        assert!(!is_resource_allowed(&messages, "users.labels"));
+    }
+
+    #[test]
     fn test_id_param_name_found() {
         let mut resource = RestResource {
             methods: HashMap::new(),
@@ -167,5 +267,61 @@ mod tests {
             resources: HashMap::new(),
         };
         assert_eq!(id_param_name(&resource, "get"), None);
+    }
+
+    #[test]
+    fn test_id_param_name_prefers_object_id_over_parent() {
+        // Gmail `users.messages.get` requires both `userId` and `id`; the object
+        // id must win regardless of map iteration order.
+        let mut resource = RestResource {
+            methods: HashMap::new(),
+            resources: HashMap::new(),
+        };
+        let mut params = HashMap::new();
+        for name in ["userId", "id"] {
+            params.insert(
+                name.to_string(),
+                MethodParameter {
+                    required: true,
+                    location: Some("path".to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+        resource.methods.insert(
+            "get".to_string(),
+            RestMethod {
+                parameters: params,
+                http_method: "GET".to_string(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(id_param_name(&resource, "get"), Some("id".to_string()));
+    }
+
+    #[test]
+    fn test_build_get_params_fills_parent_defaults() {
+        let mut params = HashMap::new();
+        for (name, location) in [("userId", "path"), ("id", "path"), ("format", "query")] {
+            params.insert(
+                name.to_string(),
+                MethodParameter {
+                    required: name != "format",
+                    location: Some(location.to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+        let method = RestMethod {
+            parameters: params,
+            http_method: "GET".to_string(),
+            ..Default::default()
+        };
+
+        let built = build_get_params(&method, "id", "msg-1");
+        assert_eq!(built.get("id"), Some(&serde_json::json!("msg-1")));
+        assert_eq!(built.get("userId"), Some(&serde_json::json!("me")));
+        assert!(!built.contains_key("format"));
+        assert_eq!(built.len(), 2);
     }
 }

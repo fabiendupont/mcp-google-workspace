@@ -5,7 +5,7 @@
   "services": [
     {
       "name": "drive",
-      "allowed_resources": ["files"],
+      "allowed_resources": ["files", "permissions"],
       "constraints": [
         {
           "param": "parents",
@@ -23,7 +23,7 @@
       "constraints": [
         {
           "param": "documentId",
-          "values": ["1Ffn60EwUK_HgpUjMPs1T11t1nxFoI4kkAm4_N9E1L-I"],
+          "values": ["$GWS_TEST_PROTECTED_DOC_ID"],
           "access": "read-only",
           "mode": "protect"
         }
@@ -64,7 +64,7 @@
       "constraints": [
         {
           "param": "presentationId",
-          "values": ["1K6h_BXE4Y8FuJ78Q-qmpUJF4mAMdZDrzxepbSbMMtNY"],
+          "values": ["$GWS_TEST_PROTECTED_SLIDES_ID"],
           "access": "read-only",
           "mode": "protect"
         }
@@ -73,7 +73,7 @@
   ],
   "templates": [
     {
-      "id": "1K6h_BXE4Y8FuJ78Q-qmpUJF4mAMdZDrzxepbSbMMtNY",
+      "id": "$GWS_TEST_PROTECTED_SLIDES_ID",
       "name": "standard",
       "description": "Red Hat standard presentation"
     }

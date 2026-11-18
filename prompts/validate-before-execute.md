@@ -11,19 +11,21 @@ Use these validation features to preview, verify, and debug API calls before the
 
 ## Dry run
 
-Set `dry_run: true` on any service tool call to see the HTTP request that would be sent without actually executing it:
+Set `dry_run: true` to see the HTTP request that would be sent without actually executing it. This is supported for generic REST proxy tools (services without a curated helper set, e.g. `people`), `gws_batch`, `gws_docs_*`, `gws_slides_*`, and `gws_generate_image`:
 
 ```json
 {
-  "name": "{{service|drive}}",
+  "name": "{{service|people}}",
   "arguments": {
-    "resource": "files",
-    "method": "list",
-    "params": { "q": "mimeType='application/pdf'", "pageSize": 10 },
+    "resource": "people",
+    "method": "connections",
+    "params": { "pageSize": 10 },
     "dry_run": true
   }
 }
 ```
+
+Curated helper tools without a preview (Drive, Sheets, Gmail, Calendar, Tasks) reject `dry_run` on mutating calls instead of pretending to preview them, so you can never mistake an executed write for a preview.
 
 The response shows:
 - The full URL that would be called

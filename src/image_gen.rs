@@ -109,12 +109,67 @@ pub fn parse_gemini_response(response: &Value) -> Result<GeneratedImage, GwsErro
     ))
 }
 
+/// OAuth scope the Gemini image API needs when no `GEMINI_API_KEY` is set.
+const GENERATIVE_LANGUAGE_SCOPE: &str = "https://www.googleapis.com/auth/generative-language";
+
+/// Parameters for the OAuth token used against the Gemini API.
+///
+/// Kept as a value so the delegation identity (`_meta.user_email`) that is
+/// threaded into [`crate::auth::get_token_as`] is explicit and testable
+/// without performing network I/O.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TokenRequest<'a> {
+    scopes: &'static [&'static str],
+    subject: Option<&'a str>,
+}
+
+fn token_request(subject: Option<&str>) -> TokenRequest<'_> {
+    TokenRequest {
+        scopes: &[GENERATIVE_LANGUAGE_SCOPE],
+        subject,
+    }
+}
+
+/// Generate an image as the server principal.
+///
+/// Wrapper around [`generate_image_as`] kept for existing call sites; new
+/// callers should pass the request's delegation subject so multi-user mode
+/// honours `_meta.user_email` instead of silently acting as the server
+/// identity.
 pub async fn generate_image(
     prompt: &str,
     model: &str,
     aspect_ratio: Option<&str>,
     image_size: Option<&str>,
     credentials_file: Option<&str>,
+    token_cache: &mut Option<crate::auth::TokenCache>,
+) -> Result<GeneratedImage, GwsError> {
+    generate_image_as(
+        prompt,
+        model,
+        aspect_ratio,
+        image_size,
+        credentials_file,
+        None,
+        token_cache,
+    )
+    .await
+}
+
+/// Generate an image, optionally as a delegated user.
+///
+/// `subject` must be resolved by the caller through the policy allowlist
+/// (`Policy::resolve_delegation_subject(meta.user_email)`), never taken
+/// verbatim from client metadata. It is only used when `GEMINI_API_KEY` is
+/// unset: an API key authenticates the server principal, so a delegated
+/// identity cannot be honoured on that path.
+pub async fn generate_image_as(
+    prompt: &str,
+    model: &str,
+    aspect_ratio: Option<&str>,
+    image_size: Option<&str>,
+    credentials_file: Option<&str>,
+    subject: Option<&str>,
     token_cache: &mut Option<crate::auth::TokenCache>,
 ) -> Result<GeneratedImage, GwsError> {
     validate_model(model)?;
@@ -128,11 +183,12 @@ pub async fn generate_image(
     if let Some(ref key) = api_key {
         req = req.header("x-goog-api-key", key);
     } else {
+        let request = token_request(subject);
         let token = crate::auth::get_token_as(
-            &["https://www.googleapis.com/auth/generative-language"],
+            request.scopes,
             credentials_file,
             Some(token_cache),
-            None,
+            request.subject,
         )
         .await
         .map_err(|_| {
@@ -326,5 +382,45 @@ mod tests {
         assert!(props.contains_key("document_id"));
         assert!(props.contains_key("presentation_id"));
         assert!(props.contains_key("aspect_ratio"));
+    }
+
+    #[test]
+    fn test_token_request_carries_delegated_subject() {
+        let request = token_request(Some("alice@example.com"));
+        assert_eq!(request.subject, Some("alice@example.com"));
+        assert_eq!(request.scopes, &[GENERATIVE_LANGUAGE_SCOPE]);
+    }
+
+    #[test]
+    fn test_token_request_without_subject() {
+        let request = token_request(None);
+        assert_eq!(request.subject, None);
+    }
+
+    /// Compile/arity guard: `generate_image` must keep its original signature
+    /// (a concurrent `server.rs` edit still calls it) and delegate with no
+    /// subject. The futures are never polled, so no auth or network I/O runs.
+    #[test]
+    fn test_generate_image_wrapper_needs_no_subject() {
+        let mut cache: Option<crate::auth::TokenCache> = None;
+        drop(generate_image(
+            "a cat",
+            "gemini-2.5-flash-image",
+            None,
+            None,
+            None,
+            &mut cache,
+        ));
+
+        let mut cache: Option<crate::auth::TokenCache> = None;
+        drop(generate_image_as(
+            "a cat",
+            "gemini-2.5-flash-image",
+            Some("16:9"),
+            Some("2K"),
+            None,
+            Some("alice@example.com"),
+            &mut cache,
+        ));
     }
 }

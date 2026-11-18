@@ -498,6 +498,33 @@ fn policy_example_json_sheets_is_read_only() {
 }
 
 #[test]
+fn policy_example_json_enables_drive_read_scoping() {
+    // The example is what deployers copy. If it omits `recursive: true`, the
+    // documented read-by-ID containment and ancestry checks are silently
+    // inactive, so this asserts the shipped example actually enables them.
+    let content = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("policy.example.json"),
+    )
+    .unwrap();
+    let file: PolicyFile = serde_json::from_str(&content).unwrap();
+    let policy = Policy::from_policy_file(file);
+
+    let roots = policy.recursive_parent_values("drive");
+    assert!(
+        !roots.is_empty(),
+        "policy.example.json must set recursive:true so read-by-ID scoping is active"
+    );
+    assert!(roots.contains(&"WRITABLE_FOLDER_ID"));
+    assert!(roots.contains(&"READONLY_FOLDER_ID"));
+
+    // The example's tools (drive share, image insert) need the permissions
+    // resource; without it those advertised tools always fail.
+    let allowed = policy.allowed_resources("drive");
+    assert!(allowed.contains(&"files".to_string()));
+    assert!(allowed.contains(&"permissions".to_string()));
+}
+
+#[test]
 fn policy_example_json_has_templates() {
     let content = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("policy.example.json"),

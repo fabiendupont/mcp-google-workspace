@@ -1,4 +1,4 @@
-Create a Google Doc named "AI Infrastructure Report" in Drive folder 1VkrXx3bhkQaLJEmnY_t5VxVmBETfsbY1.
+Create a Google Doc named "AI Infrastructure Report" in Drive folder YOUR_TEST_FOLDER_ID.
 
 The document should cover AI infrastructure deployment in enterprise environments. Include:
 - An executive summary mentioning hybrid architectures

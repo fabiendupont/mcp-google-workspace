@@ -28,13 +28,17 @@ pub struct UserInstance {
 
 impl UserInstance {
     /// The bearer token required to access this user's endpoint, if configured.
+    /// Whitespace-only values count as "not configured", matching the HTTP
+    /// middleware's handling.
     pub async fn api_token(&self) -> Option<String> {
         self.policy
             .read()
             .await
             .api_token
-            .clone()
-            .filter(|t| !t.is_empty())
+            .as_deref()
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .map(str::to_string)
     }
 }
 
@@ -96,10 +100,14 @@ pub fn load_users(
 
         let policy = Policy::from_file(&policy_path)?;
 
-        // Per-user audit log for accountable multi-user deployments
+        // Per-user audit log for accountable multi-user deployments.
+        //
+        // Fatal on failure, exactly like the single-user `--audit-log` path in
+        // `main.rs`: starting without an audit trail on a read-only mount was
+        // a silent loss of the only accountability record in multi-user mode.
         let audit = {
             let audit_path = path.join("audit.jsonl");
-            match crate::audit::AuditLogger::new(audit_path) {
+            match crate::audit::AuditLogger::new(audit_path.clone()) {
                 Ok(logger) => {
                     let logger = Arc::new(logger);
                     tracing::info!(
@@ -110,8 +118,14 @@ pub fn load_users(
                     Some(logger)
                 }
                 Err(e) => {
-                    tracing::warn!(user = %name, error = %e, "Cannot open per-user audit log");
-                    None
+                    return Err(GwsError::Validation(format!(
+                        "Cannot open per-user audit log for user '{name}' at {}: {e}. \
+                         Refusing to start without an audit trail. Fix: make the user's \
+                         directory writable so audit.jsonl can be created, or run with \
+                         --audit-log /dev/stdout (single-user mode) or a writable \
+                         per-user directory.",
+                        audit_path.display()
+                    )));
                 }
             }
         };
@@ -249,6 +263,33 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A per-user audit log that cannot be opened must abort the load instead
+    /// of silently producing a user with `audit: None`. A read-only users
+    /// mount used to start "clean" with no audit trail at all.
+    #[test]
+    fn test_load_users_fails_when_audit_log_cannot_be_opened() {
+        let dir = tmp_dir("audit-unwritable");
+        write_user(&dir, "alice", r#"{"services": [{"name": "drive"}]}"#);
+
+        // A directory at the audit-log path makes `open(..., append)` fail with
+        // EISDIR even when the test runs as root (a chmod 0o555 directory would
+        // not, for root).
+        std::fs::create_dir(dir.join("alice/audit.jsonl")).unwrap();
+
+        let result = load_users(&dir, &[], false, None);
+        let error = result.err().expect("load_users must fail, not skip audit");
+        let message = error.to_string();
+        assert!(
+            message.contains("alice"),
+            "error must name the user: {message}"
+        );
+        assert!(
+            message.contains("audit.jsonl"),
+            "error must name the audit path: {message}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn test_load_users_hidden_policy_name() {
         let dir = tmp_dir("hidden");
@@ -300,5 +341,33 @@ mod tests {
         .unwrap();
         let p = crate::policy::Policy::from_policy_file(file);
         assert!(p.api_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_user_instance_whitespace_token_means_unconfigured() {
+        let dir = tmp_dir("blank-token");
+        write_user(
+            &dir,
+            "alice",
+            r#"{"server": {"api_token": "   "}, "services": [{"name": "drive"}]}"#,
+        );
+        let users = load_users(&dir, &[], false, None).unwrap();
+        assert_eq!(users[0].api_token().await, None);
+        drop(users);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_user_instance_token_is_trimmed() {
+        let dir = tmp_dir("trim-token");
+        write_user(
+            &dir,
+            "alice",
+            r#"{"server": {"api_token": "  tok  "}, "services": [{"name": "drive"}]}"#,
+        );
+        let users = load_users(&dir, &[], false, None).unwrap();
+        assert_eq!(users[0].api_token().await.as_deref(), Some("tok"));
+        drop(users);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

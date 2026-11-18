@@ -62,6 +62,10 @@ fn parse_credentials(content: &str, source: &str) -> anyhow::Result<Credential> 
 /// 4. `gws auth export` (reads from OS keyring)
 /// 5. GOOGLE_APPLICATION_CREDENTIALS env var (ADC)
 /// 6. ~/.config/gcloud/application_default_credentials.json
+///
+/// The order is intentional and unchanged; when a higher-priority source
+/// displaces an explicitly configured `credentials_file` we emit a one-time
+/// warning so operators are never silently overridden.
 pub async fn get_token(
     scopes: &[&str],
     credentials_file: Option<&str>,
@@ -79,6 +83,7 @@ pub async fn get_token_as(
     if let Ok(token) = std::env::var("GOOGLE_WORKSPACE_CLI_TOKEN")
         && !token.is_empty()
     {
+        warn_credential_override(credentials_file, "GOOGLE_WORKSPACE_CLI_TOKEN");
         return Ok(token);
     }
 
@@ -104,6 +109,26 @@ pub async fn get_token_as(
     Ok(token)
 }
 
+/// Warning text for a credential source that wins over the policy
+/// `credentials_file`, or `None` when nothing explicit would be overridden.
+fn credential_override_warning(credentials_file: Option<&str>, source: &str) -> Option<String> {
+    let path = credentials_file?;
+    Some(format!(
+        "credential source '{source}' takes precedence over the policy credentials_file \
+         '{path}', which will be ignored. Unset it to honor the policy configuration"
+    ))
+}
+
+/// Emit the credential-override warning at most once per process.
+fn warn_credential_override(credentials_file: Option<&str>, source: &str) {
+    static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if let Some(msg) = credential_override_warning(credentials_file, source)
+        && WARNED.set(()).is_ok()
+    {
+        tracing::warn!("{msg}");
+    }
+}
+
 async fn load_credentials(credentials_file: Option<&str>) -> anyhow::Result<Credential> {
     if let Some(path) = credentials_file {
         let p = PathBuf::from(path);
@@ -118,6 +143,7 @@ async fn load_credentials(credentials_file: Option<&str>) -> anyhow::Result<Cred
     if let Ok(path) = std::env::var("GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE") {
         let p = PathBuf::from(&path);
         if p.exists() {
+            warn_credential_override(credentials_file, "GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE");
             let content = tokio::fs::read_to_string(&p).await?;
             return parse_credentials(&content, &p.display().to_string());
         }
@@ -126,13 +152,18 @@ async fn load_credentials(credentials_file: Option<&str>) -> anyhow::Result<Cred
         );
     }
 
+    let config_dir_from_env = std::env::var("GOOGLE_WORKSPACE_CLI_CONFIG_DIR").is_ok();
     let default_path = config_dir().join("credentials.json");
     if default_path.exists() {
+        if config_dir_from_env {
+            warn_credential_override(credentials_file, "GOOGLE_WORKSPACE_CLI_CONFIG_DIR");
+        }
         let content = tokio::fs::read_to_string(&default_path).await?;
         return parse_credentials(&content, &default_path.display().to_string());
     }
 
     if let Some(cred) = try_gws_export().await {
+        warn_credential_override(credentials_file, "`gws auth export`");
         return Ok(cred);
     }
 
@@ -519,6 +550,25 @@ pub fn get_quota_project(policy_project_id: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_credential_override_warning_decisions() {
+        // No explicit credentials_file: nothing can be displaced.
+        assert!(credential_override_warning(None, "GOOGLE_WORKSPACE_CLI_TOKEN").is_none());
+        assert!(credential_override_warning(None, "GOOGLE_WORKSPACE_CLI_CONFIG_DIR").is_none());
+        assert!(credential_override_warning(None, "`gws auth export`").is_none());
+
+        // An explicit policy file is named in the warning.
+        for source in [
+            "GOOGLE_WORKSPACE_CLI_TOKEN",
+            "GOOGLE_WORKSPACE_CLI_CONFIG_DIR",
+            "`gws auth export`",
+        ] {
+            let msg = credential_override_warning(Some("/etc/gws/creds.json"), source).unwrap();
+            assert!(msg.contains(source), "{msg}");
+            assert!(msg.contains("/etc/gws/creds.json"), "{msg}");
+        }
+    }
 
     #[test]
     fn test_adc_well_known_path_exists() {

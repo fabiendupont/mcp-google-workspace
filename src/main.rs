@@ -33,6 +33,18 @@ struct Cli {
     #[arg(long)]
     http: Option<String>,
 
+    /// Bearer token required by the HTTP endpoints (overrides
+    /// server.api_token from the policy; empty means "not configured").
+    /// Falls back to the GWS_API_TOKEN environment variable.
+    #[arg(long)]
+    api_token: Option<String>,
+
+    /// Allow an HTTP server bound to a non-loopback address to run without
+    /// any API token. Anyone who can reach the port can call every tool the
+    /// policy allows — use only on a trusted network.
+    #[arg(long)]
+    insecure_no_auth: bool,
+
     /// External URL for webhook callbacks
     #[arg(long)]
     external_url: Option<String>,
@@ -41,7 +53,7 @@ struct Cli {
     #[arg(long)]
     compact_schemas: bool,
 
-    /// Load all helper tools at startup instead of lazy discovery
+    /// Load every helper tool the policy permits at startup instead of lazy discovery
     #[arg(long)]
     eager_tools: bool,
 
@@ -62,13 +74,14 @@ struct Cli {
 #[derive(clap::Subcommand, Debug)]
 enum CliCommand {
     /// Guided setup: check auth, pick services, folders, labels, calendars
+    /// (asks before overwriting an existing policy file)
     Init {
-        /// Use a preset instead of interactive setup (analyst, assistant, admin-readonly)
+        /// Use a preset instead of interactive setup (analyst, assistant, admin-readonly, content-writer, it-admin)
         #[arg(long)]
         template: Option<String>,
     },
 
-    /// Validate a policy file and show security warnings
+    /// Validate a policy file; exit non-zero when security warnings are present
     CheckPolicy {
         /// Path to the policy file to validate
         path: PathBuf,
@@ -125,6 +138,8 @@ struct ParsedArgs {
     audit_log: Option<PathBuf>,
     prompts_dir: Option<PathBuf>,
     users_dir: Option<PathBuf>,
+    api_token: Option<String>,
+    insecure_no_auth: bool,
 }
 
 fn parse_args_from(args: &[String]) -> Result<Command, GwsError> {
@@ -176,24 +191,122 @@ fn cli_to_command(cli: Cli) -> Result<Command, GwsError> {
             audit_log: cli.audit_log,
             prompts_dir: cli.prompts_dir,
             users_dir: cli.users_dir,
+            api_token: cli.api_token,
+            insecure_no_auth: cli.insecure_no_auth,
         })),
     }
 }
 
 const POLICY_FILE_NAMES: &[&str] = &[".gws-policy.json", "gws-policy.json"];
 
+/// Whether policy auto-discovery must stop ascending at `dir`.
+///
+/// Discovery stops at `$HOME` and at the first directory containing `.git`:
+/// continuing to the filesystem root could silently pick up an unrelated
+/// policy from `/gws-policy.json` or another project.
+fn discovery_boundary_reached(dir: &Path, home: Option<&Path>) -> bool {
+    home.is_some_and(|home| dir == home) || dir.join(".git").exists()
+}
+
 fn discover_policy_file() -> Option<PathBuf> {
-    let mut dir = std::env::current_dir().ok()?;
+    let cwd = std::env::current_dir().ok()?;
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut dir = cwd.clone();
     loop {
         for name in POLICY_FILE_NAMES {
             let candidate = dir.join(name);
             if candidate.is_file() {
-                tracing::info!(path = %candidate.display(), "Auto-discovered policy file");
+                if dir == cwd {
+                    tracing::info!(path = %candidate.display(), "Auto-discovered policy file");
+                } else {
+                    tracing::warn!(
+                        path = %candidate.display(),
+                        directory = %dir.display(),
+                        "Auto-discovered policy file above the current directory"
+                    );
+                }
                 return Some(candidate);
             }
         }
+        if discovery_boundary_reached(&dir, home.as_deref()) {
+            return None;
+        }
         if !dir.pop() {
             return None;
+        }
+    }
+}
+
+/// Resolve the HTTP bearer token: `--api-token`, then `GWS_API_TOKEN`, then
+/// the policy's `server.api_token`. Empty/whitespace values count as unset.
+fn resolve_api_token(flag: Option<String>, env: Option<String>) -> Option<String> {
+    flag.into_iter()
+        .chain(env)
+        .map(|token| token.trim().to_string())
+        .find(|token| !token.is_empty())
+}
+
+/// Whether an HTTP bind address is loopback-only.
+fn is_loopback_bind(addr: &str) -> bool {
+    let host = http::bind_host_of(addr);
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+/// Outcome of the HTTP-mode authentication safety check.
+#[derive(Debug, PartialEq, Eq)]
+enum HttpStartupAuth {
+    /// A token is configured, or the operator explicitly opted out.
+    Allowed,
+    /// Loopback bind with no token: allowed, but warn loudly.
+    WarnNoTokenLoopback,
+    /// Non-loopback bind with no token: refuse to start.
+    RefuseNoTokenPublic,
+}
+
+fn evaluate_http_startup(
+    bind_addr: &str,
+    token_configured: bool,
+    insecure_no_auth: bool,
+) -> HttpStartupAuth {
+    if token_configured || insecure_no_auth {
+        return HttpStartupAuth::Allowed;
+    }
+    if is_loopback_bind(bind_addr) {
+        HttpStartupAuth::WarnNoTokenLoopback
+    } else {
+        HttpStartupAuth::RefuseNoTokenPublic
+    }
+}
+
+/// Apply [`evaluate_http_startup`], logging the warning or exiting with a
+/// message that explains both ways to proceed.
+fn enforce_http_startup_auth(bind_addr: &str, token_configured: bool, insecure_no_auth: bool) {
+    match evaluate_http_startup(bind_addr, token_configured, insecure_no_auth) {
+        HttpStartupAuth::Allowed => {}
+        HttpStartupAuth::WarnNoTokenLoopback => {
+            tracing::warn!(
+                addr = bind_addr,
+                "HTTP server has no API token. This is only safe because it is bound to a \
+                 loopback address. Set --api-token (or GWS_API_TOKEN, or server.api_token) \
+                 to require authentication."
+            );
+        }
+        HttpStartupAuth::RefuseNoTokenPublic => {
+            eprintln!(
+                "Refusing to start: --http is bound to a non-loopback address ({bind_addr}) \
+                 but no API token is configured.\n\
+                 Anyone who can reach this port could call every tool the policy allows.\n\
+                 Either:\n  \
+                 - pass --api-token <token> (or set GWS_API_TOKEN), or set \
+                 \"server.api_token\" in the policy, or\n  \
+                 - pass --insecure-no-auth if the port is only reachable by trusted clients."
+            );
+            std::process::exit(1);
         }
     }
 }
@@ -224,11 +337,16 @@ fn resolve_config(parsed: ParsedArgs) -> Result<(policy::Policy, Transport), Gws
     Ok((policy, transport))
 }
 
-fn check_policy(path: &Path) -> Result<(), GwsError> {
+/// Validate a policy file and print a summary.
+///
+/// Returns the warnings that were printed. The caller exits non-zero when the
+/// list is not empty: `check-policy` is used in CI as a gate, so a policy that
+/// only "looks fine" must not pass silently.
+fn check_policy(path: &Path) -> Result<Vec<String>, GwsError> {
     let p = policy::Policy::from_file(path)?;
 
     let services = p.allowed_services();
-    eprintln!("Policy OK: {} service(s) configured", services.len());
+    eprintln!("Policy parsed: {} service(s) configured", services.len());
     for svc in &services {
         let mut flags = Vec::new();
         if p.is_read_only(svc) {
@@ -255,67 +373,62 @@ fn check_policy(path: &Path) -> Result<(), GwsError> {
     eprintln!("  max request size: {} bytes", p.max_request_bytes);
 
     let warnings = check_policy_warnings(&p);
-    if !warnings.is_empty() {
+    if warnings.is_empty() {
         eprintln!();
-        eprintln!("Warnings:");
+        eprintln!("Policy OK: no warnings");
+    } else {
+        eprintln!();
+        eprintln!("Warnings ({}):", warnings.len());
         for w in &warnings {
             eprintln!("  ! {w}");
         }
     }
 
-    Ok(())
+    Ok(warnings)
 }
 
+/// Warnings for policy shapes that silently weaken the documented guarantees.
+///
+/// Delegates to [`policy::Policy::scoping_warnings`] — the single source of
+/// truth, also used for startup logging — so `check-policy` and the running
+/// server can never disagree or print the same line twice with different
+/// wording. Only CLI-specific checks that the runtime API does not emit are
+/// added here.
 fn check_policy_warnings(p: &policy::Policy) -> Vec<String> {
-    let mut warnings = Vec::new();
+    let mut warnings = p.scoping_warnings();
 
-    for svc in p.allowed_services() {
-        match svc {
-            "gmail" => {
-                let denied = p.denied_methods(svc);
-                if !denied.contains("settings.updateAutoForwarding") {
-                    warnings.push(
-                        "gmail: settings.updateAutoForwarding is not denied — \
-                         an agent could silently forward all mail to an external address"
-                            .to_string(),
-                    );
-                }
-                if !denied.contains("settings.delegates.create") {
-                    warnings.push(
-                        "gmail: settings.delegates.create is not denied — \
-                         an agent could grant another account full access to the mailbox"
-                            .to_string(),
-                    );
-                }
-                if !denied.contains("settings.forwardingAddresses.create") {
-                    warnings.push(
-                        "gmail: settings.forwardingAddresses.create is not denied — \
-                         an agent could add forwarding addresses"
-                            .to_string(),
-                    );
-                }
-            }
-            "drive" => {
-                if p.constraints(svc).is_empty() && !p.is_read_only(svc) {
-                    warnings.push(
-                        "drive: no constraints and not read-only — \
-                         agent has full access to all Drive files"
-                            .to_string(),
-                    );
-                }
-            }
-            "admin" if !p.is_read_only(svc) => {
-                warnings.push(
-                    "admin: not read-only — \
-                     agent can modify users, groups, and org units"
-                        .to_string(),
-                );
-            }
-            _ => {}
-        }
+    // `scoping_warnings` already emits a generic line for a read-write service
+    // with no constraints. Admin's blast radius (users, groups, org units) is
+    // unusual enough to warrant a specific line, but only when the shared API
+    // said nothing — otherwise `check-policy` prints two lines for one service.
+    if p.is_service_allowed("admin")
+        && !p.is_read_only("admin")
+        && !warnings
+            .iter()
+            .any(|w| w.starts_with("admin: service is not read-only"))
+    {
+        warnings.push(
+            "admin: not read-only — \
+             agent can modify users, groups, and org units"
+                .to_string(),
+        );
     }
 
     warnings
+}
+
+/// Log every scoping warning at WARN.
+///
+/// `Policy::scoping_warnings()` is the shared source of truth (also consumed
+/// by `check-policy`), so the running server and the CI gate cannot drift.
+/// `user` is `Some` in multi-user mode so the line names the affected tenant.
+fn log_scoping_warnings(policy: &policy::Policy, user: Option<&str>) {
+    for warning in policy.scoping_warnings() {
+        match user {
+            Some(user) => tracing::warn!(user = user, "{warning}"),
+            None => tracing::warn!("{warning}"),
+        }
+    }
 }
 
 async fn verify_policy(p: &mut policy::Policy) -> Result<(), GwsError> {
@@ -510,9 +623,12 @@ fn simulate_policy(policy_path: &Path, scenarios_path: &Path) -> Result<(), GwsE
             continue;
         }
 
-        let denied = p.denied_methods(&scenario.service);
-        let full_name = format!("{resource}.{method}");
-        let method_denied = denied.contains(method) || denied.contains(full_name.as_str());
+        // Use the same alias/leaf matching as `Policy::check_method`, so the
+        // simulation cannot disagree with the live path: a denylist entry for
+        // `messages.trash` must deny a scenario written as
+        // `users.messages.trash` (and vice versa), and `files.emptyTrash` is
+        // denied through the `files.delete` alias.
+        let method_denied = p.is_method_denied(&scenario.service, resource, method);
         if method_denied {
             eprintln!("  Method:  \u{2717} denied by denylist");
             verdict = "DENIED (method in denylist)";
@@ -644,6 +760,18 @@ async fn main() {
     let parsed = match cmd {
         Command::InitPolicy { services, template } => {
             let interactive = services.is_none() && template.is_none();
+            if interactive {
+                // `init_guided` runs the wizard, writes the policy through the
+                // guarded writer (refuses symlinks, asks before overwriting)
+                // and prints its own next-steps. Writing the file again here
+                // would bypass that guard and prompt a second time.
+                if let Err(e) = init::init_guided().await {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+                std::process::exit(0);
+            }
+
             let json = if let Some(ref tmpl) = template {
                 if let Some((_, desc)) = init::TEMPLATES.iter().find(|(n, _)| *n == tmpl.as_str()) {
                     eprintln!("Using template '{tmpl}': {desc}");
@@ -655,56 +783,31 @@ async fn main() {
                         std::process::exit(1);
                     }
                 }
-            } else if let Some(svc) = services {
-                init::generate_policy(&svc)
+            } else if let Some(ref svc) = services {
+                init::generate_policy(svc)
             } else {
-                match init::init_guided().await {
-                    Ok(j) => j,
-                    Err(e) => {
-                        eprintln!("Error: {e}");
-                        std::process::exit(1);
-                    }
-                }
+                unreachable!("interactive case exits above")
             };
-            let output = serde_json::to_string_pretty(&json).unwrap();
-
-            if interactive {
-                use dialoguer::Input;
-                eprintln!();
-                let path: String = Input::new()
-                    .with_prompt("Save to")
-                    .default(".gws-policy.json".to_string())
-                    .interact_text()
-                    .unwrap_or_else(|_| ".gws-policy.json".to_string());
-
-                if let Err(e) = std::fs::write(&path, &output) {
-                    eprintln!("Error writing {path}: {e}");
-                    std::process::exit(1);
-                }
-                eprintln!();
-                eprintln!("Saved to {path}");
-                if path.starts_with('.') {
-                    eprintln!();
-                    eprintln!("Add to .gitignore (contains project IDs and folder IDs):");
-                    eprintln!("  echo '{path}' >> .gitignore");
-                }
-                eprintln!();
-                eprintln!("The server auto-discovers {path} — just run:");
-                eprintln!("  mcp-google-workspace");
-                eprintln!();
-                eprintln!("Or explicitly:");
-                eprintln!("  mcp-google-workspace --policy {path}");
-                eprintln!();
-                eprintln!("Validate with:");
-                eprintln!("  mcp-google-workspace check-policy {path}");
-            } else {
-                println!("{output}");
-            }
+            println!("{}", serde_json::to_string_pretty(&json).unwrap());
             std::process::exit(0);
         }
         Command::CheckPolicy { path, verify } => {
             match check_policy(&path) {
-                Ok(()) => {}
+                Ok(warnings) => {
+                    // `check-policy` is a CI gate: warnings are printed above,
+                    // and any of them means the policy grants more than the
+                    // operator likely intends. Exit non-zero so the gate
+                    // actually fails instead of always succeeding.
+                    if !warnings.is_empty() {
+                        eprintln!();
+                        eprintln!(
+                            "Policy has {} warning(s); exiting non-zero. \
+                             Fix the policy or remove the warning source.",
+                            warnings.len()
+                        );
+                        std::process::exit(1);
+                    }
+                }
                 Err(e) => {
                     eprintln!("Policy error: {e}");
                     std::process::exit(1);
@@ -801,6 +904,11 @@ async fn main() {
     let eager_tools = parsed.eager_tools;
     let users_dir_flag = parsed.users_dir.clone();
     let http_addr_flag = parsed.http_addr.clone();
+    let insecure_no_auth = parsed.insecure_no_auth;
+    let api_token_override = resolve_api_token(
+        parsed.api_token.clone(),
+        std::env::var("GWS_API_TOKEN").ok(),
+    );
 
     // Multi-user HTTP mode: per-user policies and credentials, no global
     // policy required. Each user is served at /mcp/<user>.
@@ -828,13 +936,44 @@ async fn main() {
                 .join(", "),
             "Starting multi-user MCP HTTP server"
         );
-        tracing::warn!(
-            "Multi-user mode: per-policy rate limits are not enforced \
-             across users in this mode"
+
+        for user in &users {
+            let policy = user.policy.read().await;
+            log_scoping_warnings(&policy, Some(user.name.as_str()));
+        }
+
+        let bind_addr = http_addr_flag.unwrap_or_default();
+        // Every user endpoint must require a token before a non-loopback bind
+        // is considered safe; a single unprotected user is an open door.
+        let mut all_users_have_tokens = true;
+        for user in &users {
+            if user.api_token().await.is_none() {
+                all_users_have_tokens = false;
+                break;
+            }
+        }
+        enforce_http_startup_auth(
+            &bind_addr,
+            api_token_override.is_some() || all_users_have_tokens,
+            insecure_no_auth,
         );
 
-        let result =
-            http::serve_users(users, &http_addr_flag.unwrap_or_default(), external_url).await;
+        // Install the service-level limiter in multi-user mode too, using the
+        // most restrictive per-user `rate_limit_rpm` as the fallback. Explicit
+        // per-service overrides from individual policies are not merged.
+        let mut min_rpm: Option<u32> = None;
+        for user in &users {
+            if let Some(rpm) = user.policy.read().await.rate_limit_rpm {
+                min_rpm = Some(min_rpm.map_or(rpm, |current| current.min(rpm)));
+            }
+        }
+        rate_limit::init_global(min_rpm, None);
+        tracing::warn!(
+            "Multi-user mode: the global outbound limiter uses the lowest per-user \
+             rate_limit_rpm; per-user rate_limits overrides are not applied"
+        );
+
+        let result = http::serve_users(users, &bind_addr, external_url, api_token_override).await;
         if let Err(e) = result {
             eprintln!("Fatal: {e}");
             std::process::exit(1);
@@ -854,6 +993,10 @@ async fn main() {
     rate_limit::init_global(policy.rate_limit_rpm, policy.rate_limits.clone());
 
     print_effective_policy(&policy);
+    // Surface policy shapes that silently weaken the documented guarantees
+    // (unscoped calendars, non-recursive `parents`, un-denied Gmail settings)
+    // before any client can call a tool.
+    log_scoping_warnings(&policy, None);
 
     let prompts_dir = prompts_dir_flag
         .or_else(|| {
@@ -910,6 +1053,17 @@ async fn main() {
                 tracing::info!(services = %svc_list.join(", "), "Starting MCP HTTP server");
             }
 
+            let policy_token = policy
+                .api_token
+                .as_deref()
+                .map(str::trim)
+                .filter(|token| !token.is_empty());
+            enforce_http_startup_auth(
+                &addr,
+                api_token_override.is_some() || policy_token.is_some(),
+                insecure_no_auth,
+            );
+
             let webhook = external_url
                 .clone()
                 .or_else(|| Some(format!("http://{addr}")));
@@ -917,7 +1071,8 @@ async fn main() {
             let state = Arc::new(tokio::sync::Mutex::new(state));
             let policy = Arc::new(tokio::sync::RwLock::new(policy));
 
-            let result = http::serve(policy, policy_file_path, state, &addr).await;
+            let result =
+                http::serve(policy, policy_file_path, state, &addr, api_token_override).await;
             if let Err(e) = result {
                 eprintln!("Fatal: {e}");
                 std::process::exit(1);
@@ -1024,6 +1179,8 @@ mod tests {
             audit_log: None,
             prompts_dir: None,
             users_dir: None,
+            api_token: None,
+            insecure_no_auth: false,
         };
         let (policy, _) = resolve_config(parsed).unwrap();
         assert!(policy.is_service_allowed("drive"));
@@ -1047,6 +1204,8 @@ mod tests {
             audit_log: None,
             prompts_dir: None,
             users_dir: None,
+            api_token: None,
+            insecure_no_auth: false,
         };
         let result = resolve_config(parsed);
         std::env::set_current_dir(prev).unwrap();
@@ -1066,6 +1225,8 @@ mod tests {
             audit_log: None,
             prompts_dir: None,
             users_dir: None,
+            api_token: None,
+            insecure_no_auth: false,
         };
         let (_, transport) = resolve_config(parsed).unwrap();
         assert!(matches!(transport, Transport::Http(addr) if addr == "0.0.0.0:8080"));
@@ -1083,6 +1244,8 @@ mod tests {
             audit_log: None,
             prompts_dir: None,
             users_dir: None,
+            api_token: None,
+            insecure_no_auth: false,
         };
         let (_, transport) = resolve_config(parsed).unwrap();
         assert!(matches!(transport, Transport::Stdio));
@@ -1100,6 +1263,8 @@ mod tests {
             audit_log: None,
             prompts_dir: None,
             users_dir: None,
+            api_token: None,
+            insecure_no_auth: false,
         };
         assert!(resolve_config(parsed).is_err());
     }
@@ -1276,12 +1441,41 @@ mod tests {
         let dir = std::env::temp_dir().join("mcp-gws-test-check");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("policy.json");
+        // A read-only, constrained policy is the only shape that produces no
+        // warnings; `check-policy` treats any warning as a CI failure.
         std::fs::write(
             &path,
-            r#"{"services": [{"name": "drive"}, {"name": "gmail"}]}"#,
+            r#"{"services": [{"name": "drive", "read_only": true}]}"#,
         )
         .unwrap();
-        assert!(check_policy(&path).is_ok());
+        let warnings = check_policy(&path).unwrap();
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_check_policy_reports_warnings_as_a_gate() {
+        let dir = std::env::temp_dir().join("mcp-gws-test-check-warn");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("policy.json");
+        // Read-write Drive with no constraints silently grants the credential's
+        // whole corpus. The CLI exits non-zero when this list is non-empty.
+        std::fs::write(&path, r#"{"services": [{"name": "drive"}]}"#).unwrap();
+        let warnings = check_policy(&path).unwrap();
+        assert!(
+            warnings.iter().any(|w| w.starts_with("drive:")),
+            "expected an unscoped-drive warning, got: {warnings:?}"
+        );
+        // No duplicated lines: the delegated `scoping_warnings` output and the
+        // CLI-only admin check must not repeat each other.
+        let mut deduped = warnings.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(
+            deduped.len(),
+            warnings.len(),
+            "duplicate warnings: {warnings:?}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1436,5 +1630,134 @@ mod tests {
     fn test_parse_users_dir_default_none() {
         let parsed = unwrap_serve(parse_args_from(&args(&["--services", "drive"])).unwrap());
         assert!(parsed.users_dir.is_none());
+    }
+
+    #[test]
+    fn test_parse_api_token_flag() {
+        let parsed = unwrap_serve(
+            parse_args_from(&args(&[
+                "--services",
+                "drive",
+                "--http",
+                "0.0.0.0:3000",
+                "--api-token",
+                "tok123",
+            ]))
+            .unwrap(),
+        );
+        assert_eq!(parsed.api_token.as_deref(), Some("tok123"));
+        assert!(!parsed.insecure_no_auth);
+    }
+
+    #[test]
+    fn test_parse_insecure_no_auth_flag() {
+        let parsed = unwrap_serve(
+            parse_args_from(&args(&[
+                "--services",
+                "drive",
+                "--http",
+                "0.0.0.0:3000",
+                "--insecure-no-auth",
+            ]))
+            .unwrap(),
+        );
+        assert!(parsed.insecure_no_auth);
+        assert!(parsed.api_token.is_none());
+    }
+
+    #[test]
+    fn test_resolve_api_token_precedence() {
+        assert_eq!(
+            resolve_api_token(Some("flag".into()), Some("env".into())),
+            Some("flag".into())
+        );
+        assert_eq!(
+            resolve_api_token(None, Some("env".into())),
+            Some("env".into())
+        );
+        assert_eq!(resolve_api_token(None, None), None);
+        // Empty/whitespace counts as "not configured".
+        assert_eq!(resolve_api_token(Some(String::new()), None), None);
+        assert_eq!(
+            resolve_api_token(Some("   ".into()), Some(String::new())),
+            None
+        );
+        // An empty override does not suppress a usable env value.
+        assert_eq!(
+            resolve_api_token(Some("  ".into()), Some("env".into())),
+            Some("env".into())
+        );
+        assert_eq!(
+            resolve_api_token(Some("  tok  ".into()), None),
+            Some("tok".into())
+        );
+    }
+
+    #[test]
+    fn test_is_loopback_bind() {
+        assert!(is_loopback_bind("127.0.0.1:3000"));
+        assert!(is_loopback_bind("localhost:3000"));
+        assert!(is_loopback_bind("[::1]:3000"));
+        assert!(!is_loopback_bind("0.0.0.0:3000"));
+        assert!(!is_loopback_bind("[::]:3000"));
+        assert!(!is_loopback_bind("10.0.0.5:3000"));
+        assert!(!is_loopback_bind("mcp-gws.example:3000"));
+    }
+
+    #[test]
+    fn test_evaluate_http_startup_with_token_is_allowed() {
+        assert_eq!(
+            evaluate_http_startup("0.0.0.0:3000", true, false),
+            HttpStartupAuth::Allowed
+        );
+        assert_eq!(
+            evaluate_http_startup("127.0.0.1:3000", true, false),
+            HttpStartupAuth::Allowed
+        );
+    }
+
+    #[test]
+    fn test_evaluate_http_startup_loopback_without_token_warns() {
+        assert_eq!(
+            evaluate_http_startup("127.0.0.1:3000", false, false),
+            HttpStartupAuth::WarnNoTokenLoopback
+        );
+    }
+
+    #[test]
+    fn test_evaluate_http_startup_public_without_token_refuses() {
+        assert_eq!(
+            evaluate_http_startup("0.0.0.0:3000", false, false),
+            HttpStartupAuth::RefuseNoTokenPublic
+        );
+    }
+
+    #[test]
+    fn test_evaluate_http_startup_insecure_opt_out_allows_public() {
+        assert_eq!(
+            evaluate_http_startup("0.0.0.0:3000", false, true),
+            HttpStartupAuth::Allowed
+        );
+    }
+
+    #[test]
+    fn test_discovery_boundary_reached() {
+        let root = std::env::temp_dir().join("mcp-gws-test-discovery-boundary");
+        let _ = std::fs::remove_dir_all(&root);
+        let project = root.join("project");
+        let nested = project.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(root.join("home")).unwrap();
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+
+        // A directory containing .git stops the ascent.
+        assert!(discovery_boundary_reached(&project, None));
+        assert!(!discovery_boundary_reached(&nested, None));
+        // $HOME always stops it.
+        let home = root.join("home");
+        assert!(discovery_boundary_reached(&home, Some(&home)));
+        assert!(!discovery_boundary_reached(&nested, Some(&home)));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

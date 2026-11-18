@@ -334,6 +334,37 @@ pub fn gmail_labels_tool_schema() -> Value {
     })
 }
 
+/// Reject header values containing CR/LF so callers cannot inject extra headers.
+pub fn validate_mail_header(field: &str, value: &str) -> Result<(), GwsError> {
+    if value.contains('\r') || value.contains('\n') {
+        return Err(GwsError::Validation(format!(
+            "Invalid '{field}' header: carriage return or newline characters are not allowed"
+        )));
+    }
+    Ok(())
+}
+
+/// Build a per-message MIME boundary from the clock and message length.
+///
+/// Uses an FNV-1a mix of the current time and the body length so that every
+/// message gets its own boundary without adding a randomness dependency.
+fn generate_mime_boundary(body_len: usize) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in nanos
+        .to_le_bytes()
+        .iter()
+        .chain(body_len.to_le_bytes().iter())
+    {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("----=_Part_MCP_GWS_{hash:016x}")
+}
+
 pub fn build_rfc2822_message(
     to: &str,
     cc: Option<&str>,
@@ -343,9 +374,31 @@ pub fn build_rfc2822_message(
     in_reply_to: Option<&str>,
     references: Option<&str>,
     html_body: Option<&str>,
-) -> String {
+    from: Option<&str>,
+) -> Result<String, GwsError> {
+    validate_mail_header("To", to)?;
+    if let Some(cc) = cc {
+        validate_mail_header("Cc", cc)?;
+    }
+    if let Some(bcc) = bcc {
+        validate_mail_header("Bcc", bcc)?;
+    }
+    validate_mail_header("Subject", subject)?;
+    if let Some(irt) = in_reply_to {
+        validate_mail_header("In-Reply-To", irt)?;
+    }
+    if let Some(refs) = references {
+        validate_mail_header("References", refs)?;
+    }
+    if let Some(from) = from {
+        validate_mail_header("From", from)?;
+    }
+
     let mut msg = String::new();
     msg.push_str("MIME-Version: 1.0\r\n");
+    if let Some(from) = from {
+        msg.push_str(&format!("From: {from}\r\n"));
+    }
     msg.push_str(&format!("To: {to}\r\n"));
     if let Some(cc) = cc {
         msg.push_str(&format!("Cc: {cc}\r\n"));
@@ -362,7 +415,7 @@ pub fn build_rfc2822_message(
     }
 
     if let Some(html) = html_body {
-        let boundary = "----=_Part_MCP_GWS_boundary";
+        let boundary = generate_mime_boundary(body.len() + html.len());
         msg.push_str(&format!(
             "Content-Type: multipart/alternative; boundary=\"{boundary}\"\r\n"
         ));
@@ -380,7 +433,7 @@ pub fn build_rfc2822_message(
         msg.push_str(body);
     }
 
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(msg.as_bytes())
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(msg.as_bytes()))
 }
 
 pub fn decode_message_body(payload: &Value) -> String {
@@ -466,25 +519,63 @@ pub fn extract_headers(headers: &Value, names: &[&str]) -> serde_json::Map<Strin
     map
 }
 
+/// Well-known Gmail system labels. Gmail uses the label name as its id.
+const SYSTEM_LABELS: [&str; 13] = [
+    "INBOX",
+    "SENT",
+    "DRAFT",
+    "TRASH",
+    "SPAM",
+    "STARRED",
+    "UNREAD",
+    "IMPORTANT",
+    "CATEGORY_PERSONAL",
+    "CATEGORY_SOCIAL",
+    "CATEGORY_PROMOTIONS",
+    "CATEGORY_UPDATES",
+    "CATEGORY_FORUMS",
+];
+
+/// System labels whose addition through `messages.modify` is destructive:
+/// `TRASH` trashes the message and `SPAM` moves it into spam, where Gmail
+/// deletes it automatically. Both bypass a `messages.trash` denial, so they
+/// are gated by the same denylist family.
+const DESTRUCTIVE_SYSTEM_LABELS: [&str; 2] = ["TRASH", "SPAM"];
+
+/// Resolve a system label id without a `users.labels.list` call.
+fn system_label_id(label_name: &str) -> Option<String> {
+    let upper = label_name.trim().to_ascii_uppercase();
+    SYSTEM_LABELS.contains(&upper.as_str()).then_some(upper)
+}
+
+/// Deny a `messages.modify` label mutation that stands in for a denied
+/// `messages.trash`.
+///
+/// Only adding `TRASH`/`SPAM` is blocked: removing `TRASH` is un-trashing and
+/// ordinary user labels are unaffected.
+pub fn check_destructive_label_mutation(
+    policy: &Policy,
+    action: &str,
+    label_id: &str,
+) -> Result<(), GwsError> {
+    let id = label_id.trim().to_ascii_uppercase();
+    if action != "add" || !DESTRUCTIVE_SYSTEM_LABELS.contains(&id.as_str()) {
+        return Ok(());
+    }
+    if policy.is_method_denied("gmail", "messages", "trash") {
+        return Err(GwsError::Validation(format!(
+            "Label mutation denied: adding the '{id}' system label is a destructive message \
+             mutation blocked by the same 'messages.trash' denylist family. \
+             Fix: remove \"messages.trash\" from \"denied_methods\" in the \"gmail\" service \
+             to allow it."
+        )));
+    }
+    Ok(())
+}
+
 pub fn resolve_label_id(label_name: &str, labels: &Value) -> Option<String> {
-    let system_labels = [
-        "INBOX",
-        "SENT",
-        "DRAFT",
-        "TRASH",
-        "SPAM",
-        "STARRED",
-        "UNREAD",
-        "IMPORTANT",
-        "CATEGORY_PERSONAL",
-        "CATEGORY_SOCIAL",
-        "CATEGORY_PROMOTIONS",
-        "CATEGORY_UPDATES",
-        "CATEGORY_FORUMS",
-    ];
-    let upper = label_name.to_uppercase();
-    if system_labels.contains(&upper.as_str()) {
-        return Some(upper);
+    if let Some(id) = system_label_id(label_name) {
+        return Some(id);
     }
 
     if let Some(arr) = labels.get("labels").and_then(|l| l.as_array()) {
@@ -559,13 +650,44 @@ pub fn strip_quoted_text(body: &str) -> String {
     result.trim_end().to_string()
 }
 
-pub fn markdown_to_html(md: &str) -> String {
+/// Maximum markdown body accepted for `format: "markdown"` (1 MiB).
+///
+/// Markdown rendering runs synchronously on a tokio worker, so the input is
+/// bounded before any parsing starts.
+pub const MAX_MARKDOWN_BYTES: usize = 1024 * 1024;
+/// Maximum length of a single markdown line (64 KiB).
+pub const MAX_MARKDOWN_LINE_BYTES: usize = 64 * 1024;
+/// Backstop on the rendered HTML size, in case entity escaping expands input.
+const MAX_MARKDOWN_HTML_BYTES: usize = 4 * MAX_MARKDOWN_BYTES;
+
+pub fn markdown_to_html(md: &str) -> Result<String, GwsError> {
+    if md.len() > MAX_MARKDOWN_BYTES {
+        return Err(GwsError::Validation(format!(
+            "Markdown body is {} bytes, exceeding the {} byte limit for format=\"markdown\". \
+             Shorten the body or send it as format=\"plain\".",
+            md.len(),
+            MAX_MARKDOWN_BYTES
+        )));
+    }
+
     let mut html = String::new();
     let mut in_code_block = false;
     let mut in_list = false;
     let mut list_ordered = false;
 
-    for line in md.lines() {
+    for (line_number, line) in md.lines().enumerate() {
+        if html.len() > MAX_MARKDOWN_HTML_BYTES {
+            return Err(rendered_html_too_large(html.len()));
+        }
+        if line.len() > MAX_MARKDOWN_LINE_BYTES {
+            return Err(GwsError::Validation(format!(
+                "Markdown line {} is {} bytes, exceeding the {} byte per-line limit for \
+                 format=\"markdown\". Split the long line or send it as format=\"plain\".",
+                line_number + 1,
+                line.len(),
+                MAX_MARKDOWN_LINE_BYTES
+            )));
+        }
         if line.starts_with("```") {
             if in_code_block {
                 html.push_str("</code></pre>\n");
@@ -651,7 +773,18 @@ pub fn markdown_to_html(md: &str) -> String {
         html.push_str("</code></pre>\n");
     }
 
-    html
+    if html.len() > MAX_MARKDOWN_HTML_BYTES {
+        return Err(rendered_html_too_large(html.len()));
+    }
+
+    Ok(html)
+}
+
+fn rendered_html_too_large(rendered: usize) -> GwsError {
+    GwsError::Validation(format!(
+        "Rendered markdown HTML is {rendered} bytes, exceeding the {MAX_MARKDOWN_HTML_BYTES} \
+         byte limit for format=\"markdown\". Shorten the body or send it as format=\"plain\"."
+    ))
 }
 
 fn close_list(html: &mut String, in_list: &mut bool, ordered: bool) {
@@ -665,18 +798,96 @@ fn escape_html(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
+}
+
+/// Lookup tables of the next matching position for every character index of a
+/// line.
+///
+/// Each table has `len + 1` entries: entry `i` is the smallest `j >= i` where
+/// the marker occurs, or `len` (the sentinel) when it never occurs again.
+/// Building them in one reverse pass keeps rendering linear; the previous
+/// implementation rescanned the rest of the line for every `[`, which made
+/// unterminated link markup quadratic.
+struct LineIndex {
+    close_bracket: Vec<usize>,
+    close_paren: Vec<usize>,
+    backtick: Vec<usize>,
+    star: Vec<usize>,
+    underscore: Vec<usize>,
+    double_star: Vec<usize>,
+}
+
+impl LineIndex {
+    fn new(chars: &[char]) -> Self {
+        let len = chars.len();
+        let mut close_bracket = vec![len; len + 1];
+        let mut close_paren = vec![len; len + 1];
+        let mut backtick = vec![len; len + 1];
+        let mut star = vec![len; len + 1];
+        let mut underscore = vec![len; len + 1];
+        let mut double_star = vec![len; len + 1];
+
+        for i in (0..len).rev() {
+            close_bracket[i] = if chars[i] == ']' {
+                i
+            } else {
+                close_bracket[i + 1]
+            };
+            close_paren[i] = if chars[i] == ')' {
+                i
+            } else {
+                close_paren[i + 1]
+            };
+            backtick[i] = if chars[i] == '`' { i } else { backtick[i + 1] };
+            star[i] = if chars[i] == '*' { i } else { star[i + 1] };
+            underscore[i] = if chars[i] == '_' {
+                i
+            } else {
+                underscore[i + 1]
+            };
+            double_star[i] = if chars[i] == '*' && chars.get(i + 1) == Some(&'*') {
+                i
+            } else {
+                double_star[i + 1]
+            };
+        }
+
+        Self {
+            close_bracket,
+            close_paren,
+            backtick,
+            star,
+            underscore,
+            double_star,
+        }
+    }
+
+    /// First position at or after `from` whose marker matched, if any.
+    fn next_match(table: &[usize], from: usize) -> Option<usize> {
+        let position = *table.get(from)?;
+        // The last entry of every table is the sentinel.
+        (position + 1 < table.len()).then_some(position)
+    }
 }
 
 fn inline_format(text: &str) -> String {
     let text = escape_html(text);
+    // Fast path: without an inline marker there is nothing to parse, so no
+    // lookup tables are allocated at all.
+    if !text.contains(['[', '`', '*', '_']) {
+        return text;
+    }
     let mut result = String::with_capacity(text.len());
     let chars: Vec<char> = text.chars().collect();
+    let index = LineIndex::new(&chars);
     let len = chars.len();
     let mut i = 0;
 
     while i < len {
         if chars[i] == '`'
-            && let Some(end) = find_closing(&chars, i + 1, '`')
+            && let Some(end) = LineIndex::next_match(&index.backtick, i + 1)
         {
             let code: String = chars[i + 1..end].iter().collect();
             result.push_str(&format!(
@@ -689,7 +900,7 @@ fn inline_format(text: &str) -> String {
         if i + 1 < len
             && chars[i] == '*'
             && chars[i + 1] == '*'
-            && let Some(end) = find_closing_double(&chars, i + 2, '*')
+            && let Some(end) = LineIndex::next_match(&index.double_star, i + 2)
         {
             let inner: String = chars[i + 2..end].iter().collect();
             result.push_str(&format!("<strong>{inner}</strong>"));
@@ -699,7 +910,12 @@ fn inline_format(text: &str) -> String {
 
         if chars[i] == '*' || chars[i] == '_' {
             let marker = chars[i];
-            if let Some(end) = find_closing(&chars, i + 1, marker) {
+            let table = if marker == '*' {
+                &index.star
+            } else {
+                &index.underscore
+            };
+            if let Some(end) = LineIndex::next_match(table, i + 1) {
                 let inner: String = chars[i + 1..end].iter().collect();
                 result.push_str(&format!("<em>{inner}</em>"));
                 i = end + 1;
@@ -708,12 +924,20 @@ fn inline_format(text: &str) -> String {
         }
 
         if chars[i] == '['
-            && let Some(link) = parse_link(&chars, i)
+            && let Some(link) = parse_link(&chars, &index, i)
         {
-            result.push_str(&format!(
-                "<a href=\"{}\" style=\"color:#1a73e8;\">{}</a>",
-                link.url, link.text
-            ));
+            match link.destination {
+                Some(LinkDestination::Link(url)) => result.push_str(&format!(
+                    "<a href=\"{url}\" style=\"color:#1a73e8;\">{}</a>",
+                    link.text
+                )),
+                // Disallowed scheme: keep the URL visible, but never as a link.
+                Some(LinkDestination::Text(url)) => {
+                    result.push_str(&format!("{} ({url})", link.text));
+                }
+                // Malformed destination: nothing from it is echoed back.
+                None => result.push_str(&link.text),
+            }
             i = link.end;
             continue;
         }
@@ -725,37 +949,95 @@ fn inline_format(text: &str) -> String {
     result
 }
 
-fn find_closing(chars: &[char], start: usize, marker: char) -> Option<usize> {
-    chars[start..]
-        .iter()
-        .position(|&c| c == marker)
-        .map(|p| start + p)
-}
-
-fn find_closing_double(chars: &[char], start: usize, marker: char) -> Option<usize> {
-    chars[start..]
-        .windows(2)
-        .position(|w| w[0] == marker && w[1] == marker)
-        .map(|p| start + p)
-}
-
 struct LinkParse {
     text: String,
-    url: String,
+    /// `None` when the destination is malformed and must not be echoed at all.
+    destination: Option<LinkDestination>,
     end: usize,
 }
 
-fn parse_link(chars: &[char], start: usize) -> Option<LinkParse> {
-    let close_bracket = find_closing(chars, start + 1, ']')?;
-    if close_bracket + 1 >= chars.len() || chars[close_bracket + 1] != '(' {
+enum LinkDestination {
+    /// Safe to emit as an `href`.
+    Link(String),
+    /// Well-formed but with a disallowed scheme: show as plain text.
+    Text(String),
+}
+
+/// Schemes that may appear in a rendered `href`.
+const ALLOWED_URL_SCHEMES: [&str; 4] = ["http", "https", "mailto", "tel"];
+
+/// Remove control characters (including NUL, tabs and newlines) and surrounding
+/// whitespace from a link target.
+fn sanitize_url(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// Whether a link target is well-formed enough to be shown at all.
+///
+/// Whitespace cannot appear in a URL, and the quote/angle/backtick characters
+/// are the ones used to break out of an HTML attribute. A destination carrying
+/// any of them (also as the entities `escape_html` produced from it) is not a
+/// URL, so it is dropped instead of being echoed back as attribute-looking
+/// text.
+fn url_is_well_formed(url: &str) -> bool {
+    let has_unsafe_char = url
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '"' | '\'' | '<' | '>' | '`'));
+    !has_unsafe_char
+        && !url.contains("&quot;")
+        && !url.contains("&#x27;")
+        && !url.contains("&lt;")
+        && !url.contains("&gt;")
+}
+
+/// Whether a URL may be emitted as an `href`.
+///
+/// Relative URLs (no scheme) are allowed — they cannot select a scripting
+/// scheme. Anything with an explicit scheme must be on the allowlist, so
+/// `javascript:` and `data:` render as plain text instead of a link.
+fn url_scheme_allowed(url: &str) -> bool {
+    let Some(colon) = url.find(':') else {
+        return true;
+    };
+    let scheme = &url[..colon];
+    let mut chars = scheme.chars();
+    let looks_like_scheme = chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    if !looks_like_scheme {
+        return true;
+    }
+    ALLOWED_URL_SCHEMES
+        .iter()
+        .any(|s| s.eq_ignore_ascii_case(scheme))
+}
+
+fn parse_link(chars: &[char], index: &LineIndex, start: usize) -> Option<LinkParse> {
+    let close_bracket = LineIndex::next_match(&index.close_bracket, start + 1)?;
+    if chars.get(close_bracket + 1) != Some(&'(') {
         return None;
     }
-    let close_paren = find_closing(chars, close_bracket + 2, ')')?;
+    let close_paren = LineIndex::next_match(&index.close_paren, close_bracket + 2)?;
     let text: String = chars[start + 1..close_bracket].iter().collect();
-    let url: String = chars[close_bracket + 2..close_paren].iter().collect();
+    let raw_url: String = chars[close_bracket + 2..close_paren].iter().collect();
+    let url = sanitize_url(&raw_url);
+
+    let destination = if !url_is_well_formed(&url) {
+        tracing::debug!("Dropping link with a malformed destination");
+        None
+    } else if url_scheme_allowed(&url) {
+        Some(LinkDestination::Link(url))
+    } else {
+        tracing::debug!(url = %url, "Rendering link with a disallowed scheme as plain text");
+        Some(LinkDestination::Text(url))
+    };
+
     Some(LinkParse {
         text,
-        url,
+        destination,
         end: close_paren + 1,
     })
 }
@@ -819,9 +1101,15 @@ pub fn check_label_target_policy(label_name: &str, allowed: &[String]) -> Result
     ))
 }
 
+/// Remove NUL and other control characters from a user-supplied Gmail query.
+fn sanitize_gmail_query(query: &str) -> String {
+    query.chars().filter(|c| !c.is_control()).collect()
+}
+
 pub fn inject_label_query(query: &str, allowed_labels: &[String]) -> String {
+    let query = sanitize_gmail_query(query);
     if allowed_labels.is_empty() {
-        return query.to_string();
+        return query;
     }
     let label_filter = if allowed_labels.len() == 1 {
         format!("label:{}", allowed_labels[0])
@@ -832,10 +1120,12 @@ pub fn inject_label_query(query: &str, allowed_labels: &[String]) -> String {
             .collect();
         format!("({})", parts.join(" OR "))
     };
-    if query.is_empty() {
+    if query.trim().is_empty() {
         label_filter
     } else {
-        format!("{query} {label_filter}")
+        // Parenthesize the caller query so ungrouped operators (e.g. a trailing
+        // `OR`) cannot escape the label restriction.
+        format!("({query}) {label_filter}")
     }
 }
 
@@ -844,6 +1134,107 @@ pub fn extract_label_ids(msg: &Value) -> Vec<&str> {
         .and_then(|l| l.as_array())
         .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
         .unwrap_or_default()
+}
+
+/// Defense-in-depth label check used for search hits.
+///
+/// Returns `true` when the message has at least one allowed label, or when no
+/// label policy is configured.
+pub fn message_allowed_by_label_policy(msg: &Value, allowed_label_ids: &[String]) -> bool {
+    if allowed_label_ids.is_empty() {
+        return true;
+    }
+    let labels = extract_label_ids(msg);
+    check_label_policy(&labels, allowed_label_ids).is_ok()
+}
+
+/// Keep only the thread messages that satisfy the allowed-label policy.
+///
+/// Gmail labels exist on messages, not on threads: the API documents that a
+/// "label might not exist on every message within a thread" and that messages
+/// added later do not inherit the thread's labels. The `Thread` resource has no
+/// `labelIds` field, so validating a single message (previously the first one)
+/// would return the unlabelled siblings that `gws_gmail_search` filters out.
+///
+/// Messages without any allowed label are dropped, mirroring the search
+/// behaviour; the caller reports the omitted count. A message that carries no
+/// `labelIds` at all (or a thread with no messages) is an error rather than an
+/// implicit allow — the policy cannot be verified, so the read fails closed.
+pub fn filter_thread_messages(
+    messages: &[Value],
+    allowed: &[String],
+) -> Result<Vec<Value>, String> {
+    if messages.is_empty() {
+        // Fail closed: a thread without messages is not an empty conversation
+        // that could be verified against the label policy.
+        return Err("Thread has no messages; refusing to return an empty read.".to_string());
+    }
+    if allowed.is_empty() {
+        return Ok(messages.to_vec());
+    }
+
+    let mut allowed_messages = Vec::with_capacity(messages.len());
+    for msg in messages {
+        let message_id = msg
+            .get("id")
+            .and_then(|id| id.as_str())
+            .unwrap_or("<unknown>");
+        let label_ids = msg.get("labelIds").and_then(|labels| labels.as_array());
+        let Some(label_ids) = label_ids else {
+            return Err(format!(
+                "Message '{message_id}' in this thread has no labelIds, so the \
+                 allowed-label policy cannot be verified. Refusing to return the thread \
+                 (fail closed)."
+            ));
+        };
+        let labels: Vec<&str> = label_ids.iter().filter_map(|v| v.as_str()).collect();
+        if check_label_policy(&labels, allowed).is_ok() {
+            allowed_messages.push(msg.clone());
+        } else {
+            tracing::warn!(
+                message_id = message_id,
+                "Dropping thread message outside the allowed label policy"
+            );
+        }
+    }
+    Ok(allowed_messages)
+}
+
+/// Resolve configured label names against a `users.labels.list` response.
+///
+/// Returns an error when the API response is an error payload. Unresolvable
+/// names are logged and skipped; the caller fail-closes when nothing resolves.
+/// An empty `allowed_labels` means "no label restriction" and resolves to an
+/// empty list.
+fn resolve_allowed_ids_from_result(
+    allowed_labels: &[String],
+    labels_result: &Value,
+) -> Result<Vec<String>, GwsError> {
+    if allowed_labels.is_empty() {
+        return Ok(vec![]);
+    }
+    if labels_result.get("error").is_some() || labels_result.get("validation_error").is_some() {
+        let detail = labels_result
+            .get("error")
+            .map(|e| match e {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            })
+            .unwrap_or_else(|| labels_result.to_string());
+        return Err(GwsError::Auth(format!(
+            "Failed to list Gmail labels while resolving the allowed label policy: {detail}"
+        )));
+    }
+
+    let mut ids = Vec::new();
+    for name in allowed_labels {
+        if let Some(id) = resolve_label_id(name, labels_result) {
+            ids.push(id);
+        } else {
+            tracing::warn!(label = %name, "Allowed label not found in Gmail — skipped");
+        }
+    }
+    Ok(ids)
 }
 
 async fn resolve_allowed_label_ids(
@@ -879,15 +1270,7 @@ async fn resolve_allowed_label_ids(
     )
     .await?;
 
-    let mut ids = Vec::new();
-    for name in allowed_labels {
-        if let Some(id) = resolve_label_id(name, &labels_result) {
-            ids.push(id);
-        } else {
-            tracing::warn!(label = %name, "Allowed label not found in Gmail — skipped");
-        }
-    }
-    Ok(ids)
+    resolve_allowed_ids_from_result(allowed_labels, &labels_result)
 }
 
 async fn execute_gmail_search(
@@ -895,7 +1278,7 @@ async fn execute_gmail_search(
     policy: &Policy,
     meta: &RequestMeta,
     state: &mut ServerState,
-    _allowed_label_ids: &[String],
+    allowed_label_ids: &[String],
     allowed_labels: &[String],
 ) -> Result<Value, GwsError> {
     let gmail_doc = state.get_doc("gmail").await?;
@@ -990,6 +1373,15 @@ async fn execute_gmail_search(
         .await
         {
             Ok(msg) => {
+                // Defense in depth: the injected query should already restrict
+                // results, but never return a hit outside the allowed labels.
+                if !message_allowed_by_label_policy(&msg, allowed_label_ids) {
+                    tracing::warn!(
+                        message_id = msg_id,
+                        "Dropping search hit outside the allowed label policy"
+                    );
+                    continue;
+                }
                 let empty_headers = json!([]);
                 let headers = msg
                     .get("payload")
@@ -1137,12 +1529,22 @@ async fn execute_gmail_draft(
     let is_markdown = arguments.get("format").and_then(|v| v.as_str()) == Some("markdown");
 
     let html_body = if is_markdown {
-        let html = markdown_to_html(body);
+        let html = markdown_to_html(body)?;
         Some(build_html_email_body(&html))
     } else {
         None
     };
-    let raw = build_rfc2822_message(to, cc, bcc, subject, body, None, None, html_body.as_deref());
+    let raw = build_rfc2822_message(
+        to,
+        cc,
+        bcc,
+        subject,
+        body,
+        None,
+        None,
+        html_body.as_deref(),
+        None,
+    )?;
 
     let drafts_resource = tools::find_resource(&gmail_doc.resources, "users.drafts")
         .ok_or_else(|| GwsError::Validation("users.drafts resource not found".into()))?;
@@ -1243,12 +1645,22 @@ async fn execute_gmail_send(
     let is_markdown = arguments.get("format").and_then(|v| v.as_str()) == Some("markdown");
 
     let html_body = if is_markdown {
-        let html = markdown_to_html(body);
+        let html = markdown_to_html(body)?;
         Some(build_html_email_body(&html))
     } else {
         None
     };
-    let raw = build_rfc2822_message(to, cc, bcc, subject, body, None, None, html_body.as_deref());
+    let raw = build_rfc2822_message(
+        to,
+        cc,
+        bcc,
+        subject,
+        body,
+        None,
+        None,
+        html_body.as_deref(),
+        None,
+    )?;
 
     let messages_resource = tools::find_resource(&gmail_doc.resources, "users.messages")
         .ok_or_else(|| GwsError::Validation("users.messages resource not found".into()))?;
@@ -1362,7 +1774,7 @@ async fn execute_gmail_reply(
 
     let is_markdown = arguments.get("format").and_then(|v| v.as_str()) == Some("markdown");
     let html_body = if is_markdown {
-        let html = markdown_to_html(reply_body);
+        let html = markdown_to_html(reply_body)?;
         Some(build_html_email_body(&html))
     } else {
         None
@@ -1376,7 +1788,8 @@ async fn execute_gmail_reply(
         message_id_header,
         message_id_header,
         html_body.as_deref(),
-    );
+        None,
+    )?;
 
     let send_method = messages_resource
         .methods
@@ -1450,25 +1863,21 @@ async fn execute_gmail_thread(
     )
     .await?;
 
-    if !allowed_label_ids.is_empty() {
-        let empty_msg = json!({});
-        let first_msg = thread
-            .get("messages")
-            .and_then(|m| m.as_array())
-            .and_then(|a| a.first())
-            .unwrap_or(&empty_msg);
-        let msg_labels = extract_label_ids(first_msg);
-        check_label_policy(&msg_labels, allowed_label_ids).map_err(GwsError::Validation)?;
-    }
+    // Gmail labels live on messages, not on threads, and messages added to a
+    // thread after a label was applied do not inherit it. The `Thread` resource
+    // has no `labelIds` field at all, so every message must be validated on its
+    // own — checking just the first one would leak the unlabelled siblings that
+    // `gws_gmail_search` can never return.
+    let fetched_messages = thread.get("messages").and_then(|m| m.as_array());
+    let fetched_messages = fetched_messages.cloned().unwrap_or_default();
+    let returned_messages = filter_thread_messages(&fetched_messages, allowed_label_ids)
+        .map_err(GwsError::Validation)?;
+    let omitted_count = fetched_messages
+        .len()
+        .saturating_sub(returned_messages.len());
 
-    let empty_arr = vec![];
-    let messages = thread
-        .get("messages")
-        .and_then(|m| m.as_array())
-        .unwrap_or(&empty_arr);
-
-    let mut conversation = Vec::new();
-    for msg in messages {
+    let mut conversation = Vec::with_capacity(returned_messages.len());
+    for msg in &returned_messages {
         let empty_headers = json!([]);
         let headers = msg
             .get("payload")
@@ -1493,11 +1902,23 @@ async fn execute_gmail_thread(
         }));
     }
 
-    let result = json!({
+    let mut result = json!({
         "threadId": thread.get("id"),
-        "messageCount": messages.len(),
+        // Count only messages actually returned, not messages fetched.
+        "messageCount": returned_messages.len(),
         "messages": conversation
     });
+    if omitted_count > 0 {
+        // Surface the truncation instead of pretending the thread was read in
+        // full: the conversation is incomplete by policy.
+        result["partialRead"] = json!(true);
+        result["omittedMessageCount"] = json!(omitted_count);
+        tracing::warn!(
+            thread_id = thread_id,
+            omitted = omitted_count,
+            "Thread read was truncated by the allowed-label policy"
+        );
+    }
     Ok(json!({
         "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
         "structuredContent": result,
@@ -1930,7 +2351,17 @@ async fn execute_gmail_forward(
         &orig_body,
     );
 
-    let raw = build_rfc2822_message(to, cc, None, &fwd_subject, &fwd_body, None, None, None);
+    let raw = build_rfc2822_message(
+        to,
+        cc,
+        None,
+        &fwd_subject,
+        &fwd_body,
+        None,
+        None,
+        None,
+        None,
+    )?;
 
     let send_method = messages_resource
         .methods
@@ -2050,29 +2481,41 @@ async fn execute_gmail_labels(
         check_label_policy(&msg_labels, allowed_label_ids).map_err(GwsError::Validation)?;
     }
 
-    let list_method = labels_resource
-        .methods
-        .get("list")
-        .ok_or_else(|| GwsError::Validation("labels.list method not found".into()))?;
-    let labels_args = json!({ "params": { "userId": "me" } });
-    let labels_result = crate::execute::execute_tool(
-        &gmail_doc,
-        list_method,
-        "users.labels",
-        "list",
-        &labels_args,
-        "gmail",
-        policy,
-        meta,
-        None,
-        None,
-        false,
-        &mut state.token_cache,
-    )
-    .await?;
+    // System labels resolve without `users.labels.list`, which keeps label
+    // add/remove usable under an `allowed_resources` allowlist that grants only
+    // `users.messages`. Custom labels still need the `users.labels` resource.
+    let label_id = match system_label_id(label_name) {
+        Some(id) => id,
+        None => {
+            let list_method = labels_resource
+                .methods
+                .get("list")
+                .ok_or_else(|| GwsError::Validation("labels.list method not found".into()))?;
+            let labels_args = json!({ "params": { "userId": "me" } });
+            let labels_result = crate::execute::execute_tool(
+                &gmail_doc,
+                list_method,
+                "users.labels",
+                "list",
+                &labels_args,
+                "gmail",
+                policy,
+                meta,
+                None,
+                None,
+                false,
+                &mut state.token_cache,
+            )
+            .await?;
 
-    let label_id = resolve_label_id(label_name, &labels_result)
-        .ok_or_else(|| GwsError::Validation(format!("Label '{label_name}' not found")))?;
+            resolve_label_id(label_name, &labels_result)
+                .ok_or_else(|| GwsError::Validation(format!("Label '{label_name}' not found")))?
+        }
+    };
+
+    // Adding the system TRASH/SPAM label through `messages.modify` performs the
+    // same destructive action as `messages.trash`, so honour that denial here.
+    check_destructive_label_mutation(policy, action, &label_id)?;
 
     let messages_resource = tools::find_resource(&gmail_doc.resources, "users.messages")
         .ok_or_else(|| GwsError::Validation("users.messages resource not found".into()))?;
@@ -2129,6 +2572,15 @@ pub(crate) async fn execute_gmail_helper(
     let gmail_doc = state.get_doc("gmail").await?;
     let allowed_label_ids =
         resolve_allowed_label_ids(allowed_labels, &gmail_doc, policy, meta, state).await?;
+
+    // Fail closed: a configured label policy that resolves to zero IDs must not
+    // silently disable label enforcement for the rest of the Gmail tools.
+    if !allowed_labels.is_empty() && allowed_label_ids.is_empty() {
+        return Err(GwsError::Validation(format!(
+            "Gmail label policy configured but none of the allowed labels resolved: {}",
+            allowed_labels.join(", ")
+        )));
+    }
 
     match tool_name {
         "gws_gmail_search" => {
@@ -2305,7 +2757,9 @@ mod tests {
             None,
             None,
             None,
-        );
+            None,
+        )
+        .unwrap();
         let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(&raw)
             .unwrap();
@@ -2328,7 +2782,9 @@ mod tests {
             None,
             None,
             None,
-        );
+            None,
+        )
+        .unwrap();
         let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(&raw)
             .unwrap();
@@ -2348,13 +2804,203 @@ mod tests {
             Some("<msg123@example.com>"),
             Some("<msg123@example.com>"),
             None,
-        );
+            None,
+        )
+        .unwrap();
         let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(&raw)
             .unwrap();
         let text = String::from_utf8(decoded).unwrap();
         assert!(text.contains("In-Reply-To: <msg123@example.com>\r\n"));
         assert!(text.contains("References: <msg123@example.com>\r\n"));
+    }
+
+    #[test]
+    fn test_validate_mail_header_rejects_crlf_per_field() {
+        for field in [
+            "To",
+            "Cc",
+            "Bcc",
+            "Subject",
+            "From",
+            "In-Reply-To",
+            "References",
+        ] {
+            let err = validate_mail_header(field, "ok@example.com\r\nX-Evil: 1").unwrap_err();
+            assert!(
+                matches!(err, GwsError::Validation(_)),
+                "{field} must be rejected with a validation error"
+            );
+            assert!(
+                err.to_string().contains(field),
+                "error for {field} must name the field: {err}"
+            );
+            assert!(validate_mail_header(field, "ok@example.com").is_ok());
+            assert!(validate_mail_header(field, "Ré Sumé").is_ok());
+        }
+    }
+
+    #[test]
+    fn test_build_rfc2822_rejects_crlf_in_header_values() {
+        let cases = vec![
+            build_rfc2822_message(
+                "a@example.com\r\nBcc: evil@example.com",
+                None,
+                None,
+                "Hi",
+                "Body",
+                None,
+                None,
+                None,
+                None,
+            ),
+            build_rfc2822_message(
+                "a@example.com",
+                Some("b@example.com\nX-Evil: 1"),
+                None,
+                "Hi",
+                "Body",
+                None,
+                None,
+                None,
+                None,
+            ),
+            build_rfc2822_message(
+                "a@example.com",
+                None,
+                Some("b@example.com\r\nX-Evil: 1"),
+                "Hi",
+                "Body",
+                None,
+                None,
+                None,
+                None,
+            ),
+            build_rfc2822_message(
+                "a@example.com",
+                None,
+                None,
+                "Hi\r\nX-Evil: 1",
+                "Body",
+                None,
+                None,
+                None,
+                None,
+            ),
+            build_rfc2822_message(
+                "a@example.com",
+                None,
+                None,
+                "Hi",
+                "Body",
+                Some("<id@example.com>\r\nX-Evil: 1"),
+                None,
+                None,
+                None,
+            ),
+            build_rfc2822_message(
+                "a@example.com",
+                None,
+                None,
+                "Hi",
+                "Body",
+                None,
+                Some("<id@example.com>\nX-Evil: 1"),
+                None,
+                None,
+            ),
+            build_rfc2822_message(
+                "a@example.com",
+                None,
+                None,
+                "Hi",
+                "Body",
+                None,
+                None,
+                None,
+                Some("sender@example.com\r\nX-Evil: 1"),
+            ),
+        ];
+        for case in cases {
+            assert!(matches!(case, Err(GwsError::Validation(_))));
+        }
+    }
+
+    #[test]
+    fn test_build_rfc2822_utf8_subject_and_addresses() {
+        let raw = build_rfc2822_message(
+            "alice@example.com",
+            Some("bob@example.com"),
+            None,
+            "Résumé — 日本語 ✅",
+            "Body",
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&raw)
+            .unwrap();
+        let text = String::from_utf8(decoded).unwrap();
+        assert!(text.contains("Subject: Résumé — 日本語 ✅\r\n"));
+        assert!(text.contains("To: alice@example.com\r\n"));
+        assert!(text.contains("Cc: bob@example.com\r\n"));
+    }
+
+    #[test]
+    fn test_build_rfc2822_boundary_is_per_message() {
+        let first = build_rfc2822_message(
+            "alice@example.com",
+            None,
+            None,
+            "Test",
+            "plain body",
+            None,
+            None,
+            Some("<p>a</p>"),
+            None,
+        )
+        .unwrap();
+        let second = build_rfc2822_message(
+            "alice@example.com",
+            None,
+            None,
+            "Test",
+            "a much longer plain body that forces a different boundary",
+            None,
+            None,
+            Some("<p>b</p>"),
+            None,
+        )
+        .unwrap();
+
+        let decode = |raw: &str| {
+            let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(raw)
+                .unwrap();
+            String::from_utf8(decoded).unwrap()
+        };
+        let first_text = decode(&first);
+        let second_text = decode(&second);
+
+        let boundary_of = |text: &str| {
+            text.lines()
+                .find_map(|l| l.strip_prefix("Content-Type: multipart/alternative; boundary=\""))
+                .and_then(|l| l.strip_suffix('"'))
+                .unwrap()
+                .to_string()
+        };
+        let first_boundary = boundary_of(&first_text);
+        let second_boundary = boundary_of(&second_text);
+
+        assert_ne!(first_boundary, "----=_Part_MCP_GWS_boundary");
+        assert!(first_boundary.starts_with("----=_Part_MCP_GWS_"));
+        assert_ne!(first_boundary, second_boundary);
+        assert!(first_text.contains(&format!("--{first_boundary}\r\n")));
+        assert!(first_text.contains(&format!("--{first_boundary}--")));
+        assert!(!first_text.contains("----=_Part_MCP_GWS_boundary\r\n"));
     }
 
     #[test]
@@ -2561,7 +3207,11 @@ mod tests {
         let labels = vec!["GWS-MCP-Test".to_string()];
         assert_eq!(
             inject_label_query("from:alice", &labels),
-            "from:alice label:GWS-MCP-Test"
+            "(from:alice) label:GWS-MCP-Test"
+        );
+        assert_eq!(
+            inject_label_query("is:unread", &labels),
+            "(is:unread) label:GWS-MCP-Test"
         );
     }
 
@@ -2570,7 +3220,7 @@ mod tests {
         let labels = vec!["Test".to_string(), "Dev".to_string()];
         assert_eq!(
             inject_label_query("is:unread", &labels),
-            "is:unread (label:Test OR label:Dev)"
+            "(is:unread) (label:Test OR label:Dev)"
         );
     }
 
@@ -2578,6 +3228,185 @@ mod tests {
     fn test_inject_label_query_empty_query() {
         let labels = vec!["Test".to_string()];
         assert_eq!(inject_label_query("", &labels), "label:Test");
+        assert_eq!(inject_label_query("   ", &labels), "label:Test");
+    }
+
+    #[test]
+    fn test_inject_label_query_parenthesizes_dangling_or() {
+        let labels = vec!["Work".to_string()];
+        assert_eq!(
+            inject_label_query("in:anywhere OR", &labels),
+            "(in:anywhere OR) label:Work"
+        );
+    }
+
+    #[test]
+    fn test_inject_label_query_parenthesizes_dangling_or_multi_label() {
+        let labels = vec!["Test".to_string(), "Dev".to_string()];
+        assert_eq!(
+            inject_label_query("label:Personal OR", &labels),
+            "(label:Personal OR) (label:Test OR label:Dev)"
+        );
+    }
+
+    #[test]
+    fn test_inject_label_query_strips_control_characters() {
+        let labels = vec!["Test".to_string()];
+        assert_eq!(
+            inject_label_query("from:alice\u{0}\u{7}", &labels),
+            "(from:alice) label:Test"
+        );
+        assert_eq!(inject_label_query("from:alice\u{0}", &[]), "from:alice");
+    }
+
+    #[test]
+    fn test_message_allowed_by_label_policy_no_policy() {
+        let msg = json!({ "labelIds": ["INBOX"] });
+        assert!(message_allowed_by_label_policy(&msg, &[]));
+    }
+
+    #[test]
+    fn test_message_allowed_by_label_policy_match() {
+        let msg = json!({ "labelIds": ["INBOX", "Label_42"] });
+        assert!(message_allowed_by_label_policy(
+            &msg,
+            &["Label_42".to_string()]
+        ));
+    }
+
+    #[test]
+    fn test_message_allowed_by_label_policy_no_match() {
+        let msg = json!({ "labelIds": ["INBOX", "UNREAD"] });
+        assert!(!message_allowed_by_label_policy(
+            &msg,
+            &["Label_42".to_string()]
+        ));
+        let missing = json!({ "id": "m1" });
+        assert!(!message_allowed_by_label_policy(
+            &missing,
+            &["Label_42".to_string()]
+        ));
+    }
+
+    #[test]
+    fn test_filter_thread_messages_drops_unlabelled_siblings() {
+        // The first message is labelled, the second is not: the old code only
+        // validated the first one and leaked the second one's body.
+        let allowed = vec!["Agent-Approved".to_string()];
+        let messages = vec![
+            json!({
+                "id": "m1",
+                "labelIds": ["INBOX", "Agent-Approved"],
+                "payload": { "body": { "data": "b25l" } }
+            }),
+            json!({
+                "id": "m2",
+                "labelIds": ["INBOX"],
+                "payload": { "body": { "data": "dHdv" } }
+            }),
+        ];
+        let kept = filter_thread_messages(&messages, &allowed).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0]["id"], "m1");
+        assert_eq!(messages.len() - kept.len(), 1);
+        // The unlabelled sibling's content is nowhere in the returned set.
+        assert!(
+            !kept.iter().any(|m| m["payload"]["body"]["data"] == "dHdv"),
+            "{kept:?}"
+        );
+        assert!(kept.iter().all(|m| m["id"] != "m2"));
+    }
+
+    #[test]
+    fn test_filter_thread_messages_drops_everything_without_policy_match() {
+        let allowed = vec!["Agent-Approved".to_string()];
+        let messages = vec![
+            json!({ "id": "m1", "labelIds": ["INBOX"] }),
+            json!({ "id": "m2", "labelIds": ["SENT"] }),
+        ];
+        let kept = filter_thread_messages(&messages, &allowed).unwrap();
+        assert!(kept.is_empty());
+        assert_eq!(messages.len() - kept.len(), 2);
+    }
+
+    #[test]
+    fn test_filter_thread_messages_keeps_labelled_message_not_first() {
+        let allowed = vec!["Agent-Approved".to_string()];
+        let messages = vec![
+            json!({ "id": "m1", "labelIds": ["INBOX"] }),
+            json!({ "id": "m2", "labelIds": ["INBOX", "Agent-Approved"] }),
+        ];
+        let kept = filter_thread_messages(&messages, &allowed).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0]["id"], "m2");
+    }
+
+    #[test]
+    fn test_filter_thread_messages_missing_label_ids_is_error() {
+        let allowed = vec!["Agent-Approved".to_string()];
+        let messages = vec![json!({ "id": "m1" })];
+        let err = filter_thread_messages(&messages, &allowed).unwrap_err();
+        assert!(err.contains("no labelIds"), "{err}");
+        assert!(err.contains("fail closed"), "{err}");
+    }
+
+    #[test]
+    fn test_filter_thread_messages_empty_thread_is_error() {
+        let err = filter_thread_messages(&[], &["Agent-Approved".to_string()]).unwrap_err();
+        assert!(err.contains("no messages"), "{err}");
+        // Also fail closed when no policy is configured.
+        assert!(filter_thread_messages(&[], &[]).is_err());
+    }
+
+    #[test]
+    fn test_filter_thread_messages_no_policy_returns_all() {
+        let messages = vec![
+            json!({ "id": "m1", "labelIds": ["INBOX"] }),
+            json!({ "id": "m2", "labelIds": ["SENT"] }),
+        ];
+        assert_eq!(filter_thread_messages(&messages, &[]).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_resolve_allowed_ids_empty_policy() {
+        assert_eq!(
+            resolve_allowed_ids_from_result(&[], &json!({"error": "boom"})).unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_resolve_allowed_ids_maps_names_and_system_labels() {
+        let labels = vec!["GWS-MCP-Test".to_string(), "STARRED".to_string()];
+        let result = json!({
+            "labels": [
+                { "id": "Label_7", "name": "GWS-MCP-Test" }
+            ]
+        });
+        let ids = resolve_allowed_ids_from_result(&labels, &result).unwrap();
+        assert_eq!(ids, vec!["Label_7".to_string(), "STARRED".to_string()]);
+    }
+
+    #[test]
+    fn test_resolve_allowed_ids_unresolvable_returns_empty() {
+        let labels = vec!["DoesNotExist".to_string()];
+        let ids = resolve_allowed_ids_from_result(&labels, &json!({"labels": []})).unwrap();
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_allowed_ids_api_error_is_error() {
+        let labels = vec!["GWS-MCP-Test".to_string()];
+        let err =
+            resolve_allowed_ids_from_result(&labels, &json!({"error": "forbidden", "status": 403}))
+                .unwrap_err();
+        assert!(matches!(err, GwsError::Auth(_)));
+        assert!(err.to_string().contains("Failed to list Gmail labels"));
+
+        let validation =
+            resolve_allowed_ids_from_result(&labels, &json!({"validation_error": true}))
+                .unwrap_err();
+        assert!(matches!(validation, GwsError::Auth(_)));
     }
 
     #[test]
@@ -2616,7 +3445,9 @@ mod tests {
             None,
             None,
             Some(html),
-        );
+            None,
+        )
+        .unwrap();
         let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(&raw)
             .unwrap();
@@ -2630,7 +3461,7 @@ mod tests {
 
     #[test]
     fn test_markdown_to_html_headings() {
-        let html = markdown_to_html("# Title\n## Subtitle\n### Section");
+        let html = markdown_to_html("# Title\n## Subtitle\n### Section").unwrap();
         assert!(html.contains("<h1"));
         assert!(html.contains("Title"));
         assert!(html.contains("<h2"));
@@ -2639,14 +3470,15 @@ mod tests {
 
     #[test]
     fn test_markdown_to_html_bold_italic() {
-        let html = markdown_to_html("This is **bold** and *italic*.");
+        let html = markdown_to_html("This is **bold** and *italic*.").unwrap();
         assert!(html.contains("<strong>bold</strong>"));
         assert!(html.contains("<em>italic</em>"));
     }
 
     #[test]
     fn test_markdown_to_html_list() {
-        let html = markdown_to_html("- Item 1\n- Item 2\n\n1. First\n2. Second");
+        let md = "- Item 1\n- Item 2\n\n1. First\n2. Second";
+        let html = markdown_to_html(md).unwrap();
         assert!(html.contains("<ul"));
         assert!(html.contains("<li>Item 1</li>"));
         assert!(html.contains("<ol"));
@@ -2655,14 +3487,15 @@ mod tests {
 
     #[test]
     fn test_markdown_to_html_link() {
-        let html = markdown_to_html("Visit [Google](https://google.com) for more.");
+        let html = markdown_to_html("Visit [Google](https://google.com) for more.").unwrap();
         assert!(html.contains("<a href=\"https://google.com\""));
         assert!(html.contains(">Google</a>"));
     }
 
     #[test]
     fn test_markdown_to_html_code() {
-        let html = markdown_to_html("Use `git status` to check.\n\n```\nlet x = 1;\n```");
+        let md = "Use `git status` to check.\n\n```\nlet x = 1;\n```";
+        let html = markdown_to_html(md).unwrap();
         assert!(html.contains("<code"));
         assert!(html.contains("git status"));
         assert!(html.contains("<pre"));
@@ -2671,10 +3504,95 @@ mod tests {
 
     #[test]
     fn test_markdown_to_html_escapes() {
-        let html = markdown_to_html("Use <script> tags & \"quotes\"");
+        let html = markdown_to_html("Use <script> tags & \"quotes\"").unwrap();
         assert!(html.contains("&lt;script&gt;"));
         assert!(html.contains("&amp;"));
         assert!(!html.contains("<script>"));
+        assert!(html.contains("&quot;quotes&quot;"));
+    }
+
+    #[test]
+    fn test_markdown_unterminated_brackets_stay_linear() {
+        // 200 KiB of unterminated `[` used to take seconds (quadratic rescan).
+        let mut md = String::with_capacity(200 * 1024);
+        for _ in 0..200 {
+            md.push_str(&"[".repeat(1024));
+            md.push('\n');
+        }
+        assert!(md.len() >= 200 * 1024);
+
+        let started = std::time::Instant::now();
+        let html = markdown_to_html(&md).unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(!html.is_empty());
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "markdown rendering took {elapsed:?} for {} bytes",
+            md.len()
+        );
+    }
+
+    #[test]
+    fn test_markdown_body_over_cap_rejected() {
+        let body = "a".repeat(MAX_MARKDOWN_BYTES + 1);
+        let err = markdown_to_html(&body).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("exceeding"), "{message}");
+        assert!(message.contains("format=\"markdown\""), "{message}");
+    }
+
+    #[test]
+    fn test_markdown_line_over_cap_rejected() {
+        let body = format!("ok\n{}\n", "a".repeat(MAX_MARKDOWN_LINE_BYTES + 1));
+        let err = markdown_to_html(&body).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("line 2"), "{message}");
+        assert!(message.contains("per-line limit"), "{message}");
+    }
+
+    #[test]
+    fn test_markdown_link_attribute_injection_blocked() {
+        let html = markdown_to_html("[x](http://a/\" onmouseover=\"alert(1))").unwrap();
+        // The destination is not a URL, so it is not linked and not echoed.
+        assert!(!html.contains("onmouseover="), "{html}");
+        assert!(!html.contains("<a href"), "{html}");
+        assert!(html.contains('x'), "{html}");
+    }
+
+    #[test]
+    fn test_markdown_javascript_scheme_is_not_linked() {
+        let html = markdown_to_html("[x](javascript:alert(1))").unwrap();
+        assert!(!html.contains("<a href"), "{html}");
+        assert!(!html.contains("href=\"javascript:"), "{html}");
+        // The markup survives as escaped plain text.
+        assert!(html.contains("javascript:alert(1)"), "{html}");
+    }
+
+    #[test]
+    fn test_markdown_data_scheme_is_not_linked() {
+        let html = markdown_to_html("[x](data:text/html;base64,PHNjcmlwdD4=)").unwrap();
+        assert!(!html.contains("<a href"), "{html}");
+    }
+
+    #[test]
+    fn test_markdown_control_characters_stripped_from_scheme() {
+        let html = markdown_to_html("[x](java\tscript:alert(1))").unwrap();
+        assert!(!html.contains("<a href"), "{html}");
+    }
+
+    #[test]
+    fn test_markdown_allowed_schemes_render() {
+        for url in [
+            "https://example.com/a?b=c",
+            "http://example.com",
+            "mailto:alice@example.com",
+            "tel:+15550100",
+            "/relative/path",
+        ] {
+            let html = markdown_to_html(&format!("[link]({url})")).unwrap();
+            assert!(html.contains("<a href=\""), "{url}: {html}");
+        }
     }
 
     #[test]
@@ -2807,5 +3725,62 @@ mod tests {
         let msg = json!({ "id": "abc" });
         let ids: Vec<&str> = extract_label_ids(&msg);
         assert!(ids.is_empty());
+    }
+
+    // -- destructive label mutation tests --
+
+    fn gmail_policy_with_denials(denied: &[&str]) -> Policy {
+        let denied: Vec<String> = denied.iter().map(|d| d.to_string()).collect();
+        let file: crate::policy::PolicyFile = serde_json::from_value(json!({
+            "services": [{ "name": "gmail", "denied_methods": denied }]
+        }))
+        .unwrap();
+        Policy::from_policy_file(file)
+    }
+
+    #[test]
+    fn test_label_add_trash_denied_when_trash_denied() {
+        let p = gmail_policy_with_denials(&["messages.trash"]);
+        let err = check_destructive_label_mutation(&p, "add", "TRASH").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("messages.trash"), "{msg}");
+        assert!(msg.contains("denylist family"), "{msg}");
+    }
+
+    #[test]
+    fn test_label_add_spam_denied_when_trash_denied() {
+        let p = gmail_policy_with_denials(&["messages.trash"]);
+        assert!(check_destructive_label_mutation(&p, "add", "SPAM").is_err());
+        assert!(check_destructive_label_mutation(&p, "add", "spam").is_err());
+    }
+
+    #[test]
+    fn test_label_add_normal_label_allowed() {
+        let p = gmail_policy_with_denials(&["messages.trash"]);
+        assert!(check_destructive_label_mutation(&p, "add", "Label_1").is_ok());
+    }
+
+    #[test]
+    fn test_label_remove_trash_allowed() {
+        let p = gmail_policy_with_denials(&["messages.trash"]);
+        assert!(check_destructive_label_mutation(&p, "remove", "TRASH").is_ok());
+    }
+
+    #[test]
+    fn test_label_add_trash_allowed_without_trash_denial() {
+        let p = gmail_policy_with_denials(&["messages.delete"]);
+        assert!(check_destructive_label_mutation(&p, "add", "TRASH").is_ok());
+        assert!(check_destructive_label_mutation(&p, "add", "SPAM").is_ok());
+    }
+
+    #[test]
+    fn test_system_label_resolves_without_labels_list() {
+        assert_eq!(system_label_id("trash"), Some("TRASH".to_string()));
+        assert_eq!(system_label_id(" Spam "), Some("SPAM".to_string()));
+        assert_eq!(system_label_id("Work"), None);
+        assert_eq!(
+            resolve_label_id("unread", &json!({})),
+            Some("UNREAD".to_string())
+        );
     }
 }

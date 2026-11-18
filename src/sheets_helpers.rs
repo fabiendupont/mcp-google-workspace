@@ -89,6 +89,11 @@ pub fn sheets_write_tool_schema() -> Value {
                 "sheet": {
                     "type": "string",
                     "description": "Tab name if not included in range"
+                },
+                "value_input_option": {
+                    "type": "string",
+                    "enum": ["RAW", "USER_ENTERED"],
+                    "description": "How values are interpreted: RAW (default) stores text verbatim; USER_ENTERED parses formulas and numbers."
                 }
             },
             "required": ["data"]
@@ -133,6 +138,11 @@ pub fn sheets_append_tool_schema() -> Value {
                 "sheet": {
                     "type": "string",
                     "description": "Tab name if not included in range"
+                },
+                "value_input_option": {
+                    "type": "string",
+                    "enum": ["RAW", "USER_ENTERED"],
+                    "description": "How values are interpreted: RAW (default) stores text verbatim; USER_ENTERED parses formulas and numbers."
                 }
             },
             "required": ["spreadsheet_id", "range", "data"]
@@ -611,7 +621,16 @@ pub fn sheets_csv_tool_schema() -> Value {
                 "action": { "type": "string", "enum": ["export", "import"], "description": "export or import" },
                 "sheet": { "type": "string", "description": "Tab name (defaults to Sheet1)" },
                 "data": { "type": "string", "description": "CSV string (for import)" },
-                "separator": { "type": "string", "description": "Field separator (default: comma)" }
+                "separator": { "type": "string", "description": "Field separator (default: comma)" },
+                "value_input_option": {
+                    "type": "string",
+                    "enum": ["RAW", "USER_ENTERED"],
+                    "description": "Import only. RAW (default) stores text verbatim; USER_ENTERED parses formulas and numbers."
+                },
+                "sanitize_formulas": {
+                    "type": "boolean",
+                    "description": "Export only. Prefix cells starting with =, +, -, @, TAB or CR with a single quote (default: true)."
+                }
             },
             "required": ["spreadsheet_id", "action"]
         }
@@ -944,16 +963,27 @@ pub fn csv_to_values(csv: &str, separator: char) -> Vec<Vec<String>> {
         .collect()
 }
 
-pub fn values_to_csv(values: &[Vec<String>], separator: char) -> String {
+pub fn values_to_csv(values: &[Vec<String>], separator: char, sanitize_formulas: bool) -> String {
     values
         .iter()
         .map(|row| {
             row.iter()
                 .map(|cell| {
-                    if cell.contains(separator) || cell.contains('"') || cell.contains('\n') {
-                        format!("\"{}\"", cell.replace('"', "\"\""))
+                    let text = if sanitize_formulas && leads_with_formula_char(cell) {
+                        format!("'{cell}")
                     } else {
                         cell.clone()
+                    };
+                    // Quote embedded CR as well as LF so a lone \r cannot
+                    // terminate a record and inject a new one.
+                    if text.contains(separator)
+                        || text.contains('"')
+                        || text.contains('\n')
+                        || text.contains('\r')
+                    {
+                        format!("\"{}\"", text.replace('"', "\"\""))
+                    } else {
+                        text
                     }
                 })
                 .collect::<Vec<_>>()
@@ -961,6 +991,15 @@ pub fn values_to_csv(values: &[Vec<String>], separator: char) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Characters that make a spreadsheet cell executable when interpreted by a
+/// formula-capable importer.
+fn leads_with_formula_char(cell: &str) -> bool {
+    matches!(
+        cell.chars().next(),
+        Some('=') | Some('+') | Some('-') | Some('@') | Some('\t') | Some('\r')
+    )
 }
 
 pub fn build_range(range: &str, sheet: Option<&str>) -> String {
@@ -992,12 +1031,36 @@ pub fn build_read_args(range: &str, sheet: Option<&str>, format: Option<&str>) -
     })
 }
 
-pub fn build_write_args(range: &str, data: &Value, sheet: Option<&str>) -> Value {
+/// Default input option for writes. RAW stores values verbatim and never
+/// evaluates formulas, so untrusted data cannot execute in the spreadsheet.
+pub const DEFAULT_VALUE_INPUT_OPTION: &str = "RAW";
+
+/// Parse the optional `value_input_option` tool argument.
+///
+/// Only `RAW` and `USER_ENTERED` are accepted; anything else is a validation
+/// error so a typo can never silently change how data is interpreted.
+pub fn parse_value_input_option(arguments: &Value) -> Result<&'static str, GwsError> {
+    match arguments.get("value_input_option").and_then(|v| v.as_str()) {
+        None => Ok(DEFAULT_VALUE_INPUT_OPTION),
+        Some("RAW") => Ok("RAW"),
+        Some("USER_ENTERED") => Ok("USER_ENTERED"),
+        Some(other) => Err(GwsError::Validation(format!(
+            "Invalid 'value_input_option' {other:?}. Allowed values: RAW, USER_ENTERED"
+        ))),
+    }
+}
+
+pub fn build_write_args(
+    range: &str,
+    data: &Value,
+    sheet: Option<&str>,
+    value_input_option: &str,
+) -> Value {
     let full_range = build_range(range, sheet);
     json!({
         "params": {
             "range": full_range,
-            "valueInputOption": "USER_ENTERED"
+            "valueInputOption": value_input_option
         },
         "body": {
             "range": full_range,
@@ -1006,12 +1069,17 @@ pub fn build_write_args(range: &str, data: &Value, sheet: Option<&str>) -> Value
     })
 }
 
-pub fn build_append_args(range: &str, data: &Value, sheet: Option<&str>) -> Value {
+pub fn build_append_args(
+    range: &str,
+    data: &Value,
+    sheet: Option<&str>,
+    value_input_option: &str,
+) -> Value {
     let full_range = build_range(range, sheet);
     json!({
         "params": {
             "range": full_range,
-            "valueInputOption": "USER_ENTERED",
+            "valueInputOption": value_input_option,
             "insertDataOption": "INSERT_ROWS"
         },
         "body": {
@@ -1141,6 +1209,7 @@ async fn execute_sheets_write_create(
         .and_then(|v| v.as_str())
         .unwrap_or("Sheet1");
     let sheet = arguments.get("sheet").and_then(|v| v.as_str());
+    let value_input_option = parse_value_input_option(arguments)?;
 
     let (effective_policy, resolved_folder) =
         crate::shared::policy_for_folder(folder_id, policy, meta, state).await?;
@@ -1194,7 +1263,7 @@ async fn execute_sheets_write_create(
             "params": {
                 "spreadsheetId": new_id,
                 "range": full_range,
-                "valueInputOption": "USER_ENTERED"
+                "valueInputOption": value_input_option
             },
             "body": { "range": full_range, "values": normalized_data }
         });
@@ -1356,13 +1425,14 @@ async fn execute_sheets_write_update(
     })?;
     let normalized_data = normalize_data(data);
     let sheet = arguments.get("sheet").and_then(|v| v.as_str());
+    let value_input_option = parse_value_input_option(arguments)?;
     let values_resource = tools::find_resource(&sheets_doc.resources, "spreadsheets.values")
         .ok_or_else(|| GwsError::Validation("spreadsheets.values resource not found".into()))?;
     let update_method = values_resource
         .methods
         .get("update")
         .ok_or_else(|| GwsError::Validation("update method not found".into()))?;
-    let args = build_write_args(range, &normalized_data, sheet);
+    let args = build_write_args(range, &normalized_data, sheet, value_input_option);
     let mut args_with_id = args.clone();
     args_with_id["params"]["spreadsheetId"] = json!(spreadsheet_id);
     let result = crate::execute::execute_tool(
@@ -1404,13 +1474,14 @@ async fn execute_sheets_append(
         .get("data")
         .ok_or_else(|| GwsError::Validation("Missing 'data'".into()))?;
     let sheet = arguments.get("sheet").and_then(|v| v.as_str());
+    let value_input_option = parse_value_input_option(arguments)?;
     let values_resource = tools::find_resource(&sheets_doc.resources, "spreadsheets.values")
         .ok_or_else(|| GwsError::Validation("spreadsheets.values resource not found".into()))?;
     let append_method = values_resource
         .methods
         .get("append")
         .ok_or_else(|| GwsError::Validation("append method not found".into()))?;
-    let args = build_append_args(range, data, sheet);
+    let args = build_append_args(range, data, sheet, value_input_option);
     let mut args_with_id = args.clone();
     args_with_id["params"]["spreadsheetId"] = json!(spreadsheet_id);
     let result = crate::execute::execute_tool(
@@ -1769,6 +1840,10 @@ async fn execute_sheets_csv(
         .ok_or_else(|| GwsError::Validation("spreadsheets.values resource not found".into()))?;
 
     if action == "export" {
+        let sanitize_formulas = arguments
+            .get("sanitize_formulas")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
         let get_method = values_resource
             .methods
             .get("get")
@@ -1808,12 +1883,13 @@ async fn execute_sheets_csv(
                     .collect()
             })
             .unwrap_or_default();
-        let csv = values_to_csv(&values, separator);
+        let csv = values_to_csv(&values, separator, sanitize_formulas);
         Ok(json!({
             "content": [{"type": "text", "text": csv}],
             "isError": false
         }))
     } else if action == "import" {
+        let value_input_option = parse_value_input_option(arguments)?;
         let csv_data = arguments
             .get("data")
             .and_then(|v| v.as_str())
@@ -1826,7 +1902,7 @@ async fn execute_sheets_csv(
         let full_range = build_range(sheet, None);
         let data_json: Vec<Value> = values.iter().map(|row| json!(row)).collect();
         let args = json!({
-            "params": {"spreadsheetId": spreadsheet_id, "range": full_range, "valueInputOption": "USER_ENTERED"},
+            "params": {"spreadsheetId": spreadsheet_id, "range": full_range, "valueInputOption": value_input_option},
             "body": {"range": full_range, "values": data_json}
         });
         let result = crate::execute::execute_tool(
@@ -2468,17 +2544,53 @@ mod tests {
     #[test]
     fn build_write_args_structure() {
         let data = json!([["a", "b"], [1, 2]]);
-        let args = build_write_args("A1:B2", &data, Some("Sheet1"));
+        let args = build_write_args("A1:B2", &data, Some("Sheet1"), "RAW");
         assert_eq!(args["params"]["range"], "'Sheet1'!A1:B2");
-        assert_eq!(args["params"]["valueInputOption"], "USER_ENTERED");
+        assert_eq!(args["params"]["valueInputOption"], "RAW");
         assert_eq!(args["body"]["values"], data);
+    }
+
+    #[test]
+    fn build_write_args_user_entered_passthrough() {
+        let data = json!([["=1+1"]]);
+        let args = build_write_args("A1", &data, None, "USER_ENTERED");
+        assert_eq!(args["params"]["valueInputOption"], "USER_ENTERED");
+    }
+
+    #[test]
+    fn parse_value_input_option_defaults_to_raw() {
+        let args = json!({ "data": [] });
+        assert_eq!(parse_value_input_option(&args).unwrap(), "RAW");
+        assert_eq!(DEFAULT_VALUE_INPUT_OPTION, "RAW");
+    }
+
+    #[test]
+    fn parse_value_input_option_accepts_user_entered() {
+        let args = json!({ "value_input_option": "USER_ENTERED" });
+        assert_eq!(parse_value_input_option(&args).unwrap(), "USER_ENTERED");
+        let raw = json!({ "value_input_option": "RAW" });
+        assert_eq!(parse_value_input_option(&raw).unwrap(), "RAW");
+    }
+
+    #[test]
+    fn parse_value_input_option_rejects_invalid() {
+        for value in ["user_entered", "FORMULA", "", "RAW; DROP"] {
+            let args = json!({ "value_input_option": value });
+            let err = parse_value_input_option(&args).unwrap_err();
+            assert!(matches!(err, GwsError::Validation(_)));
+            assert!(
+                err.to_string()
+                    .contains("Allowed values: RAW, USER_ENTERED")
+            );
+        }
     }
 
     #[test]
     fn build_append_args_has_insert_rows() {
         let data = json!([["x"]]);
-        let args = build_append_args("A:A", &data, None);
+        let args = build_append_args("A:A", &data, None, "RAW");
         assert_eq!(args["params"]["insertDataOption"], "INSERT_ROWS");
+        assert_eq!(args["params"]["valueInputOption"], "RAW");
     }
 
     #[test]
@@ -2639,7 +2751,7 @@ mod tests {
             vec!["Name".into(), "Score".into()],
             vec!["Alice".into(), "95".into()],
         ];
-        let csv = values_to_csv(&values, ',');
+        let csv = values_to_csv(&values, ',', true);
         assert_eq!(csv, "Name,Score\nAlice,95");
         let parsed = csv_to_values(&csv, ',');
         assert_eq!(parsed, values);
@@ -2648,10 +2760,69 @@ mod tests {
     #[test]
     fn csv_with_quotes() {
         let values = vec![vec!["Hello, World".into(), "normal".into()]];
-        let csv = values_to_csv(&values, ',');
+        let csv = values_to_csv(&values, ',', true);
         assert!(csv.contains("\"Hello, World\""));
         let parsed = csv_to_values(&csv, ',');
         assert_eq!(parsed[0][0], "Hello, World");
+    }
+
+    #[test]
+    fn csv_quotes_lone_cr() {
+        let values = vec![vec!["line1\rline2".into()]];
+        assert_eq!(values_to_csv(&values, ',', true), "\"line1\rline2\"");
+        let values = vec![vec!["\r".into()]];
+        // CR-leading cells are formula-sanitized first, then quoted for the CR.
+        assert_eq!(values_to_csv(&values, ',', true), "\"'\r\"");
+        assert_eq!(values_to_csv(&values, ',', false), "\"\r\"");
+    }
+
+    #[test]
+    fn csv_quotes_newlines_and_separators() {
+        assert_eq!(
+            values_to_csv(&[vec!["a".into(), "b".into()]], ',', true),
+            "a,b"
+        );
+        assert_eq!(
+            values_to_csv(&[vec!["line1\nline2".into()]], ',', true),
+            "\"line1\nline2\""
+        );
+        assert_eq!(
+            values_to_csv(&[vec!["\"quoted\"".into()]], ',', true),
+            "\"\"\"quoted\"\"\""
+        );
+    }
+
+    #[test]
+    fn csv_sanitizes_formula_cells() {
+        assert_eq!(
+            values_to_csv(&[vec!["=cmd|' /C calc'!A0".into()]], ',', true),
+            "'=cmd|' /C calc'!A0"
+        );
+        assert_eq!(
+            values_to_csv(&[vec!["=IMPORTXML(\"x\",\"//a\")".into()]], ',', true),
+            "\"'=IMPORTXML(\"\"x\"\",\"\"//a\"\")\""
+        );
+        for cell in ["+1+1", "-2+3", "@SUM(A1)", "\tleading"] {
+            assert_eq!(
+                values_to_csv(&[vec![cell.to_string()]], ',', true),
+                format!("'{cell}")
+            );
+        }
+    }
+
+    #[test]
+    fn csv_sanitize_can_be_disabled() {
+        assert_eq!(values_to_csv(&[vec!["=1+1".into()]], ',', false), "=1+1");
+    }
+
+    #[test]
+    fn csv_leaves_normal_cells_unchanged() {
+        assert_eq!(values_to_csv(&[vec!["42".into()]], ',', true), "42");
+        assert_eq!(
+            values_to_csv(&[vec!["Alice".into(), "95".into()]], ';', true),
+            "Alice;95"
+        );
+        assert_eq!(values_to_csv(&[vec!["".into()]], ',', true), "");
     }
 
     #[test]

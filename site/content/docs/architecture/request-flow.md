@@ -108,8 +108,8 @@ graph LR
 | `gmail_helpers.rs` | Gmail enrichment (10 tools) |
 | `format.rs` | Markdown/Plain to Docs batchUpdate, doc to Markdown reverse converter |
 | `cache.rs` | LRU + TTL in-memory cache for Sheets reads |
-| `rate_limit.rs` | Per-service sliding-window rate limiter |
-| `policy.rs` | JSON policy engine, constraint enforcement |
+| `rate_limit.rs` | Pre-auth client bucket, per-credential HTTP limiter, and per-service outbound limiter |
+| `policy.rs` | JSON policy engine, constraint enforcement (reads and by-ID writes), scoping warnings |
 | `http.rs` | Axum HTTP server, SSE, probes, metrics, webhooks |
 | `resources.rs` | MCP resources: gws:// URI scheme, resource templates |
 | `completions.rs` | MCP completions: autocomplete for resource URIs and prompt arguments |

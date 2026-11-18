@@ -1,15 +1,39 @@
+# cargo-deny configuration.
+#
+# Blocking checks (CI runs `cargo deny check`):
+#   - advisories: vulnerabilities are always denied by cargo-deny; yanked crates
+#     and unsound advisories are denied everywhere in the graph (not just for
+#     workspace crates), and unmaintained advisories are denied for all scopes.
+#   - licenses: anything not in the `allow` list is denied. `unused-allowed-license`
+#     stays at "warn" on purpose: it is a bookkeeping lint (an allowance nobody
+#     needs), not a licence violation, and MPL-2.0/OpenSSL/Unicode-DFS-2016 are
+#     currently unused allowances kept for future dependency bumps.
+#   - sources: unknown registries and unknown git hosts are denied.
+
 [graph]
 targets = []
 
 [advisories]
+# Fail on yanked crates instead of only warning about them.
+yanked = "deny"
+# Advisories for unmaintained crates are errors for every scope of the graph.
+unmaintained = "all"
+# Unsound advisories are errors for the whole graph, not only workspace crates.
+unsound = "all"
+# A stale entry below is reported but does not fail the build; keeping it
+# warning-level avoids blocking unrelated dependency bumps on bookkeeping.
+unused-ignored-advisory = "warn"
 ignore = [
     # chrono is unmaintained (RUSTSEC-2026-0543). It is pulled in transitively
     # by rmcp/schemars, not used directly by this crate. Tracked upstream in
     # the rmcp project; revisit when rmcp migrates to jiff or time.
+    # Verified still required: chrono 0.4.45 is present in Cargo.lock.
     "RUSTSEC-2026-0543",
 ]
 
 [licenses]
+# Deny-by-default: only the licences listed below are permitted.
+unused-allowed-license = "warn"
 allow = [
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
@@ -24,9 +48,14 @@ allow = [
 ]
 
 [bans]
+# Duplicate/wildcard dependency warnings are tracked separately from the
+# security gates above; tighten here if the graph is deduplicated.
 multiple-versions = "warn"
 wildcards = "warn"
 
 [sources]
 unknown-registry = "deny"
-unknown-git = "allow"
+unknown-git = "deny"
+# Sole permitted git source: the google-workspace client crate, pinned by rev
+# in Cargo.toml/Cargo.lock.
+allow-git = ["https://github.com/googleworkspace/cli"]

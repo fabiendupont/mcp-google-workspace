@@ -2,12 +2,12 @@ name: docs-full
 description: "Create doc with table, generate and insert image, replace conclusion"
 prompt_file: prompts/test-docs-full.md
 timeout_seconds: 300
-test_folder_id: "1VkrXx3bhkQaLJEmnY_t5VxVmBETfsbY1"
+test_folder_id: "YOUR_TEST_FOLDER_ID"
 
 rubric:
   - id: doc_created
     criterion: "Google Doc 'AI Infrastructure Report' created in the test folder (by ID)"
-    check: "gws_drive_list folder 1VkrXx3bhkQaLJEmnY_t5VxVmBETfsbY1"
+    check: "gws_drive_list folder YOUR_TEST_FOLDER_ID"
     weight: 1.0
 
   - id: has_executive_summary

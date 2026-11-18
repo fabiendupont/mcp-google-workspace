@@ -2,7 +2,7 @@ name: drive-workflow
 description: "Create subfolder, create doc, list, copy, rename, get info"
 prompt_file: prompts/test-drive-workflow.md
 timeout_seconds: 180
-test_folder_id: "1VkrXx3bhkQaLJEmnY_t5VxVmBETfsbY1"
+test_folder_id: "YOUR_TEST_FOLDER_ID"
 
 rubric:
   - id: subfolder_created

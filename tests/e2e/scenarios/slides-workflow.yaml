@@ -2,7 +2,7 @@ name: slides-workflow
 description: "Slides: create, read, add, delete, reorder, duplicate, update, verify final state"
 prompt_file: prompts/test-slides-workflow.md
 timeout_seconds: 300
-test_folder_id: "1VkrXx3bhkQaLJEmnY_t5VxVmBETfsbY1"
+test_folder_id: "YOUR_TEST_FOLDER_ID"
 
 rubric:
   - id: presentation_created

@@ -16,7 +16,7 @@ top = false
 
 **"invalid_client"** -- The client_secret is truncated. Use `gws auth export --unmasked`.
 
-**"No credentials found"** -- Check the [credential chain](../../security/credential-chain/).
+**"No credentials found"** -- Check the [credential chain](../../security/model/).
 
 **"permission to use project"** -- Set `project_id` in the policy `server` object to match your GCP project.
 
@@ -29,6 +29,8 @@ top = false
 **"Write denied: 'param' must be specified"** -- When constraints are configured for a body parameter, write operations must include that parameter. For Drive, include `parents` in the request body.
 
 **"Method 'X' is denied by policy"** -- The method is in `denied_methods`. Note that suffix matching applies: `"messages.send"` matches the full API method `"users.messages.send"`. Remove or narrow the denylist entry.
+
+**`init` refuses to write** -- The target path is a symlink ("Refusing to write through the symlink") or the file exists and you answered `n` at the overwrite prompt. Choose a regular file path, or re-run and confirm the overwrite.
 
 ## Constraint errors
 
@@ -61,6 +63,10 @@ top = false
 **"Policy reload failed"** -- The JSON in the policy file is invalid. The server logs the parse error and keeps the current policy. Fix the JSON and send SIGHUP again.
 
 **SIGHUP not working** -- Live reload is only available with `--http` transport and `--policy` flag. Not available in stdio mode.
+
+**Locked out after a policy reload** -- If you removed `server.api_token` (and no `--api-token` / `GWS_API_TOKEN` is set), the authentication requirement latched at boot keeps the listener closed: every request to `/mcp` and `/metrics` returns `401` and the server logs an error. This is a lockout, not a bypass. Restore `server.api_token` and send SIGHUP again, or restart the process with a token.
+
+**`check-policy` exits non-zero without an error** -- Warnings are present. They are printed under `Warnings (N):` and describe policy shapes that silently widen access (`recursive: false`, unconstrained services or calendar, Gmail forwarding not denied). Fix them, or accept the exit code knowingly.
 
 ## Container errors
 

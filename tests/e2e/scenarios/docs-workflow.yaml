@@ -2,7 +2,7 @@ name: docs-workflow
 description: "Create a doc with headings, table, bullets; read outline; read section; find text; replace section"
 prompt_file: prompts/test-docs-workflow.md
 timeout_seconds: 300
-test_folder_id: "1VkrXx3bhkQaLJEmnY_t5VxVmBETfsbY1"
+test_folder_id: "YOUR_TEST_FOLDER_ID"
 
 rubric:
   - id: doc_created

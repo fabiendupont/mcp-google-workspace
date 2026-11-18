@@ -2,7 +2,7 @@ name: slides-template
 description: "Slides with branded template: placeholder details, targeted placeholder updates, background images"
 prompt_file: prompts/test-slides-template.md
 timeout_seconds: 300
-test_folder_id: "1VkrXx3bhkQaLJEmnY_t5VxVmBETfsbY1"
+test_folder_id: "YOUR_TEST_FOLDER_ID"
 
 rubric:
   - id: templates_listed

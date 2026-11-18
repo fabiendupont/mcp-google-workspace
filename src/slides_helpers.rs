@@ -9,7 +9,9 @@ use google_workspace::error::GwsError;
 
 fn hex_to_raw_rgb(hex: &str) -> Value {
     let hex = hex.trim_start_matches('#');
-    let (r, g, b) = if hex.len() == 6 {
+    // `len() == 6` counts bytes: "€€" is 6 bytes but not 6 chars. Requiring ASCII
+    // guarantees the byte slicing below lands on char boundaries. Fallback is black.
+    let (r, g, b) = if hex.len() == 6 && hex.is_ascii() {
         let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(0);
         let g = u8::from_str_radix(&hex[2..4], 16).unwrap_or(0);
         let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(0);
@@ -1682,7 +1684,10 @@ pub fn placeholder_label(ph: &PlaceholderInfo) -> String {
 pub fn find_placeholder_by_label(page_elements: &[Value], label: &str) -> Option<String> {
     let (ph_type, ph_index) = if let Some(bracket) = label.find('[') {
         let t = &label[..bracket];
-        let idx_str = &label[bracket + 1..label.len().saturating_sub(1)];
+        // `get` is char-boundary safe: a label such as "BODY[0€" would otherwise
+        // slice through a multi-byte character and panic. Non-boundary labels are
+        // treated as "not a match".
+        let idx_str = label.get(bracket + 1..label.len().saturating_sub(1))?;
         let idx = idx_str.parse::<i64>().ok();
         (t, idx)
     } else {
@@ -4217,6 +4222,80 @@ mod tests {
         );
         assert_eq!(find_placeholder_by_label(&elements, "SUBTITLE[99]"), None);
         assert_eq!(find_placeholder_by_label(&elements, "BODY"), None);
+    }
+
+    fn raw_rgb_components(result: &Value) -> (f64, f64, f64) {
+        (
+            result["red"].as_f64().unwrap(),
+            result["green"].as_f64().unwrap(),
+            result["blue"].as_f64().unwrap(),
+        )
+    }
+
+    #[test]
+    fn test_hex_to_raw_rgb_valid_values() {
+        assert_eq!(
+            raw_rgb_components(&hex_to_raw_rgb("#FF0000")),
+            (1.0, 0.0, 0.0)
+        );
+        assert_eq!(
+            raw_rgb_components(&hex_to_raw_rgb("##FF0000")),
+            (1.0, 0.0, 0.0)
+        );
+        assert_eq!(
+            raw_rgb_components(&hex_to_raw_rgb("00FF00")),
+            (0.0, 1.0, 0.0)
+        );
+        assert_eq!(
+            raw_rgb_components(&hex_to_raw_rgb("#0000FF")),
+            (0.0, 0.0, 1.0)
+        );
+    }
+
+    #[test]
+    fn test_hex_to_raw_rgb_non_ascii_falls_back_to_black() {
+        // "€€" is 6 bytes but only 2 chars: the old `len() == 6` check made the
+        // fixed-width byte slices panic. Non-ASCII input must fall back to black.
+        for input in ["€€", "#€€", "#GGGGGG", "#FFF", ""] {
+            assert_eq!(
+                raw_rgb_components(&hex_to_raw_rgb(input)),
+                (0.0, 0.0, 0.0),
+                "input: {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_find_placeholder_by_label_char_boundary_safe() {
+        let elements = vec![
+            json!({
+                "objectId": "body_0",
+                "shape": { "placeholder": { "type": "BODY", "index": 0 } }
+            }),
+            json!({
+                "objectId": "body_no_index",
+                "shape": { "placeholder": { "type": "BODY" } }
+            }),
+        ];
+
+        // "BODY[0€" is 9 bytes; `len() - 1` lands inside the multi-byte '€', so the
+        // old direct slice panicked. Non-boundary labels are now "not a match".
+        assert_eq!(find_placeholder_by_label(&elements, "BODY[0€"), None);
+        // Control: the well-formed label still resolves.
+        assert_eq!(
+            find_placeholder_by_label(&elements, "BODY[0]"),
+            Some("body_0".to_string())
+        );
+        // Controls: no bracket at all, and non-numeric index falls back to None.
+        assert_eq!(
+            find_placeholder_by_label(&elements, "BODY"),
+            Some("body_no_index".to_string())
+        );
+        assert_eq!(
+            find_placeholder_by_label(&elements, "BODY[€]"),
+            Some("body_no_index".to_string())
+        );
+        assert_eq!(find_placeholder_by_label(&elements, "€€"), None);
     }
 
     #[test]

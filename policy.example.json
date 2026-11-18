@@ -1,29 +1,41 @@
 {
+  "_comment_services_shorthand": "For a quick start without this file, `mcp-google-workspace --services drive,gmail,calendar` enables the listed services and applies safe baseline denials (Gmail: messages.delete/trash/batchDelete and forwarding/delegation settings; Drive: files.delete/emptyTrash). Add a policy file when you need folder, calendar, or label constraints.",
   "server": {
     "read_only": false,
     "confirm_writes": false,
+    "_comment_confirm_writes": "true asks the user to approve every write through MCP elicitation; read-only tools and tools with a real dry_run preview are not interrupted, and gws_batch is rejected because its sub-requests cannot be approved individually.",
     "rate_limit_rpm": 120,
+    "_comment_rate_limit_rpm": "Caps both the outbound per-service budgets and the inbound per-client-IP limit on HTTP /mcp. The per-IP budget defaults to 600/min when unset. The key is the socket peer address; X-Forwarded-For is never trusted.",
+    "max_request_bytes": 16777216,
+    "_comment_max_request_bytes": "HTTP request bodies larger than this are rejected with 413 when Content-Length is declared; oversized chunked bodies are capped by the transport. Default is 16 MiB.",
     "allowed_origins": ["internal.corp.com"],
+    "_comment_allowed_origins": "A request that carries an Origin header must match one of these hosts, otherwise it gets 403. Requests without Origin (normal MCP clients) are allowed. An empty list accepts localhost origins only.",
+    "allowed_subjects": [],
+    "_comment_allowed_subjects": "Client-supplied delegation via _meta.user_email is rejected unless the address is listed here. An empty list disables per-request delegation; server.delegate_subject remains the operator-controlled fallback.",
     "credentials_file": "/path/to/credentials.json",
     "project_id": "my-project-123456"
   },
   "services": [
     {
       "name": "drive",
+      "allowed_resources": ["files", "permissions"],
+      "_comment_allowed_resources": "Optional resource allowlist; when set, resources outside this list are rejected for tool calls, gws:// URIs, and subscriptions. Entries also allow dotted descendants (\"files\" allows \"files.anything\"). \"permissions\" is required by gws_drive_share and by the temporary share used when inserting images into Docs.",
       "constraints": [
         {
           "param": "parents",
           "values": ["WRITABLE_FOLDER_ID"],
           "access": "read-write",
           "location": "body",
-          "_comment": "All created files must land in this folder"
+          "recursive": true,
+          "_comment": "All created files must land in this folder. recursive enables ancestry checks, including read-by-ID scoping for files.get/export and the docs/sheets/slides readers."
         },
         {
           "param": "parents",
           "values": ["READONLY_FOLDER_ID"],
           "access": "read-only",
           "location": "body",
-          "_comment": "Can list files in this folder but not create or move files into it"
+          "recursive": true,
+          "_comment": "Can list files in this folder but not create or move files into it. recursive also confines read-by-ID calls to this folder tree."
         }
       ]
     },
@@ -47,7 +59,8 @@
         "settings.updateAutoForwarding",
         "settings.delegates.create",
         "settings.forwardingAddresses.create"
-      ]
+      ],
+      "_comment": "Denials are method-family aware: messages.delete also blocks batchDelete, messages.send also blocks drafts.send, and drive files.delete also blocks files.emptyTrash."
     },
     {
       "name": "sheets",
@@ -64,7 +77,7 @@
           "values": ["TEMPLATE_DOC_ID"],
           "access": "read-only",
           "mode": "protect",
-          "_comment": "Prevent modification of the document template; reading named styles is allowed"
+          "_comment": "Prevent modification of the document template; protect mode also blocks moving files into or out of a protected Drive folder"
         }
       ]
     },

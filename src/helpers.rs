@@ -31,7 +31,9 @@ pub struct ParagraphStyle {
 
 pub fn hex_to_rgb_color(hex: &str) -> Value {
     let hex = hex.trim_start_matches('#');
-    let (r, g, b) = if hex.len() == 6 {
+    // `len() == 6` counts bytes: "€€" is 6 bytes but not 6 chars. Requiring ASCII
+    // guarantees the byte slicing below lands on char boundaries. Fallback is black.
+    let (r, g, b) = if hex.len() == 6 && hex.is_ascii() {
         let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(0);
         let g = u8::from_str_radix(&hex[2..4], 16).unwrap_or(0);
         let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(0);
@@ -48,6 +50,21 @@ pub fn hex_to_rgb_color(hex: &str) -> Value {
             }
         }
     })
+}
+
+/// Truncate `text` to at most `max_chars` characters, appending `...` only when
+/// something was actually cut.
+///
+/// The cut lands on a UTF-8 char boundary because it comes from `char_indices()`.
+/// A byte offset such as `&text[..77]` panics when it falls inside a multi-byte
+/// character (`é`, `漢`, emoji), and this crate builds with `panic = "abort"`, so
+/// that would take the whole server down. The budget is counted in chars rather
+/// than bytes so CJK previews are not 25 characters long.
+fn truncate_preview(text: &str, max_chars: usize) -> String {
+    match text.char_indices().nth(max_chars) {
+        Some((cut, _)) => format!("{}...", &text[..cut]),
+        None => text.to_string(),
+    }
 }
 
 enum LocationField {
@@ -1190,7 +1207,7 @@ pub fn insert_image_tool_schema() -> Value {
                 },
                 "drive_file_id": {
                     "type": "string",
-                    "description": "Drive file ID of the image (downloaded and embedded, no sharing needed)"
+                    "description": "Drive file ID of the image. The file is temporarily shared as anyone-with-link so the Docs API can fetch it, and that permission is revoked right after insertion."
                 },
                 "image_url": {
                     "type": "string",
@@ -1238,11 +1255,18 @@ pub fn format_tool_schema() -> Value {
                 },
                 "text": {
                     "type": "string",
+                    "minLength": 1,
                     "description": "Text to find and format (alternative to index range)"
                 },
                 "start_index": { "type": "integer", "description": "Range start (1-based, inclusive)" },
                 "end_index": { "type": "integer", "description": "Range end (exclusive)" },
-                "occurrence": { "type": "integer", "description": "Which occurrence of text (1-based)", "default": 1 },
+                "occurrence": {
+                    "type": "integer",
+                    "description": "Which occurrence of text (1-based)",
+                    "default": 1,
+                    "minimum": 1,
+                    "maximum": 100000
+                },
                 "bold": { "type": "boolean" },
                 "italic": { "type": "boolean" },
                 "font_size_pt": { "type": "number" },
@@ -1343,7 +1367,13 @@ pub fn parse_doc_structure(doc: &Value) -> Value {
                 } else if !text.is_empty() {
                     elements.push(json!({
                         "type": "paragraph",
-                        "preview": if text.len() > 80 { format!("{}...", &text[..77]) } else { text },
+                        // 80-char budget (77 chars + "..."), counted in chars so
+                        // multi-byte text cannot be sliced mid-codepoint.
+                        "preview": if text.chars().count() > 80 {
+                            truncate_preview(&text, 77)
+                        } else {
+                            text
+                        },
                         "startIndex": start,
                         "endIndex": end
                     }));
@@ -1385,7 +1415,17 @@ pub fn parse_doc_structure(doc: &Value) -> Value {
     })
 }
 
-pub fn find_text_in_doc(doc: &Value, needle: &str, occurrence: usize) -> Value {
+pub fn find_text_in_doc(doc: &Value, needle: &str, occurrence: usize) -> Result<Value, GwsError> {
+    if needle.is_empty() {
+        return Err(GwsError::Validation(
+            "'text' must be non-empty: an empty search string matches everywhere".into(),
+        ));
+    }
+    // Docs indexes are UTF-16 code units, not bytes.
+    let needle_utf16_len = needle.encode_utf16().count() as i64;
+    // `occurrence` is 1-based; 0 would never match and is a caller mistake.
+    let occurrence = occurrence.max(1);
+
     let mut found_count = 0usize;
 
     if let Some(content) = doc.pointer("/body/content").and_then(|v| v.as_array()) {
@@ -1402,20 +1442,28 @@ pub fn find_text_in_doc(doc: &Value, needle: &str, occurrence: usize) -> Value {
                         let element_start =
                             pe.get("startIndex").and_then(|v| v.as_i64()).unwrap_or(0);
 
-                        let mut search_from = 0;
-                        while let Some(pos) = text[search_from..].find(needle) {
+                        let mut search_from = 0usize;
+                        // `text.get(..)` returns None instead of panicking if
+                        // `search_from` ever lands off a char boundary.
+                        while let Some(rel) = text.get(search_from..).and_then(|s| s.find(needle)) {
+                            let pos = search_from + rel;
                             found_count += 1;
                             if found_count == occurrence {
-                                let abs_start = element_start + (search_from + pos) as i64;
-                                let abs_end = abs_start + needle.len() as i64;
-                                return json!({
+                                let start_utf16 = text[..pos].encode_utf16().count() as i64;
+                                let abs_start = element_start + start_utf16;
+                                let abs_end = abs_start + needle_utf16_len;
+                                return Ok(json!({
                                     "found": true,
                                     "startIndex": abs_start,
                                     "endIndex": abs_end,
                                     "occurrence": found_count
-                                });
+                                }));
                             }
-                            search_from += pos + 1;
+                            // Advance one whole char past the match start so
+                            // overlapping matches are still counted, without
+                            // splitting a multi-byte character.
+                            let step = text[pos..].chars().next().map_or(1, char::len_utf8);
+                            search_from = pos + step;
                         }
                     }
                 }
@@ -1423,7 +1471,7 @@ pub fn find_text_in_doc(doc: &Value, needle: &str, occurrence: usize) -> Value {
         }
     }
 
-    json!({ "found": false, "occurrences_found": found_count })
+    Ok(json!({ "found": false, "occurrences_found": found_count }))
 }
 
 pub fn build_append_section_requests(
@@ -1541,8 +1589,18 @@ pub fn find_tool_schema() -> Value {
             "type": "object",
             "properties": {
                 "document_id": { "type": "string", "description": "Google Docs document ID" },
-                "text": { "type": "string", "description": "Exact substring to search for" },
-                "occurrence": { "type": "integer", "description": "Which occurrence (1-based)", "default": 1 },
+                "text": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Exact substring to search for"
+                },
+                "occurrence": {
+                    "type": "integer",
+                    "description": "Which occurrence (1-based)",
+                    "default": 1,
+                    "minimum": 1,
+                    "maximum": 100000
+                },
                 "tab": { "type": "string", "description": "Tab title. Omit for default (first) tab." }
             },
             "required": ["document_id", "text"]
@@ -2081,8 +2139,9 @@ async fn execute_docs_read_block(
         let occurrence = arguments
             .get("occurrence")
             .and_then(|v| v.as_u64())
-            .unwrap_or(1) as usize;
-        let result = find_text_in_doc(&doc_content, needle, occurrence);
+            .unwrap_or(1)
+            .clamp(1, 100_000) as usize;
+        let result = find_text_in_doc(&doc_content, needle, occurrence)?;
         return Ok(json!({
             "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
             "structuredContent": result,
@@ -2174,13 +2233,23 @@ async fn execute_docs_insert_text(
             || arguments.get("paragraph_style").is_some());
 
     let tab = arguments.get("tab").and_then(|v| v.as_str());
+    // Always read the document before writing: `documents.get` is where the
+    // Drive folder read-scope check runs, so skipping it when the caller pins
+    // position:"start" or passes an explicit index would let an out-of-tree
+    // document be written. Dry runs write nothing, so they stay network-free.
+    let preflight = if dry_run {
+        None
+    } else {
+        Some(fetch_doc_content(doc_id, tab, policy, meta, state).await?)
+    };
     let end_index = if needs_end_index && !dry_run {
-        let dc = fetch_doc_content(doc_id, tab, policy, meta, state).await?;
-        dc.doc["body"]["content"]
-            .as_array()
-            .and_then(|arr| arr.last())
-            .and_then(|el| el["endIndex"].as_i64())
-            .map(|idx| (idx - 1) as i32)
+        preflight.as_ref().and_then(|dc| {
+            dc.doc["body"]["content"]
+                .as_array()
+                .and_then(|arr| arr.last())
+                .and_then(|el| el["endIndex"].as_i64())
+                .map(|idx| (idx - 1) as i32)
+        })
     } else {
         None
     };
@@ -2411,6 +2480,48 @@ async fn execute_docs_insert_table(
     .await
 }
 
+/// Response for a failed post-insert revoke of the temporary `anyoneWithLink`
+/// permission.
+///
+/// Mirrors `gws_generate_image` in `server.rs`: a leaked public permission
+/// outranks the insert outcome, because returning plain success would tell the
+/// caller the file is private when anyone with the link can still read it.
+fn image_revoke_failure_response(
+    doc_id: &str,
+    file_id: &str,
+    permission_id: &str,
+    inserted: bool,
+    err: &GwsError,
+) -> Value {
+    let outcome = if inserted {
+        format!("Image inserted into document {doc_id}, but")
+    } else {
+        format!("The insert into document {doc_id} also failed. More importantly,")
+    };
+    json!({
+        "content": [{ "type": "text", "text": format!(
+            "{outcome} the temporary public Drive permission could not be revoked. \
+             File {file_id} (permission {permission_id}) may still be readable by anyone with the link. \
+             Remediation: revoke it manually with drive permissions.delete for file {file_id} \
+             and permission {permission_id}, or remove the policy rule that denies \
+             drive permissions.delete so cleanup can run automatically. Cleanup error: {err}"
+        )}],
+        "isError": true
+    })
+}
+
+/// Insert an image into a Doc.
+///
+/// Sharing cleanup is deliberately linear: the temporary anyone-with-link
+/// permission is tracked in `shared_permission` and the only `?` after the
+/// grant is the grant itself, so the revoke at the end runs on every path
+/// (success, `batchUpdate` error, API error payload). A failed revoke is
+/// reported as `isError: true` with remediation text: the file may still be
+/// link-readable, which must outrank the insert result. No unit test of the
+/// grant/revoke calls: they need live Drive/Docs credentials; the path is
+/// covered by the e2e image-insert tests and
+/// `test_insert_image_schema_documents_temporary_sharing` guards the contract
+/// that is documented to callers.
 async fn execute_docs_insert_image(
     doc_id: &str,
     arguments: &Value,
@@ -2427,12 +2538,29 @@ async fn execute_docs_insert_image(
         .get("image_content_type")
         .and_then(|v| v.as_str())
         .unwrap_or("image/png");
+
+    // Public sharing created for the Docs fetcher, tracked so it is revoked on
+    // every exit path below (success, batchUpdate error, or any early return).
+    let mut shared_permission: Option<(String, String)> = None;
+
     let uri = if let Some(url) = image_url {
         url.to_string()
     } else if let Some(fid) = drive_file_id {
-        let (url, _perm_id) =
-            crate::shared::make_image_insertable(fid, policy, meta, state).await?;
-        url
+        if dry_run {
+            // A preview must not touch Drive permissions at all.
+            tracing::debug!(
+                drive_file_id = fid,
+                "dry run: skipping temporary public sharing for image insert"
+            );
+            format!("https://drive.google.com/uc?export=download&id={fid}")
+        } else {
+            let (url, perm_id) =
+                crate::shared::make_image_insertable(fid, policy, meta, state).await?;
+            if let Some(pid) = perm_id {
+                shared_permission = Some((fid.to_string(), pid));
+            }
+            url
+        }
     } else if let Some(data) = image_data {
         format!("data:{content_type};base64,{data}")
     } else {
@@ -2452,7 +2580,8 @@ async fn execute_docs_insert_image(
         }
     }));
 
-    docs_batch_update(
+    // No `?` between here and the cleanup: the temporary ACL is always revoked.
+    let result = docs_batch_update(
         doc_id,
         requests,
         "gws_docs_insert_image",
@@ -2461,7 +2590,41 @@ async fn execute_docs_insert_image(
         state,
         dry_run,
     )
-    .await
+    .await;
+
+    if let Some((file_id, permission_id)) = shared_permission
+        && let Err(err) = crate::shared::revoke_image_sharing_checked(
+            &file_id,
+            &permission_id,
+            policy,
+            meta,
+            state,
+        )
+        .await
+    {
+        tracing::error!(
+            file_id = %file_id,
+            permission_id = %permission_id,
+            error = %err,
+            "failed to revoke temporary public image sharing — the file may still be \
+             accessible to anyone with the link"
+        );
+        // A leaked public permission outranks the insert outcome: never report
+        // plain success while the file may still be link-readable.
+        let inserted = result
+            .as_ref()
+            .map(|r| crate::shared::check_api_result(r).is_ok())
+            .unwrap_or(false);
+        return Ok(image_revoke_failure_response(
+            doc_id,
+            &file_id,
+            &permission_id,
+            inserted,
+            &err,
+        ));
+    }
+
+    result
 }
 
 async fn execute_docs_format(
@@ -2499,16 +2662,39 @@ async fn execute_docs_format(
         let occurrence = arguments
             .get("occurrence")
             .and_then(|v| v.as_u64())
-            .unwrap_or(1) as usize;
-        let result = find_text_in_doc(&doc_content, text_match, occurrence);
+            .unwrap_or(1)
+            .clamp(1, 100_000) as usize;
+        let result = find_text_in_doc(&doc_content, text_match, occurrence)?;
         if result.get("found") != Some(&json!(true)) {
             return Err(GwsError::Validation(format!(
                 "Text '{}' not found in document",
                 text_match
             )));
         }
-        let s = result["startIndex"].as_i64().unwrap() as i32;
-        let e = result["endIndex"].as_i64().unwrap() as i32;
+        // `find_text_in_doc` builds these from the textRun it matched. A missing
+        // or non-integer index means a malformed element: error out rather than
+        // substituting 0 and formatting the wrong range (panic = "abort" makes
+        // the old `.unwrap()` a process kill if this guard ever changes).
+        let s = result
+            .get("startIndex")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| {
+                GwsError::Validation(format!(
+                    "Matched text '{}' but its document element has no integer startIndex; \
+                     refusing to format an unknown range. Use gws_docs_read to inspect the document.",
+                    text_match
+                ))
+            })? as i32;
+        let e = result
+            .get("endIndex")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| {
+                GwsError::Validation(format!(
+                    "Matched text '{}' but its document element has no integer endIndex; \
+                     refusing to format an unknown range. Use gws_docs_read to inspect the document.",
+                    text_match
+                ))
+            })? as i32;
         (s, e)
     } else {
         let s = arguments
@@ -2736,12 +2922,16 @@ fn find_section_range(doc: &Value, section: &str) -> Option<(i32, i32)> {
                 if let Some(start_level) = section_level
                     && level <= start_level
                 {
-                    let start = section_start.unwrap();
-                    let end = element["startIndex"].as_i64().unwrap() as i32;
+                    // Both indexes come from the API; a missing one is a
+                    // malformed element, so fail the lookup instead of panicking.
+                    let start = section_start?;
+                    let end = element["startIndex"].as_i64()? as i32;
                     return Some((start, end));
                 }
-                if text_trimmed == section {
-                    section_start = Some(element["startIndex"].as_i64().unwrap() as i32);
+                if text_trimmed == section
+                    && let Some(start) = element["startIndex"].as_i64()
+                {
+                    section_start = Some(start as i32);
                     section_level = Some(level);
                 }
             }
@@ -3012,12 +3202,32 @@ pub(crate) async fn execute_docs_write(
         None
     };
 
-    // Step C: handle section replacement
+    // Step C: handle section replacement.
+    //
+    // This read is also the write preflight: `documents.get` is where the Drive
+    // folder read-scope check runs, so it must happen before any write even when
+    // the caller pins position:"start" or passes an explicit index. Otherwise an
+    // out-of-tree document could be written without the read check ever running.
+    //
+    // A dry run writes nothing, so it only reads when it must resolve a section
+    // heading or compute the end-of-document index (the historical behaviour).
+    let read_for_index = !created_new_doc
+        && arguments.get("index").and_then(|v| v.as_i64()).is_none()
+        && arguments.get("position").and_then(|v| v.as_str()) != Some("start");
     let mut resolved_tab_id: Option<String> = None;
-    let (section_delete, insert_index) = if let Some(section_text) = section {
+    let mut read_doc = if !dry_run || section.is_some() || read_for_index {
         let dc = fetch_doc_content(&doc_id, tab_title, policy, meta, state).await?;
         resolved_tab_id = dc.tab_id;
-        let doc_content = dc.doc;
+        Some(dc.doc)
+    } else {
+        None
+    };
+
+    let (section_delete, insert_index) = if let Some(section_text) = section {
+        // The read above always runs when a section is given.
+        let doc_content = read_doc.take().ok_or_else(|| {
+            GwsError::Validation("internal error: section write without document read".into())
+        })?;
 
         match find_section_range(&doc_content, section_text) {
             Some((start, end)) => (
@@ -3044,9 +3254,13 @@ pub(crate) async fn execute_docs_write(
             match arguments.get("position").and_then(|v| v.as_str()) {
                 Some("start") => 1,
                 _ => {
-                    let dc = fetch_doc_content(&doc_id, tab_title, policy, meta, state).await?;
-                    resolved_tab_id = dc.tab_id;
-                    dc.doc["body"]["content"]
+                    // `read_for_index` above guarantees the read happened.
+                    let doc_content = read_doc.take().ok_or_else(|| {
+                        GwsError::Validation(
+                            "internal error: index write without document read".into(),
+                        )
+                    })?;
+                    doc_content["body"]["content"]
                         .as_array()
                         .and_then(|arr| arr.last())
                         .and_then(|el| el["endIndex"].as_i64())
@@ -3489,6 +3703,45 @@ mod tests {
         assert!(rgb["blue"].as_f64().unwrap().abs() < 0.001);
     }
 
+    fn rgb_components(result: &Value) -> (f64, f64, f64) {
+        let rgb = &result["color"]["rgbColor"];
+        (
+            rgb["red"].as_f64().unwrap(),
+            rgb["green"].as_f64().unwrap(),
+            rgb["blue"].as_f64().unwrap(),
+        )
+    }
+
+    #[test]
+    fn test_hex_to_rgb_valid_values() {
+        assert_eq!(
+            rgb_components(&hex_to_rgb_color("#FF0000")),
+            (1.0, 0.0, 0.0)
+        );
+        assert_eq!(
+            rgb_components(&hex_to_rgb_color("##FF0000")),
+            (1.0, 0.0, 0.0)
+        );
+        assert_eq!(rgb_components(&hex_to_rgb_color("00FF00")), (0.0, 1.0, 0.0));
+        assert_eq!(
+            rgb_components(&hex_to_rgb_color("#0000FF")),
+            (0.0, 0.0, 1.0)
+        );
+    }
+
+    #[test]
+    fn test_hex_to_rgb_non_ascii_falls_back_to_black() {
+        // "€€" is 6 bytes but only 2 chars: the old `len() == 6` check made the
+        // fixed-width byte slices panic. Non-ASCII input must fall back to black.
+        for input in ["€€", "#€€", "#GGGGGG", "#FFF", ""] {
+            assert_eq!(
+                rgb_components(&hex_to_rgb_color(input)),
+                (0.0, 0.0, 0.0),
+                "input: {input:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_add_bullets() {
         let req = build_add_bullets_request(5, 25, "BULLET_DISC_CIRCLE_SQUARE");
@@ -3505,6 +3758,20 @@ mod tests {
         let requests = build_insert_text_requests("Start", Position::Start, None, None, None);
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0]["insertText"]["location"]["index"], 1);
+    }
+
+    #[test]
+    fn test_insert_image_schema_documents_temporary_sharing() {
+        let schema = insert_image_tool_schema();
+        let desc = schema["inputSchema"]["properties"]["drive_file_id"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(desc.contains("temporarily shared"), "{desc}");
+        assert!(desc.contains("revoked"), "{desc}");
+        assert!(
+            !desc.contains("no sharing needed"),
+            "stale description: {desc}"
+        );
     }
 
     #[test]
@@ -4219,5 +4486,245 @@ mod tests {
                 == Some("t.6")
         });
         assert!(has_tab);
+    }
+
+    /// Build a minimal Docs `document` with one paragraph of `text`.
+    fn doc_with_paragraph(text: &str, style: &str) -> Value {
+        let end = 1 + text.len() as i64;
+        json!({
+            "body": {
+                "content": [{
+                    "startIndex": 1,
+                    "endIndex": end,
+                    "paragraph": {
+                        "paragraphStyle": { "namedStyleType": style },
+                        "elements": [{
+                            "startIndex": 1,
+                            "endIndex": end,
+                            "textRun": { "content": text }
+                        }]
+                    }
+                }]
+            }
+        })
+    }
+
+    #[test]
+    fn test_truncate_preview_is_char_safe() {
+        // Cutting 10 chars out of two-byte chars must not split a codepoint.
+        let preview = truncate_preview(&"é".repeat(45), 10);
+        assert_eq!(preview.chars().count(), 13); // 10 chars + "..."
+        assert!(preview.ends_with("..."));
+        assert_eq!(preview, format!("{}...", "é".repeat(10)));
+
+        // No ellipsis when nothing was cut, including at the exact budget.
+        assert_eq!(truncate_preview("abc", 3), "abc");
+        assert_eq!(truncate_preview("abc", 10), "abc");
+        assert_eq!(truncate_preview("", 5), "");
+
+        // A zero budget is still valid UTF-8.
+        assert_eq!(truncate_preview("é", 0), "...");
+    }
+
+    #[test]
+    fn test_parse_doc_structure_multibyte_previews_do_not_panic() {
+        // Each of these was >80 *bytes* under the old `&text[..77]` slice, so
+        // byte 77 could land inside a char and abort the process.
+        let inputs = [
+            "é".repeat(45),
+            "漢".repeat(30),
+            "😀".repeat(21),
+            "é".repeat(100),
+            "漢".repeat(100),
+        ];
+        for text in inputs {
+            let doc = doc_with_paragraph(&text, "NORMAL_TEXT");
+            let doc_json = parse_doc_structure(&doc);
+            let preview = doc_json["elements"][0]["preview"]
+                .as_str()
+                .expect("paragraph preview")
+                .to_string();
+            // Valid UTF-8 (guaranteed for String) and bounded by the 80-char budget.
+            assert!(std::str::from_utf8(preview.as_bytes()).is_ok());
+            assert!(preview.chars().count() <= 80, "preview too long: {preview}");
+        }
+
+        // A truncated multi-byte preview keeps whole chars and ends with "...".
+        let long = "é".repeat(100);
+        let doc_json = parse_doc_structure(&doc_with_paragraph(&long, "NORMAL_TEXT"));
+        let preview = doc_json["elements"][0]["preview"].as_str().unwrap();
+        assert_eq!(preview.chars().count(), 80);
+        assert_eq!(preview, format!("{}...", "é".repeat(77)));
+
+        // Short multi-byte paragraphs are returned verbatim, not cut.
+        let short = "漢".repeat(30);
+        let doc_json = parse_doc_structure(&doc_with_paragraph(&short, "NORMAL_TEXT"));
+        assert_eq!(doc_json["elements"][0]["preview"], short);
+    }
+
+    #[test]
+    fn test_parse_doc_structure_ascii_boundary_with_multibyte_tail() {
+        // 76/77/78 ASCII chars followed by multi-byte chars: byte 77 falls on
+        // different sides of the é boundary in each case.
+        for ascii_len in [76usize, 77, 78] {
+            let text = format!("{}{}", "a".repeat(ascii_len), "é".repeat(3));
+            let doc_json = parse_doc_structure(&doc_with_paragraph(&text, "NORMAL_TEXT"));
+            let preview = doc_json["elements"][0]["preview"]
+                .as_str()
+                .expect("paragraph preview");
+            assert!(std::str::from_utf8(preview.as_bytes()).is_ok());
+            assert!(!preview.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_parse_doc_structure_multibyte_heading() {
+        // Headings keep the full text (no preview) and must not panic either.
+        let text = "é".repeat(100);
+        let doc_json = parse_doc_structure(&doc_with_paragraph(&text, "HEADING_1"));
+        let element = &doc_json["elements"][0];
+        assert_eq!(element["type"], "heading");
+        assert_eq!(element["level"], 1);
+        assert_eq!(element["text"], text);
+        assert!(element.get("preview").is_none());
+    }
+
+    #[test]
+    fn test_find_text_in_doc_rejects_empty_needle() {
+        let doc = doc_with_paragraph("éé", "NORMAL_TEXT");
+        assert!(find_text_in_doc(&doc, "", 1).is_err());
+        assert!(find_text_in_doc(&doc, "", 100_000).is_err());
+        assert!(find_text_in_doc(&doc, "", 0).is_err());
+
+        // Also on a document with no body text at all.
+        let empty = json!({ "body": { "content": [] } });
+        assert!(find_text_in_doc(&empty, "", 0).is_err());
+    }
+
+    #[test]
+    fn test_find_text_in_doc_multibyte_needle_occurrences() {
+        let doc = doc_with_paragraph("éé", "NORMAL_TEXT");
+        // element startIndex is 1; each é is one UTF-16 code unit.
+        let second = find_text_in_doc(&doc, "é", 2).unwrap();
+        assert_eq!(second["found"], true);
+        assert_eq!(second["startIndex"], 2);
+        assert_eq!(second["endIndex"], 3);
+
+        // Occurrence 0 is clamped to 1 instead of panicking / never matching.
+        let zero = find_text_in_doc(&doc, "é", 0).unwrap();
+        assert_eq!(zero["startIndex"], 1);
+
+        // Beyond the last occurrence: no panic, clean miss.
+        let missing = find_text_in_doc(&doc, "é", 3).unwrap();
+        assert_eq!(missing["found"], false);
+        assert_eq!(missing["occurrences_found"], 2);
+    }
+
+    #[test]
+    fn test_find_text_in_doc_ascii_occurrences_still_work() {
+        let doc = doc_with_paragraph("foo foo foo", "NORMAL_TEXT");
+        let second = find_text_in_doc(&doc, "foo", 2).unwrap();
+        assert_eq!(second["found"], true);
+        assert_eq!(second["startIndex"], 5);
+        assert_eq!(second["endIndex"], 8);
+
+        // Overlapping matches are still counted (old byte +1 advance semantics).
+        let overlapping = doc_with_paragraph("aaa", "NORMAL_TEXT");
+        let second = find_text_in_doc(&overlapping, "aa", 2).unwrap();
+        assert_eq!(second["found"], true);
+        assert_eq!(second["startIndex"], 2);
+        assert_eq!(second["endIndex"], 4);
+    }
+
+    #[test]
+    fn test_find_text_in_doc_needle_at_end_and_whole_string() {
+        let doc = doc_with_paragraph("abc", "NORMAL_TEXT");
+
+        let at_end = find_text_in_doc(&doc, "bc", 1).unwrap();
+        assert_eq!(at_end["startIndex"], 2);
+        assert_eq!(at_end["endIndex"], 4);
+
+        // Whole-string needle: asking for occurrence 2 must not panic.
+        let whole = find_text_in_doc(&doc, "abc", 1).unwrap();
+        assert_eq!(whole["startIndex"], 1);
+        assert_eq!(whole["endIndex"], 4);
+        let beyond = find_text_in_doc(&doc, "abc", 2).unwrap();
+        assert_eq!(beyond["found"], false);
+    }
+
+    #[test]
+    fn test_find_text_in_doc_non_ascii_indexes_are_utf16() {
+        // "héllo wörld": "héllo " is 6 UTF-16 code units, so "wörld" starts at
+        // element_start(1) + 6 = 7 and is 5 units long.
+        let doc = doc_with_paragraph("héllo wörld", "NORMAL_TEXT");
+        let found = find_text_in_doc(&doc, "wörld", 1).unwrap();
+        assert_eq!(found["found"], true);
+        assert_eq!(found["startIndex"], 7);
+        assert_eq!(found["endIndex"], 12);
+    }
+
+    #[test]
+    fn test_find_schema_documents_non_empty_text_and_occurrence_range() {
+        for schema in [find_tool_schema(), format_tool_schema()] {
+            let props = &schema["inputSchema"]["properties"];
+            assert_eq!(props["text"]["minLength"], 1);
+            assert_eq!(props["occurrence"]["minimum"], 1);
+            assert_eq!(props["occurrence"]["maximum"], 100000);
+        }
+    }
+
+    #[test]
+    fn test_find_section_range_missing_index_does_not_panic() {
+        // Terminating heading with no startIndex: fail the lookup cleanly.
+        let doc = json!({
+            "body": {
+                "content": [
+                    { "startIndex": 1, "endIndex": 10, "paragraph": {
+                        "paragraphStyle": { "namedStyleType": "HEADING_1" },
+                        "elements": [{ "textRun": { "content": "Parent\n" } }]
+                    }},
+                    { "endIndex": 20, "paragraph": {
+                        "paragraphStyle": { "namedStyleType": "HEADING_1" },
+                        "elements": [{ "textRun": { "content": "Sibling\n" } }]
+                    }}
+                ]
+            }
+        });
+        assert!(find_section_range(&doc, "Parent").is_none());
+
+        // Matching heading without a startIndex is simply not considered found.
+        let doc = json!({
+            "body": {
+                "content": [
+                    { "endIndex": 10, "paragraph": {
+                        "paragraphStyle": { "namedStyleType": "HEADING_1" },
+                        "elements": [{ "textRun": { "content": "Parent\n" } }]
+                    }}
+                ]
+            }
+        });
+        assert!(find_section_range(&doc, "Parent").is_none());
+    }
+
+    #[test]
+    fn test_image_revoke_failure_response_reports_leak() {
+        let err = GwsError::Validation("permissions.delete denied by policy".into());
+
+        let inserted = image_revoke_failure_response("doc-1", "file-1", "perm-1", true, &err);
+        assert_eq!(inserted["isError"], true);
+        let text = inserted["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("inserted into document doc-1"));
+        assert!(text.contains("file-1"));
+        assert!(text.contains("perm-1"));
+        assert!(text.contains("Remediation"));
+        assert!(text.contains("permissions.delete denied by policy"));
+
+        // A failed insert must not hide the leak either.
+        let failed = image_revoke_failure_response("doc-2", "file-2", "perm-2", false, &err);
+        assert_eq!(failed["isError"], true);
+        let text = failed["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("also failed"));
+        assert!(text.contains("More importantly"));
+        assert!(text.contains("file-2"));
     }
 }

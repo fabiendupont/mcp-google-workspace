@@ -27,9 +27,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 yup-oauth2 = "12"
 clap = { version = "4.6.6", features = ["derive"] }
 console = "0.16"
-dialoguer = "0.12.0"
 inquire = "0.9"
-tower-http = { version = "0.7.1", features = ["cors"] }
+tower-http = { version = "0.7.1", features = ["cors", "limit"] }
 pulldown-cmark = "0.13"
 rmcp = { version = "3.2", features = ["server", "transport-io", "transport-streamable-http-server", "macros", "elicitation", "schemars"] }
 tokio-util = "0.7"

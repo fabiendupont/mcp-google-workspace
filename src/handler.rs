@@ -10,10 +10,78 @@ use tokio::sync::{Mutex, RwLock};
 use crate::policy::Policy;
 use crate::shared::ServerState;
 
+/// Gate for Drive push-notification channels (`resources/subscribe` →
+/// `files.watch`, `resources/unsubscribe` → `channels.stop`).
+///
+/// Both operations POST to Drive, so they must pass the same policy checks as
+/// any other Drive write — the URI's service alone is not enough.
+pub(crate) fn check_drive_watch_allowed(
+    policy: &Policy,
+    service: &str,
+    resource: &str,
+) -> Result<(), String> {
+    if service != "drive" {
+        return Err(format!(
+            "resources/subscribe only supports Drive push notifications (gws://drive/...); \
+             got service '{service}'. Fix: subscribe to a gws://drive/<resource>/<id> URI"
+        ));
+    }
+    if !policy.is_service_allowed("drive") {
+        return Err("Service 'drive' is not enabled by policy. \
+             Fix: add {\"name\": \"drive\"} to the \"services\" array in your policy file"
+            .to_string());
+    }
+    if policy.is_read_only("drive") {
+        return Err(
+            "Service 'drive' is read-only; subscribing to changes requires the Drive write \
+             files.watch, which is not allowed. \
+             Fix: set \"read_only\": false on the \"drive\" service in your policy file"
+                .to_string(),
+        );
+    }
+    if !crate::resources::is_resource_allowed(policy.allowed_resources("drive"), resource) {
+        return Err(format!(
+            "Resource '{resource}' is not in allowed_resources for service 'drive'. \
+             Fix: add \"{resource}\" to the \"allowed_resources\" array in your policy file"
+        ));
+    }
+    Ok(())
+}
+
+/// Run `policy.check_method` against the real discovery method for a Drive
+/// watch/stop call.
+async fn check_drive_method_allowed(
+    state: &Arc<Mutex<ServerState>>,
+    policy: &Policy,
+    resource: &str,
+    method_name: &str,
+) -> Result<(), String> {
+    let mut st = state.lock().await;
+    let doc = st
+        .get_doc("drive")
+        .await
+        .map_err(|e| format!("Failed to load drive discovery doc: {e}"))?;
+    let drive_resource = crate::tools::find_resource(&doc.resources, resource)
+        .ok_or_else(|| format!("Resource '{resource}' not found in drive"))?;
+    let method = drive_resource.methods.get(method_name).ok_or_else(|| {
+        format!("Method 'drive.{resource}.{method_name}' not found in discovery document")
+    })?;
+    policy
+        .check_method("drive", resource, method_name, method)
+        .map_err(|e| e.to_string())
+}
+
 pub struct GwsHandler {
     pub(crate) state: Arc<Mutex<ServerState>>,
     pub(crate) policy: Arc<RwLock<Policy>>,
     pub(crate) task_manager: TaskManager,
+    /// Identity that owns this handler's webhook channel secrets.
+    ///
+    /// Single-user (stdio) mode uses
+    /// [`crate::subscriptions::DEFAULT_CHANNEL_OWNER`]; multi-user HTTP mode
+    /// passes the user name so one tenant cannot register, verify, or evict
+    /// another tenant's channel secrets.
+    pub(crate) owner: String,
 }
 
 impl GwsHandler {
@@ -31,14 +99,27 @@ impl GwsHandler {
             state: Arc::new(Mutex::new(state)),
             policy: Arc::new(RwLock::new(policy)),
             task_manager: TaskManager::new(),
+            owner: crate::subscriptions::DEFAULT_CHANNEL_OWNER.to_string(),
         }
     }
 
+    /// Single-user/default-owner handler.
     pub fn from_shared(state: Arc<Mutex<ServerState>>, policy: Arc<RwLock<Policy>>) -> Self {
+        Self::from_shared_for(state, policy, crate::subscriptions::DEFAULT_CHANNEL_OWNER)
+    }
+
+    /// Handler bound to an explicit owner (multi-user mode passes the user
+    /// name). The owner scopes webhook channel secrets.
+    pub fn from_shared_for(
+        state: Arc<Mutex<ServerState>>,
+        policy: Arc<RwLock<Policy>>,
+        owner: &str,
+    ) -> Self {
         Self {
             state,
             policy,
             task_manager: TaskManager::new(),
+            owner: owner.to_string(),
         }
     }
 }
@@ -206,7 +287,20 @@ impl ServerHandler for GwsHandler {
     {
         async move {
             let policy = self.policy.read().await;
-            let st = self.state.lock().await;
+            let mut st = self.state.lock().await;
+            // The discovery documents are loaded lazily. If `resources/templates/list`
+            // is the very first request, `st.docs` is empty and the client would see
+            // zero templates; load the allowed services first so the advertised
+            // surface is available from the first call.
+            for service in policy.allowed_services() {
+                if let Err(e) = st.get_doc(service).await {
+                    tracing::warn!(
+                        service,
+                        error = %e,
+                        "could not load discovery document for resource templates"
+                    );
+                }
+            }
             let templates = crate::resources::build_resource_templates(&policy, &st.docs);
             Ok(ListResourceTemplatesResult::with_all_items(templates))
         }
@@ -282,7 +376,9 @@ impl ServerHandler for GwsHandler {
                 )
             })?;
 
-            let args = json!({ "params": { &id_param: &parsed.id } });
+            let args = json!({
+                "params": crate::resources::build_get_params(method, &id_param, &parsed.id)
+            });
             let result = crate::execute::execute_tool(
                 &doc,
                 method,
@@ -316,7 +412,9 @@ impl ServerHandler for GwsHandler {
                         .methods
                         .get("list")
                         .ok_or_else(|| McpError::internal_error("labels.list not found", None))?;
-                    let labels_result = crate::execute::execute_tool(
+                    // Fail closed: a configured label policy that cannot be
+                    // resolved must not silently disable label enforcement.
+                    let labels_result = match crate::execute::execute_tool(
                         &label_doc,
                         list_method,
                         "users.labels",
@@ -331,9 +429,19 @@ impl ServerHandler for GwsHandler {
                         &mut st.token_cache,
                     )
                     .await
-                    .map_err(|e| {
-                        McpError::internal_error(format!("Failed to list labels: {e}"), None)
-                    })?;
+                    {
+                        Ok(value) => value,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Failed to list Gmail labels");
+                            return Err(McpError::invalid_params(
+                                format!(
+                                    "Gmail label policy configured but none of the allowed labels resolved: {}",
+                                    allowed_labels.join(", ")
+                                ),
+                                None,
+                            ));
+                        }
+                    };
                     let mut allowed_ids = Vec::new();
                     for name in allowed_labels {
                         if let Some(id) =
@@ -341,6 +449,15 @@ impl ServerHandler for GwsHandler {
                         {
                             allowed_ids.push(id);
                         }
+                    }
+                    if allowed_ids.is_empty() {
+                        return Err(McpError::invalid_params(
+                            format!(
+                                "Gmail label policy configured but none of the allowed labels resolved: {}",
+                                allowed_labels.join(", ")
+                            ),
+                            None,
+                        ));
                     }
                     if let Err(msg) =
                         crate::gmail_helpers::check_label_policy(&label_ids, &allowed_ids)
@@ -369,12 +486,12 @@ impl ServerHandler for GwsHandler {
             })?;
 
             let policy = self.policy.read().await;
-            if !policy.is_service_allowed(&parsed.service) {
-                return Err(McpError::invalid_params(
-                    format!("Service '{}' not enabled", parsed.service),
-                    None,
-                ));
-            }
+            // `files.watch` is a Drive write, whatever the URI says.
+            check_drive_watch_allowed(&policy, &parsed.service, &parsed.resource)
+                .map_err(|msg| McpError::invalid_params(msg, None))?;
+            check_drive_method_allowed(&self.state, &policy, &parsed.resource, "watch")
+                .await
+                .map_err(|msg| McpError::invalid_params(msg, None))?;
 
             let webhook_url = {
                 let st = self.state.lock().await;
@@ -385,6 +502,7 @@ impl ServerHandler for GwsHandler {
                 Some(webhook_url) => {
                     let (channel_id, resource_id, expiration_ms) =
                         crate::subscriptions::watch_resource(
+                            &self.owner,
                             &parsed.service,
                             &parsed.id,
                             &webhook_url,
@@ -477,31 +595,69 @@ impl ServerHandler for GwsHandler {
         _context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<(), McpError>> + Send + '_ {
         async move {
-            let mut st = self.state.lock().await;
-            let sub = {
-                let mut subs = st.subscriptions.lock().await;
-                subs.remove(&request.uri).ok_or_else(|| {
-                    McpError::invalid_params(
-                        format!("No subscription for URI: {}", request.uri),
-                        None,
-                    )
-                })?
+            let parsed = crate::resources::parse_gws_uri(&request.uri).ok_or_else(|| {
+                McpError::invalid_params(format!("Invalid resource URI: {}", request.uri), None)
+            })?;
+
+            let (channel_id, resource_id, polling, service) = {
+                let st = self.state.lock().await;
+                let sub = {
+                    let mut subs = st.subscriptions.lock().await;
+                    subs.remove(&request.uri).ok_or_else(|| {
+                        McpError::invalid_params(
+                            format!("No subscription for URI: {}", request.uri),
+                            None,
+                        )
+                    })?
+                };
+                (sub.channel_id, sub.resource_id, sub.polling, sub.service)
             };
 
-            let policy = self.policy.read().await;
-            if sub.polling {
-                // The poll task detects removal and exits on its own
+            if polling {
+                // The poll task detects removal and exits on its own; no API call.
                 tracing::info!(uri = %request.uri, "Polling subscription removed");
                 return Ok(());
             }
 
-            let _ = crate::subscriptions::stop_watch(
-                &sub.channel_id,
-                &sub.resource_id,
-                &mut st.token_cache,
-                &policy,
-            )
-            .await;
+            let policy = self.policy.read().await;
+            // `channels.stop` POSTs to Drive just like `files.watch`.
+            if let Err(msg) = check_drive_watch_allowed(&policy, &service, &parsed.resource) {
+                // The subscription is already gone locally: the watch is being
+                // abandoned, so do not leave its secret behind until TTL.
+                crate::subscriptions::unregister_channel_secret_for(&self.owner, &channel_id).await;
+                return Err(McpError::invalid_params(msg, None));
+            }
+            if let Err(msg) =
+                check_drive_method_allowed(&self.state, &policy, "channels", "stop").await
+            {
+                crate::subscriptions::unregister_channel_secret_for(&self.owner, &channel_id).await;
+                return Err(McpError::invalid_params(msg, None));
+            }
+
+            // `stop_watch` drops the secret on every exit path, including
+            // errors; additionally drop it here so a failure can never leave
+            // the local secret behind, and surface the failure in the logs.
+            let stop_result = {
+                let mut st = self.state.lock().await;
+                crate::subscriptions::stop_watch(
+                    &self.owner,
+                    &channel_id,
+                    &resource_id,
+                    &mut st.token_cache,
+                    &policy,
+                )
+                .await
+            };
+            if let Err(e) = stop_result {
+                tracing::warn!(
+                    uri = %request.uri,
+                    channel_id = %channel_id,
+                    owner = %self.owner,
+                    error = %e,
+                    "Failed to stop watch channel; abandoned subscription, dropped local secret"
+                );
+                crate::subscriptions::unregister_channel_secret_for(&self.owner, &channel_id).await;
+            }
 
             tracing::info!(uri = %request.uri, "Subscription removed");
             Ok(())
@@ -655,5 +811,75 @@ fn value_to_call_tool_result(value: Value) -> CallToolResult {
         result
     } else {
         CallToolResult::success(content)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn policy_from(value: Value) -> Policy {
+        let file: crate::policy::PolicyFile = serde_json::from_value(value).unwrap();
+        Policy::from_policy_file(file)
+    }
+
+    #[test]
+    fn test_subscribe_rejects_read_only_drive() {
+        let policy = policy_from(json!({
+            "services": [{"name": "drive", "read_only": true}]
+        }));
+        let err = check_drive_watch_allowed(&policy, "drive", "files").unwrap_err();
+        assert!(err.contains("read-only"), "{err}");
+        assert!(err.contains("files.watch"), "{err}");
+    }
+
+    #[test]
+    fn test_subscribe_rejects_global_read_only() {
+        let policy = policy_from(json!({
+            "server": {"read_only": true},
+            "services": [{"name": "drive"}]
+        }));
+        let err = check_drive_watch_allowed(&policy, "drive", "files").unwrap_err();
+        assert!(err.contains("read-only"), "{err}");
+    }
+
+    #[test]
+    fn test_subscribe_rejects_sheets_only_policy() {
+        let policy = policy_from(json!({
+            "services": [{"name": "sheets"}]
+        }));
+        let err = check_drive_watch_allowed(&policy, "drive", "files").unwrap_err();
+        assert!(err.contains("'drive' is not enabled by policy"), "{err}");
+    }
+
+    #[test]
+    fn test_subscribe_rejects_non_drive_service() {
+        let policy = policy_from(json!({
+            "services": [{"name": "drive"}, {"name": "gmail"}]
+        }));
+        let err = check_drive_watch_allowed(&policy, "gmail", "messages").unwrap_err();
+        assert!(
+            err.contains("only supports Drive push notifications"),
+            "{err}"
+        );
+        assert!(err.contains("gmail"), "{err}");
+    }
+
+    #[test]
+    fn test_subscribe_rejects_resource_outside_allowlist() {
+        let policy = policy_from(json!({
+            "services": [{"name": "drive", "allowed_resources": ["files"]}]
+        }));
+        let err = check_drive_watch_allowed(&policy, "drive", "comments").unwrap_err();
+        assert!(err.contains("allowed_resources"), "{err}");
+        assert!(check_drive_watch_allowed(&policy, "drive", "files").is_ok());
+    }
+
+    #[test]
+    fn test_subscribe_allows_drive_write_policy() {
+        let policy = policy_from(json!({
+            "services": [{"name": "drive"}]
+        }));
+        assert!(check_drive_watch_allowed(&policy, "drive", "files").is_ok());
     }
 }

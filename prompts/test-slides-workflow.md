@@ -1,4 +1,4 @@
-Create a Google Slides presentation named "Quarterly Review" in Drive folder 1VkrXx3bhkQaLJEmnY_t5VxVmBETfsbY1.
+Create a Google Slides presentation named "Quarterly Review" in Drive folder YOUR_TEST_FOLDER_ID.
 
 Use gws_slides_import_marp to create the initial presentation with this Marp Markdown:
 

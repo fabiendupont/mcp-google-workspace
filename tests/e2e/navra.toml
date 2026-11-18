@@ -16,7 +16,11 @@ tcp = "127.0.0.1:9315"
 
 [[agents]]
 name = "gws-test"
-token_hash = "fc55a7d022fdd06d1109ba22c86df0d7c68d2dccaab408c1c67e63786646f1ef"
+# TEST-ONLY placeholder: sha256 of the documented dummy token
+# "e2e-test-token-not-a-secret". Not a credential and not the hash of any real
+# token. run.sh / run-9320.sh regenerate this file with the hash of $MCPD_TOKEN
+# at startup (render_navra_config), so nothing here needs to be a real secret.
+token_hash = "48f32c6f63480f4353b5ef6d1e177b1ef76fe3779f9028805feabf440f2546c3"
 permissions = "gws"
 model = "gemma4-26b"
 
@@ -113,13 +117,13 @@ context_size = 8192
 
 [models.vertex-claude]
 task = "chat"
-base_url = "https://aiplatform.googleapis.com/v1/projects/itpc-gcp-eco-eng-claude/locations/global/publishers/anthropic/models"
+base_url = "https://aiplatform.googleapis.com/v1/projects/example-gcp-project/locations/global/publishers/anthropic/models"
 model_name = "claude-sonnet-4-5@20250929"
 locality = "remote"
 
 [models.vertex-claude-opus]
 task = "chat"
-base_url = "https://aiplatform.googleapis.com/v1/projects/itpc-gcp-eco-eng-claude/locations/global/publishers/anthropic/models"
+base_url = "https://aiplatform.googleapis.com/v1/projects/example-gcp-project/locations/global/publishers/anthropic/models"
 model_name = "claude-opus-4-6@default"
 locality = "remote"
 

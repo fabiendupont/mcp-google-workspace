@@ -1,4 +1,4 @@
-Work with a Google Slides presentation using a branded template. All files go in Drive folder 1VkrXx3bhkQaLJEmnY_t5VxVmBETfsbY1.
+Work with a Google Slides presentation using a branded template. All files go in Drive folder YOUR_TEST_FOLDER_ID.
 
 1. Call gws_templates to list available templates. Examine the placeholder details for each layout — note which placeholders have large/medium/small sizes and their positions.
 

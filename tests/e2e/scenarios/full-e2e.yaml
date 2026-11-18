@@ -2,7 +2,7 @@ name: full-e2e
 description: "Full lifecycle: read source docs, create report, use tables, read/write sheets, organize in Drive"
 prompt_file: prompts/test-e2e.md
 timeout_seconds: 600
-test_folder_id: "1VkrXx3bhkQaLJEmnY_t5VxVmBETfsbY1"
+test_folder_id: "YOUR_TEST_FOLDER_ID"
 
 rubric:
   # Drive operations

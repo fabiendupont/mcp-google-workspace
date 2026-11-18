@@ -2,7 +2,7 @@ name: sheets-advanced
 description: "Advanced sheets: formulas, conditional formatting, data validation, named ranges, dimensions, CSV, formula analysis"
 prompt_file: prompts/test-sheets-advanced.md
 timeout_seconds: 300
-test_folder_id: "1VkrXx3bhkQaLJEmnY_t5VxVmBETfsbY1"
+test_folder_id: "YOUR_TEST_FOLDER_ID"
 
 rubric:
   - id: spreadsheet_created

@@ -2,7 +2,7 @@ name: docs-tabs
 description: "Create a doc, list tabs, read/outline/find using tab parameter, verify error on missing tab"
 prompt_file: prompts/test-docs-tabs.md
 timeout_seconds: 300
-test_folder_id: "1VkrXx3bhkQaLJEmnY_t5VxVmBETfsbY1"
+test_folder_id: "YOUR_TEST_FOLDER_ID"
 
 rubric:
   - id: doc_created

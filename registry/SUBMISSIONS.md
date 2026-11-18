@@ -8,9 +8,9 @@ status of each submission.
 
 | File | Consumed by | Notes |
 |---|---|---|
-| `server.json` (root) | Official MCP Registry, GitHub MCP Registry | Standard `server.json` manifest (2025-12-11 schema). Reverse-DNS name, OCI package pointing at the ghcr.io multi-arch image, stdio transport. Update `version` and `packages[].version` on each release. |
+| `server.json` (root) | Official MCP Registry, GitHub MCP Registry | Standard `server.json` manifest (2025-12-11 schema). Reverse-DNS name, OCI package pointing at the ghcr.io multi-arch image, stdio transport, and an optional `GWS_API_TOKEN` secret for clients that run the image in HTTP mode. Update `version` and `packages[].version` on each release. |
 | `glama.json` (root) | Glama | Declares maintainers; Glama scans the repo for the rest. |
-| `registry/docker-mcp-catalog.yaml` | Docker MCP Catalog | Payload for a PR to `docker/mcp-registry` (`servers/mcp-google-workspace/metadata.yaml`). Requires mirroring the ghcr.io image to a Docker Hub namespace (command in the file header). |
+| `registry/docker-mcp-catalog.yaml` | Docker MCP Catalog | Payload for a PR to `docker/mcp-registry` (`servers/mcp-google-workspace/metadata.yaml`). Requires mirroring the ghcr.io image to a Docker Hub namespace (command in the file header). The catalog entry runs stdio; HTTP deployments need `GWS_API_TOKEN` or `--insecure-no-auth`. |
 
 ## Submission checklist
 

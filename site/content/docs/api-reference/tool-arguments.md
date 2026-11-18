@@ -2,12 +2,12 @@
 title = "Tool reference"
 description = "Helper tools and generic tool arguments"
 date = 2026-06-12T00:00:00+00:00
-updated = 2026-07-28T00:00:00+00:00
+updated = 2026-11-18T00:00:00+00:00
 draft = false
 weight = 20
 template = "docs/page.html"
 [extra]
-lead = "59 purpose-built helper tools across 7 services, plus discovery and batch meta-tools."
+lead = "Purpose-built helper tools across seven services, plus discovery and batch meta-tools."
 toc = true
 top = false
 +++
@@ -19,9 +19,10 @@ The server operates in two modes:
 | Mode | Initial tools | Activation |
 |------|---------------|------------|
 | **Lazy** (default) | `gws_discover`, `gws_batch` | Model calls `gws_discover(service="sheets")` to activate a service |
-| **Eager** (`--eager-tools`) | All 59 tools | Loaded at startup |
+| **Eager** (`--eager-tools`) | All helper and meta tools the policy permits | Loaded at startup; helper tools for services absent from the policy are filtered out, as in lazy mode |
 
-Services with helpers (Drive, Docs, Sheets, Slides, Gmail) suppress their generic tool. The model uses only the purpose-built helpers.
+Services with helpers (Drive, Docs, Sheets, Slides, Gmail, Calendar, Tasks)
+suppress their generic tool. The model uses only the purpose-built helpers.
 
 ## Meta tools
 
@@ -37,9 +38,19 @@ Introspects the API schema and activates services in lazy mode.
 
 ### `gws_batch`
 
-Executes multiple tool calls in a single request.
+Executes multiple tool calls in a single request. Each entry names a tool and its
+arguments, and may carry its own `dry_run` flag. A sub-request that policy allows
+but whose payload carries an API error is reported with `"status":"error"`,
+excluded from `succeeded`, and counted in `failed`; a per-entry policy failure
+rejects the whole batch before anything is executed.
 
-## Drive helpers (9 tools)
+`gws_batch` refuses to dispatch into the helper-only services (Drive, Docs,
+Sheets, Slides, Gmail, Calendar, Tasks), even when the policy enables them: the
+helpers enforce label, parent, and tool-level policy that the raw REST proxy
+bypasses. Call the `gws_<service>_*` tools directly instead; the batch returns an
+error naming the required helper.
+
+## Drive helpers
 
 | Tool | Description |
 |------|-------------|
@@ -50,8 +61,8 @@ Executes multiple tool calls in a single request.
 | `gws_drive_copy` | Copy a file |
 | `gws_drive_rename` | Rename a file |
 | `gws_drive_move` | Move a file to a different folder |
-| `gws_drive_share` | Share a file with a user or group |
-| `gws_drive_trash` | Move a file to the trash |
+| `gws_drive_share` | Share a file with a user or domain (never link-anyone) |
+| `gws_drive_trash` | Move a file to the trash (destructive; recoverable from trash) |
 
 ### Example: List files
 
@@ -59,25 +70,65 @@ Executes multiple tool calls in a single request.
 {
   "name": "gws_drive_list",
   "arguments": {
-    "folder_id": "folder-abc",
+    "folder_id": "1AbCdEfGhIjKlMnOpQrStUvWxYz01234",
     "page_size": 10
   }
 }
 ```
 
-## Docs helpers (9 tools)
+### Drive IDs and sharing
+
+Drive IDs (`file_id`, `folder_id`, `parent_id`, `to_folder_id`) are validated
+before any request: `^[A-Za-z0-9_-]+$`, at least 20 characters, with the literal
+`root` alias also accepted. The charset check *is* the injection control, because
+the ID is interpolated verbatim into the Drive search grammar; free-text query
+values (names, full-text search) are escaped instead (backslash first, then `'`,
+control characters stripped). A pasted browser URL
+(`https://drive.google.com/file/d/<id>/view`), a share link, or any value
+containing `/` or a space is rejected with a validation error rather than being
+silently ignored or truncated.
+
+`gws_drive_trash` is treated as **destructive** for policy and client-annotation
+purposes (`destructiveHint: true`), even though it is implemented as
+`files.update {trashed: true}`. Trashing is recoverable from the Drive trash —
+`files.emptyTrash` is the irreversible step — but it is blocked by any denial in
+the delete family: if `files.trash`, `files.delete`, or `files.emptyTrash` is
+denied, the helper returns a `Trash blocked: ...` policy error and issues no
+request. `denied_methods: ["files.delete"]` therefore stops `gws_drive_trash` as
+well as `files.delete`.
+
+`gws_drive_share` validates `role` as `reader`, `commenter`, or `writer` before
+the API call and rejects `owner`. The permission `type` is derived from the
+target — `user` for `email`, `domain` for `domain` — and never taken from the
+caller, so `anyone`/`anyoneWithLink` sharing is unreachable through this tool.
+Pass either `email` or `domain`. Its `destructiveHint` is false because a share
+never transfers ownership.
+
+## Docs helpers
 
 | Tool | Description |
 |------|-------------|
 | `gws_docs_write` | Create or update a document (accepts Markdown or plain text) |
 | `gws_docs_read` | Read document content as Markdown |
 | `gws_docs_replace_section` | Replace a section by heading |
-| `gws_docs_outline` | Get document outline (headings) |
-| `gws_docs_find` | Search for text in a document |
+| `gws_docs_outline` | Get document outline (headings, tables, images, with indexes) |
+| `gws_docs_find` | Search for text in a document and return its character range |
+| `gws_docs_insert_text` | Insert text at an index or position |
+| `gws_docs_append_section` | Append a heading with a body and/or bullets |
+| `gws_docs_add_bullets` | Convert a character range into a bulleted list |
 | `gws_docs_insert_table` | Insert a table |
-| `gws_docs_insert_image` | Insert an image by URL |
+| `gws_docs_insert_image` | Insert an image from a Drive file, URL, or base64 data |
 | `gws_docs_read_table` | Read a table as structured data |
 | `gws_docs_format` | Apply formatting (bold, italic, color, font) |
+| `gws_docs_format_text` | Alias of `gws_docs_format` for range-based styling |
+
+`gws_docs_insert_image` with `drive_file_id` temporarily grants
+anyone-with-link read access so the Docs API can fetch the image, then revokes
+that permission immediately after insertion. If revocation fails the tool reports
+an **error** that names the file id and permission id and gives a remediation
+hint, and the file may remain link-accessible until you remove the permission —
+it is never reported as success. Prefer `image_data` when temporary sharing is not
+acceptable; in `dry_run` no sharing is created.
 
 ### Example: Create a document
 
@@ -91,7 +142,7 @@ Executes multiple tool calls in a single request.
 }
 ```
 
-## Sheets helpers (14 tools)
+## Sheets helpers
 
 | Tool | Description |
 |------|-------------|
@@ -110,6 +161,13 @@ Executes multiple tool calls in a single request.
 | `gws_sheets_csv` | Import or export CSV data |
 | `gws_sheets_dimensions` | Resize rows and columns |
 
+Writes default to `value_input_option: "RAW"`, which stores strings verbatim so
+a cell beginning with `=` is text, not a formula. Set `USER_ENTERED` only when
+you intend Google Sheets to parse formulas and numbers. `gws_sheets_csv` export
+defaults to `sanitize_formulas: true`, prefixing cells that start with `=`, `+`,
+`-`, `@`, TAB, or CR with a single quote to defuse spreadsheet formula
+injection.
+
 ### Example: Read a range
 
 ```json
@@ -122,7 +180,7 @@ Executes multiple tool calls in a single request.
 }
 ```
 
-## Slides helpers (9 tools)
+## Slides helpers
 
 | Tool | Description |
 |------|-------------|
@@ -133,8 +191,16 @@ Executes multiple tool calls in a single request.
 | `gws_slides_delete` | Delete a slide |
 | `gws_slides_reorder` | Reorder slides |
 | `gws_slides_import_marp` | Import a Marp Markdown presentation |
-| `gws_slides_templates` | List and apply slide templates |
-| `gws_slides_generate_image` | Generate an image with Gemini and insert it |
+| `gws_templates` | List and apply slide templates |
+| `gws_generate_image` | Generate an image with Gemini and insert it into a doc or slide |
+
+`gws_generate_image` is a write tool: it appears in `tools/list` with
+`readOnlyHint: false` (when the policy permits the `slides` service, which owns
+it, as it does for `gws_templates`), is discoverable through `gws_discover`, and
+requires the same `confirm_writes` approval as other mutating tools. In
+multi-user mode it honours the delegated `_meta.user_email` subject. It temporarily shares the
+generated image for insertion and revokes that permission; if the revoke fails it
+reports an error naming the file rather than success.
 
 ### Example: Import a Marp presentation
 
@@ -148,7 +214,7 @@ Executes multiple tool calls in a single request.
 }
 ```
 
-## Gmail helpers (10 tools)
+## Gmail helpers
 
 | Tool | Description |
 |------|-------------|
@@ -170,6 +236,15 @@ Executes multiple tool calls in a single request.
 {"name": "gws_gmail_read", "arguments": {"message_id": "18a1b2c3d4e5f6"}}
 ```
 
+### Label-restricted thread reads
+
+`gws_gmail_thread` validates **every** message returned against
+`allowed_labels` before handing the thread back. Messages outside the allowed
+labels are dropped and the result is marked `"partialRead": true` with
+`"omittedMessageCount": N`; `messageCount` counts only the messages actually
+returned. A thread whose messages all fall outside the policy is therefore an
+empty (but explicit) result, not a leak of the filtered ones.
+
 ### Example: Draft with Markdown
 
 ```json
@@ -184,7 +259,12 @@ Executes multiple tool calls in a single request.
 }
 ```
 
-## Calendar helpers (6 tools)
+`format: "markdown"` is bounded: the body is capped at about 1 MiB in total and
+64 KiB per line, and the renderer is linear. Links are restricted to `http`,
+`https`, `mailto`, and `tel`; any other scheme renders as plain text, and quoted
+content is HTML-escaped.
+
+## Calendar helpers
 
 | Tool | Description |
 |------|-------------|
@@ -213,9 +293,22 @@ Events include `myStatus` (accepted/declined/tentative) so models can filter dec
 {"name": "gws_calendar_create", "arguments": {"summary": "Team sync", "start": "2026-07-30T14:00:00+02:00", "end": "2026-07-30T14:30:00+02:00"}}
 ```
 
+## Tasks helpers
+
+| Tool | Description |
+|------|-------------|
+| `gws_tasks_lists` | List all task lists |
+| `gws_tasks_list` | List tasks in a task list (defaults to the first list) |
+| `gws_tasks_get` | Get full details of a single task |
+| `gws_tasks_create` | Create a task with title, optional notes and due date |
+| `gws_tasks_update` | Update an existing task |
+| `gws_tasks_complete` | Mark a task complete |
+| `gws_tasks_clear` | Clear completed tasks from a list |
+| `gws_tasks_delete` | Delete a task |
+
 ## Generic tool (fallback)
 
-For services without helpers (Calendar, Admin, Chat, etc.), a generic tool is available with these arguments:
+For services without helpers (Admin, Chat, etc.), a generic tool is available with these arguments:
 
 | Argument | Type | Required | Description |
 |----------|------|----------|-------------|
@@ -232,20 +325,38 @@ For services without helpers (Calendar, Admin, Chat, etc.), a generic tool is av
 | `media_chunk` | string | No | Base64-encoded chunk for resumable uploads |
 | `download_handle` | string | No | Handle from large file download |
 
-### Example: List Calendar events
+### Example: List Chat spaces
 
 ```json
 {
-  "name": "calendar",
+  "name": "chat",
   "arguments": {
-    "resource": "events",
+    "resource": "spaces",
     "method": "list",
     "params": {
-      "calendarId": "primary",
-      "maxResults": 10
+      "pageSize": 10
     }
   }
 }
 ```
 
-Services with helpers (Drive, Docs, Sheets, Slides, Gmail) block the generic tool. Attempting to call the generic `drive` tool returns an error directing the model to use the `gws_drive_*` helpers instead.
+Helper-only services (Drive, Docs, Sheets, Slides, Gmail, Calendar, Tasks) block
+the generic tool and `gws_batch`. Attempting to call the generic `drive` tool
+returns an error directing the model to use the `gws_drive_*` helpers instead.
+
+## Dry run
+
+`dry_run: true` previews a mutating call without performing it. It is honored
+only where the tool genuinely implements a preview:
+
+- `gws_docs_*` and `gws_slides_*` helpers
+- `gws_generate_image`
+- `gws_batch` (per entry, and on the batch call)
+- generic REST proxy tools
+
+For every other helper (Drive, Sheets, Gmail, Calendar, Tasks) the flag is not a
+preview: on a mutating call it is rejected with an error explaining that the
+tool has no preview mode, so the request cannot be mistaken for one that was not
+executed. Read-only helpers ignore it. A successful dry run reports the request
+it would have sent; no confirmation prompt is raised and no policy mutation is
+applied.

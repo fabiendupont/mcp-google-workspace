@@ -120,7 +120,10 @@ fn split_slides(input: &str) -> Vec<&str> {
                         && sep_end + 1 < len
                         && bytes[sep_end + 1] == b'\n');
                 if is_sep {
-                    let section_end = if i > 0 { i - 1 } else { i };
+                    // `i - 1` drops the newline preceding the separator, but when the
+                    // separator starts the current section (adjacent separators, e.g.
+                    // "---\n---"), `i == start` and `i - 1` would invert the range.
+                    let section_end = if i > start { i - 1 } else { i };
                     sections.push(&input[start..section_end]);
                     start = if sep_end < len {
                         let mut s = sep_end;
@@ -228,6 +231,17 @@ fn extract_slide_metadata<'a>(
 
     while let Some(start) = remaining.find("<!--") {
         if let Some(end) = remaining[start..].find("-->") {
+            // `end` is relative to `remaining[start..]`, while `start` is absolute.
+            // Malformed comments such as `<!-->` or `<!--->` make the closing marker
+            // overlap the opener (end == 2 or 3), which would invert the range below.
+            // Skip past the opener and keep scanning instead of panicking.
+            if end < 4 {
+                let advance = start + 4;
+                processed_len += advance;
+                remaining = &remaining[advance..];
+                continue;
+            }
+
             let comment_inner = remaining[start + 4..start + end].trim();
             let comment_end = start + end + 3;
 
@@ -883,5 +897,85 @@ Remember to explain the architecture diagram
             (false, Some(300.0), Some(200.0))
         );
         assert_eq!(parse_image_alt(""), (false, None, None));
+    }
+
+    #[test]
+    fn test_overlapping_comment_markers_do_not_panic() {
+        // `<!-->` / `<!--->` make the closing "-->" overlap the opener, so the
+        // relative match offset is 2/3 instead of >= 4.
+        for input in [
+            "<!-->",
+            "<!--->",
+            "# Slide\n\n<!-->\n\nBody",
+            "# Slide\n\n<!--->\n\nBody",
+            "<!--><!---><!-->",
+        ] {
+            let pres = parse_marp(input).unwrap_or_else(|e| panic!("{input:?}: {e}"));
+            assert!(!pres.slides.is_empty(), "input: {input:?}");
+        }
+    }
+
+    #[test]
+    fn test_empty_comment_still_parses() {
+        let input = "<!-- -->\n# Slide\n\nBody";
+        let pres = parse_marp(input).unwrap();
+        assert_eq!(pres.slides[0].title.as_deref(), Some("Slide"));
+    }
+
+    #[test]
+    fn test_overlapping_comment_does_not_hide_later_directives() {
+        let input = "<!--><!-- _backgroundColor: #000 -->\n# Slide";
+        let pres = parse_marp(input).unwrap();
+        assert_eq!(pres.slides[0].title.as_deref(), Some("Slide"));
+        assert_eq!(
+            pres.slides[0].directives.background_color.as_deref(),
+            Some("#000")
+        );
+    }
+
+    #[test]
+    fn test_overlapping_comment_inside_fenced_code() {
+        let input = "```\n<!-->\n<!--->\n```";
+        let pres = parse_marp(input).unwrap();
+        assert_eq!(pres.slides.len(), 1);
+        match pres.slides[0]
+            .body_blocks
+            .iter()
+            .find(|b| matches!(b, SlideBlock::CodeBlock { .. }))
+        {
+            Some(SlideBlock::CodeBlock { code, .. }) => {
+                assert!(!code.contains("<!--"), "code: {code:?}");
+            }
+            other => panic!("Expected CodeBlock block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_adjacent_separators_do_not_panic() {
+        for input in [
+            "---\n---",
+            "---\n---\n",
+            "# A\n\n---\n\n---\n",
+            "# A\n\n---\n\n---",
+        ] {
+            let pres = parse_marp(input).unwrap_or_else(|e| panic!("{input:?}: {e}"));
+            assert!(!pres.slides.is_empty(), "input: {input:?}");
+        }
+    }
+
+    #[test]
+    fn test_blank_line_separated_slides_still_split() {
+        let pres = parse_marp("# A\n\n---\n\n---\n\n# B").unwrap();
+        assert_eq!(pres.slides.len(), 2);
+        assert_eq!(pres.slides[0].title.as_deref(), Some("A"));
+        assert_eq!(pres.slides[1].title.as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn test_separator_without_blank_lines_still_splits() {
+        let pres = parse_marp("# A\n---\n# B").unwrap();
+        assert_eq!(pres.slides.len(), 2);
+        assert_eq!(pres.slides[0].title.as_deref(), Some("A"));
+        assert_eq!(pres.slides[1].title.as_deref(), Some("B"));
     }
 }
