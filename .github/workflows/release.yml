@@ -480,7 +480,7 @@ jobs:
           sha256sum mcp-google-workspace-linux-* > SHA256SUMS
           cat SHA256SUMS
 
-      - uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
         with:
           # Pin the cosign binary so verification instructions stay stable.
           cosign-release: 'v2.5.3'
@@ -587,7 +587,7 @@ jobs:
           # binaries, and clobbering it would overwrite a signed asset.
           (cd dist && sha256sum "mcp-google-workspace-${VERSION}.tgz" > SHA256SUMS.chart && cat SHA256SUMS.chart)
 
-      - uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
         with:
           cosign-release: 'v2.5.3'
 
